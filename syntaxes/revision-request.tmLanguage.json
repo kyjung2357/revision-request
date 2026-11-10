@@ -1,0 +1,9 @@
+{
+  "name": "Revision Request",
+  "scopeName": "source.json.revision-request",
+  "patterns": [
+    {
+      "include": "source.json"
+    }
+  ]
+}

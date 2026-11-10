@@ -1,0 +1,13 @@
+**/*
+!package.json
+!README.md
+!.codex-build/extension.js
+!media/**
+!schemas/**
+!docs/**
+!language-configuration.json
+!syntaxes/**
+!.codex-build/mcp-server.cjs
+!LICENSE
+!.codex-build/THIRD_PARTY_NOTICES.txt
+!.codex-build/bundled-dependencies.json

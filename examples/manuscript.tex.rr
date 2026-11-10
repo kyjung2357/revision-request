@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "title": "Clarify differentiability and the first-order approximation",
+  "description": "Two independent edits demonstrate partial acceptance. Accept one block and ignore the other to keep exactly the changes you want.",
+  "files": [
+    {
+      "path": "examples/manuscript.tex",
+      "before": "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\n\\section{A small revision example}\nLet \\(f:\\mathbb R\\to\\mathbb R\\) be a differentiable function.\nFor \\(x\\in\\mathbb R\\), consider the increment\n\\[\n  f(x+h)-f(x).\n\\]\n\nThe first-order approximation is\n\\[\n  f(x+h)=f(x)+f'(x)h.\n\\]\n\nThis example contains two independent revision proposals.\n\n\\end{document}\n",
+      "after": "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\n\\section{A small revision example}\nLet \\(f:\\mathbb R\\to\\mathbb R\\) be differentiable at \\(x\\).\nFor \\(x\\in\\mathbb R\\), consider the increment\n\\[\n  f(x+h)-f(x).\n\\]\n\nThe first-order approximation is\n\\[\n  f(x+h)=f(x)+f'(x)h+o(h),\\qquad h\\to0.\n\\]\n\nThis example contains two independent revision proposals.\n\n\\end{document}\n",
+      "reason": "State the local differentiability assumption and include the missing remainder term.",
+      "explanations": [
+        {
+          "line": 6,
+          "text": "Only differentiability at the selected point x is needed for this local expansion."
+        },
+        {
+          "line": 14,
+          "text": "The first-order expression needs the remainder o(h); the equality is an asymptotic statement as h tends to zero."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/kyjung2357/revision-request/blob/main/schemas/revision-request.schema.json",
+  "title": "Revision Request",
+  "description": "A single-file review proposal named <complete-target-filename>.rr, such as manuscript.tex.rr. Opening it does not change the target.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "version",
+    "title",
+    "files"
+  ],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "The Revision Request format version."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Nonblank request-title metadata, at most 2,000 UTF-8 bytes. Not displayed in the preview banner."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional request-level metadata; not displayed as a banner explanation. At most 50,000 UTF-8 bytes."
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "path",
+          "before",
+          "after"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Forward-slash path relative to the VS Code workspace folder containing this .rr file. Must remain inside that folder. Use nonempty segments; . and .., Windows reserved device names, colons, backslashes, and trailing dots or spaces are rejected.",
+            "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\u0000<>\"|?*])(?!.*[. ](?:/|$))(?!.*\\/$).+$"
+          },
+          "before": {
+            "type": "string",
+            "description": "Exact original UTF-8 text, including its original line endings and final newline. At most 5 MiB of UTF-8 text; NUL is not supported."
+          },
+          "after": {
+            "type": "string",
+            "description": "Exact proposed replacement text. No changes are written until accepted. At most 5 MiB of UTF-8 text; NUL is not supported."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Default explanation for each change block. A matching explanations entry overrides it; blank text disables the block Why button. At most 50,000 UTF-8 bytes."
+          },
+          "explanations": {
+            "type": "array",
+            "maxItems": 10000,
+            "description": "Block explanations matched by the exact first original line (oldStart). Each line must be unique. Unmatched entries are unused.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": [
+                "line",
+                "text"
+              ],
+              "properties": {
+                "line": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991,
+                  "description": "One-based first original line of the block, or original insertion position for a pure insertion."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Specific block explanation, overriding reason. Empty or whitespace-only text disables Why for this block. At most 50,000 UTF-8 bytes; NUL is rejected."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

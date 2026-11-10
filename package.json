@@ -1,0 +1,234 @@
+{
+  "name": "revision-request",
+  "displayName": "Revision Request",
+  "icon": "media/logo.png",
+  "description": "Review .rr proposals and accept individual changes before they touch your files.",
+  "version": "0.1.0",
+  "publisher": "kyjung2357",
+  "private": true,
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "review",
+    "diff",
+    "approval",
+    "revision",
+    "rr"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kyjung2357/revision-request.git"
+  },
+  "main": "./.codex-build/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Proposals can be viewed; accepting changes requires a trusted workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "revision-request",
+        "aliases": [
+          "Revision Request",
+          "rr"
+        ],
+        "extensions": [
+          ".rr"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./media/rr-file-icon.svg",
+          "dark": "./media/rr-file-icon.svg"
+        }
+      }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": "*.rr",
+        "url": "./schemas/revision-request.schema.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "revisionRequest.refresh",
+        "title": "Revision Request: Refresh Requests",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "revisionRequest.openRequest",
+        "title": "Revision Request: Open Request"
+      },
+      {
+        "command": "revisionRequest.openSource",
+        "title": "Open RR as JSON",
+        "icon": "$(code)"
+      },
+      {
+        "command": "revisionRequest.openDiff",
+        "title": "Native diff",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "revisionRequest.showRequests",
+        "title": "Revision Request: Show Requests"
+      },
+      {
+        "command": "revisionRequest.openPreview",
+        "title": "Revision Request: Open Preview",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "revisionRequest.copyMcpConfiguration",
+        "title": "Revision Request: Copy MCP Configuration"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "revisionRequest",
+          "title": "Revision Request",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "revisionRequest": [
+        {
+          "id": "revisionRequest.requests",
+          "name": "Requests"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "revisionRequest.requests",
+        "contents": "No .rr requests in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "revisionRequest.refresh",
+          "when": "view == revisionRequest.requests",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "revisionRequest.openPreview",
+          "when": "resourceExtname == .rr",
+          "group": "navigation"
+        },
+        {
+          "command": "revisionRequest.openSource",
+          "when": "activeWebviewPanelId == revisionRequest.review",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "revisionRequest.openPreview",
+          "when": "resourceExtname == .rr",
+          "group": "navigation@1"
+        },
+        {
+          "command": "revisionRequest.openDiff",
+          "when": "resourceExtname == .rr",
+          "group": "navigation@2"
+        },
+        {
+          "command": "revisionRequest.openSource",
+          "when": "resourceExtname == .rr",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Revision Request",
+      "properties": {
+        "revisionRequest.previewOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the comparison preview automatically when you open a .rr file. Turn off to open JSON first. Open RR as JSON always opens the source."
+        },
+        "revisionRequest.unchangedOpacity": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Opacity of unchanged code in the right-hand RR preview, as a percentage. 0 hides it and 100 shows it fully. Pending changes and the original on the left stay fully visible."
+        },
+        "revisionRequest.autoDeleteCompleted": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically delete the .rr request after its last pending change is accepted or ignored. Uses the system trash when available. Turn off to keep completed requests."
+        },
+        "revisionRequest.highlightChangedLines": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a background tint across pending changed lines. Turn off to keep only the stronger highlights on changed text."
+        },
+        "revisionRequest.showOnlyChangedText": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hide unchanged characters within pending changed lines, keeping their space for alignment. Only the changed characters remain visible. Other context lines are unaffected."
+        },
+        "revisionRequest.mcp.allowAgentDecisions": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Allow AI agents connected through Revision Request MCP to Accept, Ignore, and Undo changes, including bulk actions. Disabled by default. Only User Settings can enable this; workspace settings cannot. Human preview buttons are unaffected."
+        }
+      }
+    },
+    "grammars": [
+      {
+        "language": "revision-request",
+        "scopeName": "source.json.revision-request",
+        "path": "./syntaxes/revision-request.tmLanguage.json"
+      }
+    ],
+    "jsonLanguageParticipants": [
+      {
+        "languageId": "revision-request",
+        "comments": false
+      }
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node scripts/build.cjs",
+    "test": "tsx --test test/core.test.ts",
+    "request": "tsx scripts/create-request.ts",
+    "test:extension": "node scripts/test-extension.cjs",
+    "package": "node scripts/package.cjs",
+    "test:ui": "node test/review-browser.cjs",
+    "test:mcp": "npm run build && tsx --test test/mcp.test.ts",
+    "vscode:prepublish": "npm run check && npm run build"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.1.0",
+    "diff": "^9.0.0",
+    "esbuild": "^0.27.0",
+    "tsx": "^4.0.0",
+    "typescript": "^7.0.2"
+  },
+  "extensionDependencies": [
+    "vscode.json-language-features"
+  ],
+  "license": "MIT"
+}

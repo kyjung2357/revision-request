@@ -1,0 +1,123 @@
+# Connect an agent through MCP
+
+Revision Request exposes a local MCP server so an agent can read an existing source file, submit a `.rr` proposal, open its preview, and check your review decisions. Creating a proposal leaves the target unchanged. The default workflow keeps Accept, Ignore, and Undo in the user's VS Code review UI.
+
+This works with existing UTF-8 text files such as `.py`, `.ts`, `.md`, `.json`, and `.tex`. It is not limited to LaTeX. See the [English format reference](FORMAT.md), [한국어 JSON 규격](FORMAT.ko.md), and [JSON schema](../schemas/revision-request.schema.json).
+
+## Connect a client
+
+1. Open and trust the target local workspace in VS Code with Revision Request enabled.
+2. Run **Revision Request: Copy MCP Configuration** from the Command Palette.
+3. Choose the workspace if more than one is open, then select generic JSON or Codex TOML. Add the copied configuration to your MCP client's server settings in the format it accepts. Preserve the generated executable, arguments, environment, and workspace values instead of guessing an extension installation path.
+4. Reload or reconnect that MCP server in your client, then call `rr_get_format` to check the adapter connection and load the request instructions. This offline tool does not verify the live VS Code bridge; `rr_list_requests` can verify workspace access.
+5. Keep the relevant VS Code workspace window open for source reads, request creation, previews, and review status.
+
+The bundled adapter communicates with the client over **stdio** and connects to the extension's **local VS Code bridge**. Its generated configuration uses VS Code's Node runtime with `ELECTRON_RUN_AS_NODE`, so a separate Node installation is not required. Revision Request does not need a model API key. Copying configuration does not edit your client's settings automatically.
+
+The extension keeps a stable adapter copy in its global storage and refreshes it on activation, so the copied configuration does not depend on a versioned extension installation directory. The generated configuration pins the selected workspace URI. If two live VS Code windows have the same workspace open, close the extra window: the adapter rejects ambiguous instances instead of choosing one silently. An optional `--instance-id` can pin a specific bridge instance, but that instance changes on reload; the generated configuration uses the workspace instead.
+
+The bundled format guides, schema, and examples remain available through MCP even when the VS Code bridge is unavailable. File and review tools require the live bridge and a trusted local workspace. Remote and virtual workspaces are not supported by this adapter.
+
+## The agent cannot approve by default
+
+The VS Code User setting `revisionRequest.mcp.allowAgentDecisions` defaults to **false**. In this mode:
+
+- `rr_decide` and `rr_undo` are absent from the available tool list.
+- The server also rejects direct attempts to invoke those operations, including bulk Accept or Ignore. Hiding tools is not the only enforcement.
+- The user can still Accept, Ignore, and Undo in the extension's UI.
+
+Only an explicit **User-level** setting enables agent decisions. This is an application-scoped preference; a workspace's `.vscode/settings.json` cannot grant it:
+
+```json
+{ "revisionRequest.mcp.allowAgentDecisions": true }
+```
+
+Leave the setting off for human approval. If it is enabled, the MCP client may need to refresh its tool list or reconnect before displaying the optional tools. Turning it off removes permission even if a client still has a cached tool definition.
+
+This setting governs **Revision Request's MCP decision tools**. It does not sandbox an agent's other filesystem tools or mouse/keyboard automation, and it does not prevent edits made outside this MCP server.
+
+## Read, propose, and return immediately
+
+A normal agent workflow is:
+
+1. Read `rr://format/v1` or call `rr_get_format` with the preferred language.
+2. Call `rr_read_target` with a workspace-relative path. It returns `path`, exact saved `content`, and its SHA-256 `hash`. Keep the text and hash together. Save or undo unsaved target edits first; reads and proposals refuse dirty targets.
+3. Prepare the complete proposed `after` text, preserving unrelated content, line endings, BOM, and final-newline behavior.
+4. Call `rr_create_request` using the returned hash as `expectedHash` and a fresh `clientRequestId` for this proposal.
+5. Use the returned request ID with `rr_open_preview` when the user should see the review.
+6. Report that the proposal is pending. Check `rr_get_request_status` later to learn what the user accepted or ignored.
+
+Creation returns a pending request; it does not keep a tool call open waiting for the human. Poll status when needed instead of interpreting the initial response as approval or waiting indefinitely in a creation call.
+
+For example, if `src/math.py` currently contains `def square(x):\n    return x + x\n`, the tool calls are:
+
+```json
+{ "path": "src/math.py" }
+```
+
+Pass that object to `rr_read_target`, then send this shape to `rr_create_request` with the actual returned hash:
+
+```json
+{
+  "path": "src/math.py",
+  "expectedHash": "<hash returned by rr_read_target>",
+  "after": "def square(x):\n    return x * x\n",
+  "clientRequestId": "7426dddf-85b8-4d67-9f4d-4f5b555d263d",
+  "title": "Correct the square operation",
+  "reason": "Multiplication computes the square for every input.",
+  "explanations": [
+    { "line": 2, "text": "Replace addition with multiplication." }
+  ]
+}
+```
+
+The server reads and fills the exact `before` snapshot, validates that the target still matches `expectedHash`, and creates the `.rr` file exclusively. It does not write `after` into the target. MCP creates the request beside the target: `src/math.py` becomes `src/math.py.rr`. The filename preserves the full target basename and extension.
+
+If the source changed, read it again and prepare a fresh proposal. Do not substitute a guessed hash or reuse an old snapshot. Retrying the **same `clientRequestId` with the same payload** is idempotent, including when the client lost the first response. Reusing that ID for a different payload is not a new proposal; use a new ID instead. An existing request file is not silently overwritten. Idempotency records share the bounded local request registry; this is not permanent retry history. If an old record has expired, inspect the current source and requests before submitting again.
+
+## Tools
+
+Paths are relative to the connected workspace. Request IDs, revisions, hunk IDs, and hashes are returned values; do not infer them from filenames or line numbers.
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `rr_get_format` | Optional `language`: `en` (default) or `ko` | Returns the guide, schema, and examples, including when the VS Code bridge is offline. |
+| `rr_read_target` | `path` | Reads an existing UTF-8 target and returns its content and hash. |
+| `rr_create_request` | `path`, `expectedHash`, `after`, `clientRequestId`; optional `title`, `reason`, `explanations` | Creates a pending `.rr` request without changing the target. The server supplies required title metadata if omitted. |
+| `rr_list_requests` | Optional `includeCompleted` (default `false`) | Lists existing requests; set true to also include retained completion receipts after cleanup. |
+| `rr_get_request_status` | `requestId` | Retrieves the request's current review state or retained completion receipt. |
+| `rr_open_preview` | `requestId` | Opens the review UI without making a decision. |
+| `rr_decide` | `requestId`, `revision`, `decision`: `accepted` or `ignored`; optional `hunkId` | **Only when agent decisions are enabled.** Decides one hunk, or all pending hunks when `hunkId` is omitted. |
+| `rr_undo` | `requestId`, `revision`, `hunkId` | **Only when agent decisions are enabled.** Returns one resolved hunk to pending through the same checks as UI Undo. |
+
+Request discovery scans up to 1,000 `.rr` files and excludes `node_modules`, `.git`, and `.codex-*` folders. A live completed request can appear even without `includeCompleted`; that option adds stored completion receipts. Keep the returned request ID when creating a request, including one in an excluded folder.
+
+Decision calls must use the current revision returned by the server. A changed request must be reviewed again. Accepted changes and accepted-block Undo also reject stale or unsaved target edits. Undo of an ignored block changes review metadata only.
+
+## Built-in resources
+
+| Resource URI | Contents |
+| --- | --- |
+| `rr://format/v1` | English version-1 format guide. |
+| `rr://format/v1/ko` | Korean version-1 JSON format guide. |
+| `rr://schema/v1` | Version-1 JSON schema. |
+
+These are bundled local instructions. They do not require a model service, API key, or running VS Code bridge. `rr_get_format` is the tool alternative for clients that do not expose MCP resource browsing conveniently.
+
+## Completion, deletion, and Undo
+
+By default, `revisionRequest.autoDeleteCompleted` deletes the `.rr` file after the last successful Accept or Ignore, using the system Recycle Bin/Trash when available. MCP status retains a completion receipt so an agent can learn the final accepted/ignored result after that cleanup. These are local metadata records, not copies of the full source snapshots. Storage is bounded to 256 receipts, so older results can expire.
+
+Status includes the request ID and revision, pending/accepted/ignored counts, and individual hunk decisions. Its `status` is `pending`, `completed`, `stale`, or `unavailable`; a completed receipt can also report cleanup as `retained`, `deleted`, or `failed`. A completed review may contain ignored blocks, so completion is not the same as accepting everything.
+
+**A missing `.rr` file is not proof of acceptance.** Use the status or completion receipt. A request can be removed or changed outside the review; an unavailable or unknown request must not be reported as accepted.
+
+Per-block Undo requires the request to remain available. Turn off `revisionRequest.autoDeleteCompleted` before finishing if you want completed requests and their Undo controls retained. A completion receipt records the result; it is not a substitute for a live request that can still be undone. Native editor Undo is not guaranteed for the extension's exact filesystem writes.
+
+## Connection and validation errors
+
+If format resources work but file tools cannot connect, reopen and trust the intended local VS Code workspace and reconnect using its generated configuration. If a path is rejected, use a forward-slash path inside that workspace; absolute paths, traversal, and escaping symlinks are not accepted. Existing UTF-8 text targets are supported; binary files and creating, deleting, or renaming target files are outside this format.
+
+Identical proposals are rejected as `NO_CHANGES`. The proposal must preserve the target's BOM, and malformed UTF-8 or unpaired Unicode surrogates cannot be saved as exact source text.
+
+If creation reports an existing output, inspect that request instead of overwriting it. If a decision tool is unavailable or denied, check the User-level agent-decision setting; workspace configuration cannot enable it.
