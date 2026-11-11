@@ -1,155 +1,91 @@
 # Revision Request
 
-Review proposed changes before they reach your files.
+**Revision Request** lets you review proposed changes and decide which ones to apply to your files.
 
-Revision Request adds a visual comparison preview for **`.rr` files**. By default, opening `manuscript.tex.rr` in Explorer opens one preview tab with the original/current text on the left and the proposed text on the right. Compare the highlighted changes, then **Accept** or **Ignore** each change block. Opening the source or preview and ignoring a block do not write to the target file.
+Each `.rr` file contains a revision request for one existing UTF-8 text file (for example, `.py`, `.ts`, `.md`, `.json`, and `.tex`). Opening it does not modify the original.
 
-Existing UTF-8 source files such as `.py`, `.ts`, `.md`, `.json`, and `.tex` use the same workflow. Revision Request is not limited to LaTeX.
+**Accept** applies the change, **Ignore** leaves the original unchanged.
 
-This extension is a local review tool. Your agent creates the proposal; it does not need to move into another chat or generate a patch for you to copy.
+## Installation 
 
-## Start with your own files
+- Search for `revision request` in the Extensions view in VS Code.
+- Download via [marketplace](https://marketplace.visualstudio.com/items?itemName=kyjung2357.revision-request).
 
-1. Install Revision Request, or use **Extensions → Install from VSIX...** with a supplied package.
-2. Open your project folder in VS Code. Your target must be an existing UTF-8 text file inside that workspace.
-3. Ask your agent to create a request named after the complete target filename, such as `main.py.rr` for `main.py`, without editing the target. Use the [request format](docs/FORMAT.md), [한국어 JSON 규격](docs/FORMAT.ko.md), or [MCP connection guide](docs/MCP.md).
-4. Open the `.rr` file in Explorer. Review the aligned comparison and choose **Accept** or **Ignore** for each block. Trust the workspace before applying decisions.
+## Review a revision request
 
-No repository clone, demo files, or command-line setup is needed to review a request. By default, the last decision deletes the completed request; disable **Revision Request: Auto Delete Completed** first if you want to retain it and its Undo controls.
+1. Open the project folder containing the original file in VS Code, and place the `.rr` request inside that workspace.
+2. Open the `.rr` file. Its preview opens automatically by default; if needed, right-click the request in Explorer and choose **Open Preview**.
+3. Compare the original and proposed text, then use **Accept** or **Ignore** for each change.
+4. When finished, keep the `.rr` file to retain available Undo controls, or delete it. By default, **Accept all** and **Ignore all** ask whether to delete the request when they complete the review.
 
-## Try the repository demo
+Try the [example requests](examples/README.md) for replacements, added and deleted lines, an empty starting file, and clearing all content.
 
-The demo and proposal-creation CLI are available in the [source repository](https://github.com/kyjung2357/revision-request). They are not installed as project files by the extension package.
+Accepting changes requires workspace trust. Unsaved or conflicting changes to the original block Accept and Undo of accepted changes. If the original has changed outside this review, generate a fresh request from the current file.
 
-1. Open this repository as a folder in VS Code with the extension enabled.
-2. Open `examples/manuscript.tex.rr` in Explorer, or select it in **Revision Request → Requests**. Its comparison preview opens automatically.
-3. In **manuscript.tex.rr — Preview**, compare the original/current text on the left with the full proposed text on the right. Added and removed text is highlighted; each change group has **Accept** and **Ignore** controls.
-4. Choose **Accept** on one block and **Ignore** on the other. After the last decision, the completed `.rr` request is deleted using the system Recycle Bin/Trash when available, and its preview closes by default. Turn off **Revision Request: Auto Delete Completed** to keep completed requests.
+### Buttons
 
-The two comparison columns share vertical scrolling. Corresponding lines stay aligned, with blank spacer rows for additions and deletions and equal-height file banners. Both columns belong to this single `.rr` preview. Opening the request uses this preview only; clicking the filename beneath **ORIGINAL** opens the actual editable target file in a native editor. Right-click the `.rr` file in Explorer and choose **Native diff** to open the native comparison, or **Open RR as JSON** to inspect its stored source without triggering automatic preview. These actions live in the file context menu; the preview has no top toolbar. The preview does not depend on Git or a worktree.
+- **Accept**: Apply and save the selected change to the original file.
+- **Ignore**: Record the decision without changing the original.
+- **Accept all / Ignore all**: Decide all remaining pending changes in the request.
+- **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and the original still matches the recorded changes.
+- **Why**: Show the change's explanation in a popover. The button is disabled when no explanation is provided.
+- **ORIGINAL**: Click the filename beneath this label to open the editable original file.
+- **Native diff**: Use this Explorer context-menu command on a `.rr` file to open VS Code's built-in comparison.
+- **Open RR as JSON**: Use this Explorer context-menu command to inspect the stored request without automatically opening its preview.
 
-Each pending block has **Accept**, **Ignore**, and **Why** inline at the right edge of its first changed row. **Why** opens the block explanation in a popover without shifting the aligned source rows. It is disabled and dim when no explanation is provided. After a decision, the same area shows **Accepted** or **Ignored** on the left and **Undo** on the right; resolved blocks do not show Why. Undo returns that block to pending while the `.rr` request remains available. There is no separate control row or banner explanation toggle.
+## Create a request with an AI agent
 
-Accept applies the chosen block to the target shown on the left. Undo on an accepted block restores that block's original text while preserving other accepted revisions. The extension writes the exact accepted UTF-8 content, bypassing format-on-save and other save participants. A red removed line and a green added line are review decorations, not commands inserted into your source.
+Ask your AI agent to create a `.rr` request without modifying the original. The [request format](docs/FORMAT.md) explains the JSON structure and includes examples for replacements, insertions, and deletions.
 
-The original demo is a small standalone LaTeX file. It does not reference or modify any research manuscript.
+MCP lets the agent read the original, create requests, open previews, and check your review decisions through the extension. Open and trust your local workspace in VS Code with Revision Request enabled, then ask your agent:
 
-## Choose how requests open
+> Read the [Revision Request MCP guide](https://github.com/kyjung2357/revision-request/blob/main/docs/MCP.md) and help me connect this AI client to Revision Request. Use the configuration generated by the VS Code extension, and verify access to my workspace after connecting.
 
-`revisionRequest.previewOnOpen` is **true** by default, so opening a request from Explorer launches its visual preview.
+The agent may need you to run **Revision Request: Copy MCP Configuration** or reconnect your AI client. **Agent Accept, Ignore, and Undo through MCP are disabled by default.** See the [MCP guide](docs/MCP.md) for setup and tool details. MCP is optional when an agent writes a `.rr` file directly.
 
-Set it to **false** for a Markdown-style source-first workflow:
+For the desktop plugin with bundled skills and an MCP launcher, see [plugin setup](plugin/README.md).
 
-```json
-{ "revisionRequest.previewOnOpen": false }
-```
+## Create a request from your own edits
 
-With this setting off, opening a `.rr` file shows JSON. Use the editor-title **Open Preview** icon, the file context menu, or **Revision Request: Open Preview** in the Command Palette to open its visual review. Selecting a request in the Requests sidebar still opens its preview directly. **Open RR as JSON** always opens the source without triggering preview, regardless of the setting.
+Use this workflow when you have edited a copy yourself and want someone else to review the changes.
 
-`.rr` source files use the **Revision Request** language mode with JSON syntax highlighting, schema validation, completion, and formatting from VS Code's built-in JSON support. Their default Explorer icon is **RR**, with a red first R and green second R. Ordinary `.json` files keep their existing language and icon. The active file-icon theme controls whether language-default icons are displayed; the extension does not change your theme.
+1. Keep the original file, such as `paper/section.tex`, and make your edits in a separate copy, such as `paper/section.proposed.tex`.
+2. Open and trust the workspace containing the original in VS Code. Save both files.
+3. In the **Revision Request** sidebar, click the **+** button (**Create Revision Request**) at the top of **Requests**. Select the original file first, then the modified copy.
+4. The extension creates `paper/section.tex.rr` beside the original and opens its preview. Both input files remain unchanged, and an existing request is never overwritten.
+5. Send the generated `.rr` file, with its changes still pending, to the reviewer.
 
-## Adjust unchanged text visibility
+The reviewer needs Revision Request and a copy of the original with the same contents at the request's workspace-relative `path`. If they already have that original, you only need to send the `.rr` file.
 
-The right comparison column shows unrelated, unchanged code at **20% opacity** by default so pending changes stand out. Adjust **Revision Request: Unchanged Opacity** in VS Code Settings, or set `revisionRequest.unchangedOpacity` to any value from **0 to 100**:
+### Using the repository CLI
 
-```json
-{ "revisionRequest.unchangedOpacity": 20 }
-```
-
-At 0, unchanged code is hidden while its rows keep the comparison aligned; at 100, it is fully visible. Pending changes and their buttons stay at full opacity. The left column is unaffected. This option is available in extension settings only.
-
-## Choose how changed text is highlighted
-
-Pending changes highlight the exact removed or inserted characters, including multiple separate changes on one line. Two independent extension settings control the surrounding display:
-
-- **Revision Request: Highlight Changed Lines** (`revisionRequest.highlightChangedLines`, default **true**) adds a faint red/green background across changed rows. Turning it off keeps the stronger character highlights.
-- **Revision Request: Show Only Changed Text** (`revisionRequest.showOnlyChangedText`, default **false**) makes common characters within pending changed rows transparent. Their space remains, so both columns stay aligned. Changed characters, buttons, and unrelated context stay visible according to their existing settings.
-
-```json
-{
-  "revisionRequest.highlightChangedLines": true,
-  "revisionRequest.showOnlyChangedText": false
-}
-```
-
-These options are available only in VS Code extension settings. They do not edit the source or request. Accepted or ignored blocks return to normal context rendering; **Undo** restores their pending character highlights.
-
-## Keep completed requests
-
-`revisionRequest.autoDeleteCompleted` is **true** by default. After a successful Accept or Ignore leaves no pending blocks, the extension deletes the `.rr` request using the system Recycle Bin/Trash when available and closes its preview and clean JSON tabs. The original file keeps exactly the accepted revisions; ignored blocks do not change it.
-
-To retain completed requests and their baseline snapshots, turn off **Revision Request: Auto Delete Completed** in VS Code Settings:
-
-```json
-{ "revisionRequest.autoDeleteCompleted": false }
-```
-
-Opening a request that already has no changes does not trigger deletion. This setting controls the `.rr` proposal only, not its target file. Keeping a completed request also keeps its per-block **Undo** controls available.
-
-## Create a request
-
-Ask your agent to create a `.rr` proposal with the current file text in `before` and its proposed text in `after`, without editing the original. The extension computes the differences.
-
-Each request reviews exactly one target. Its name is the complete target filename plus `.rr`: `section.tex` → `section.tex.rr`, and `section.md` → `section.md.rr`. The `files` array contains exactly one item:
-
-```json
-{
-  "version": 1,
-  "title": "Clarify the definition",
-  "description": "Optional request metadata.",
-  "files": [
-    {
-      "path": "paper/section.tex",
-      "before": "The exact original text.\n",
-      "after": "The exact proposed text.\n",
-      "reason": "Default explanation for each change block.",
-      "explanations": [{ "line": 1, "text": "A specific explanation for this block." }]
-    }
-  ]
-}
-```
-
-Paths are relative to the **VS Code workspace folder containing the request**, even when the `.rr` file is in a subfolder. Keep exact line endings and the final newline in both snapshots.
-
-Use `reason` as the default explanation for each block and optional `explanations` entries for specific blocks. An entry matches the first original line of that block; an empty `text` disables its **Why** button. `title` is required request metadata and `description` is optional metadata; neither is displayed in the preview banner. The right banner shows the proposed-side label, decision counts, and file actions.
-
-See the [English format reference](docs/FORMAT.md), [한국어 JSON 규격](docs/FORMAT.ko.md), and [JSON schema](schemas/revision-request.schema.json).
-
-### Generate a request from a separate modified copy
-
-The repository CLI can create the proposal for an agent or a script after installing the repository dependencies. It reads both files and leaves the original unchanged:
+From a clone of this repository, run `npm ci` once, then:
 
 ```sh
-npm run request -- --workspace . --original paper/section.tex --proposed .codex-work/section.proposed.tex --title "Clarify the definition"
+npm run request -- --workspace . --original paper/section.tex --proposed paper/section.proposed.tex --reason "Clarify the definition."
 ```
 
-By default, this creates `paper/section.tex.rr` beside the original. Optional `--output proposals/section.tex.rr` can place it elsewhere inside the workspace, but the filename must remain `section.tex.rr` and its directory must already exist. The CLI refuses to overwrite an existing request, rejects a target outside the workspace, and reports identical files instead of producing an empty proposal. Run `npm run request -- --help` for all options.
+This creates `paper/section.tex.rr` without changing either input. Optional `--output proposals/section.tex.rr` selects another existing folder inside the workspace; keep the filename `section.tex.rr`. Existing requests are never overwritten. Run `npm run request -- --help` for all options.
 
-## Connect an agent with MCP
+Both creation methods preserve the original line endings and UTF-8 BOM. Changes that line entries cannot represent, such as line-ending-only or final-newline-only changes, are rejected.
 
-Run **Revision Request: Copy MCP Configuration** in VS Code, choose the workspace and generic JSON or Codex TOML, and add the copied configuration to your MCP client. The bundled stdio adapter connects to the local VS Code extension using VS Code's Node runtime; no separate Node installation or model API key is required. Keep that trusted local workspace open. The command copies configuration without editing client settings.
+## Other functions 
 
-An agent can read the current target and its hash with `rr_read_target`, create a proposal with `rr_create_request`, open its preview, and check `rr_get_request_status`. The server supplies the original snapshot, checks the hash, and creates only the `.rr` file. Creation returns pending immediately; the agent can check the human's decisions later. After automatic deletion, a bounded local completion receipt remains available; a missing request never means accepted.
+- **Resize columns**: Drag the center divider; the preview remembers its position. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 
-**Agents cannot Accept, Ignore, or Undo through MCP by default.** The User-level application setting `revisionRequest.mcp.allowAgentDecisions` defaults to `false`; those tools are hidden and their operations are denied. Explicitly enabling it in User settings allows agent decisions. Workspace settings cannot enable it, and the user's review UI is unaffected. This setting does not restrict independent filesystem tools or mouse automation.
+- **Edit proposal**: Click pending code to edit one source line in place. Save and Cancel replace its action buttons. Save changes only the `.rr` proposal; Accept is still required to change the original. Saving the original content removes that entry without affecting other decisions. Undo resolved entries before editing them.
 
-Agents can load the bundled guides and schema through `rr_get_format` (`language: "en"` or `"ko"`) or the resources `rr://format/v1`, `rr://format/v1/ko`, and `rr://schema/v1`, even without a live VS Code bridge. See [MCP connection, tool arguments, and review status](docs/MCP.md) for the full workflow.
 
-## Review behavior
 
-- **Accept** writes only the chosen pending change block to its target file, with exact byte persistence rather than a normal editor save. The left comparison column updates to reflect the accepted result.
-- **Ignore** records your decision and leaves the target untouched.
-- **Undo** returns a resolved block to pending. For an accepted block, it reverts only that block in the target; for an ignored block, it changes the decision only. Other blocks keep their current decisions.
-- The per-block **Undo** button is available while the `.rr` exists. To use it after completing the review, turn off **Revision Request: Auto Delete Completed** before the last decision. Native editor Undo is not guaranteed for extension writes.
-- File-level controls accept or ignore all remaining blocks in that file.
-- Decisions are stored locally in VS Code's workspace state; the `.rr` document itself is not rewritten. By default, the last successful Accept or Ignore deletes the completed request using the system Recycle Bin/Trash when available and closes its preview and clean JSON tabs.
-- Reopening a retained, unchanged proposal restores its decisions. A no-change request is not automatically deleted merely by opening it.
-- Changing the proposal creates a new review. If its `before` snapshot no longer matches the target, acceptance is blocked.
-- Unsaved target edits or changes made outside this review block acceptance and Undo of accepted changes. If the original has changed, the preview shows a warning and the request snapshot instead of presenting the stale comparison as current. Regenerate a request from the current target before trying again.
-- A request must be inside an open workspace. Accepting changes requires workspace trust. Its targets must stay inside that same workspace.
-- The initial version reviews **existing UTF-8 text files**. New-file creation, deletion, and binary files are not supported.
+## Settings
 
-If another person or agent edits a target while you are reviewing it, Revision Request does not silently overwrite those edits.
+See [Settings](docs/SETTINGS.md) for preview behavior, appearance, completed-request cleanup, and MCP permissions, with their defaults.
+
+## Limits
+
+Requests are limited to 20 MiB, source text and each fragment to 5 MiB of UTF-8 text, and each reason to 50,000 UTF-8 bytes. Up to 10,000 entries are allowed, subject to bounded comparison time. NUL characters, invalid Unicode, binary files, non-UTF-8 files, absolute paths, traversal, and unsafe filenames are rejected.
+
+See the [JSON schema](schemas/revision-request.schema.json) and [MCP connection guide](docs/MCP.md).
 
 ## Develop
 
@@ -160,18 +96,16 @@ npm run build
 npm test
 ```
 
-Press **F5** to launch an Extension Development Host, then open the repository folder and `examples/manuscript.tex.rr` there. Its preview opens by default; use **Open Preview** if automatic preview is disabled. Use a disposable copy of the demo when testing Accept, since it intentionally changes the selected target.
+Press **F5** to launch an Extension Development Host. Test Accept against disposable files.
 
-Run `npm run test:extension` for the Extension Development Host checks. Run `npm run test:mcp` for authenticated bridge and bundled stdio adapter protocol checks. Run `npm run test:ui` for real browser layout checks using an installed Edge or Chrome, without additional downloads. Run `npm run package` to build `.codex-artifacts/revision-request-0.1.1.vsix`. Install that package from the Extensions view with **Install from VSIX...**, then open a `.rr` file. Its preview opens by default; **Open Preview** is available when automatic preview is disabled.
+Additional checks: `npm run test:extension`, `npm run test:mcp`, and `npm run test:ui` (Edge or Chrome required).
 
-Temporary build, test, and packaged artifacts live under ignored `.codex-*` directories. See the [한국어 수동 배포 안내](docs/PUBLISHING.ko.md) for local packaging and Marketplace upload steps.
+Run `npm run package` to create a VSIX; its path is printed. Install it with **Extensions → Install from VSIX...**.
 
-The current release was tested on **Windows with VS Code 1.145.3**. macOS, Linux, and the declared minimum VS Code 1.96 have not been tested.
+Run `npm run test:plugin` for the plugin connection checks and `npm run package:plugin` to create its ZIP package. The repo marketplace in `.agents/plugins/marketplace.json` also supports local installation directly from `plugin/`.
+
+Tested on **Windows with VS Code 1.145.3**. macOS, Linux, and VS Code 1.96 remain untested.
 
 ## License
 
-Revision Request is released under the [MIT License](LICENSE), which permits commercial reuse with its required notices. Bundled third-party components retain their respective licenses. The build generates `.codex-build/THIRD_PARTY_NOTICES.txt`, and the VSIX includes that file with their copyright and license notices. Keep those notices when redistributing the extension.
-
-## Scope
-
-The extension does not call an AI model, send proposals to a service, or publish changes. Creating a `.rr` request is separate from accepting it. The proposal contains source text, so share it only where you would share the underlying files.
+Revision Request is released under the [MIT License](LICENSE), which permits commercial reuse with its required notices. Bundled third-party components retain their respective licenses. Their copyright and license notices are included in `THIRD_PARTY_NOTICES.txt` with the extension. Keep those notices when redistributing the extension.

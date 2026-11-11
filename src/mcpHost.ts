@@ -3,7 +3,8 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
-import { computeHunks, parseRequest, requestFingerprint } from './core';
+import { validateRequestPath, requestFingerprint } from './core';
+import { parseRequestDocument, proposalIdentity, resolveRequest } from './request';
 import type { ReviewService } from './extension';
 import { McpBridgeError, type McpHandler, type McpStatus } from './mcpTypes';
 
@@ -12,7 +13,7 @@ const MAX_RECEIPTS = 256;
 const MAX_ACTIVE = 1000;
 interface RequestRecord {
   requestId: string; workspaceUri: string; uri: string; path: string;
-  fingerprint: string; stamp: string; createdAt: number;
+  fingerprint: string; stamp: string; createdAt: number; rawRevision?: string;
   clientRequestId?: string; inputHash?: string; receipt?: McpStatus;
 }
 const hash = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
@@ -37,7 +38,7 @@ function requiredString(value: unknown, label: string, maximum = 4096): string {
 function validatePath(value: unknown): string {
   // Reuse the actual format validator; do not maintain a weaker MCP path syntax.
   const result = requiredString(value, 'path');
-  parseRequest(JSON.stringify({version: 1, title: 'Path validation', files: [{path: result, before: '', after: ''}]}));
+  validateRequestPath(result);
   if (result.split('/').some(part => part.toLowerCase() === '.git')) throw new McpBridgeError('OUTSIDE_WORKSPACE', 'Git metadata cannot be a revision target.');
   return result;
 }
@@ -130,24 +131,28 @@ export class McpHost {
     const bytes = await fs.readFile(real);
     if (bytes.length > 20 * 1024 * 1024) throw new McpBridgeError('INVALID_REQUEST', 'The request exceeds the format size limit.');
     const text = utf8(bytes).replace(/^\uFEFF/, '');
-    const request = parseRequest(text);
-    if (path.basename(uri.fsPath) !== path.basename(request.files[0]!.path) + '.rr') throw new McpBridgeError('INVALID_REQUEST', 'The request filename must be the complete original filename followed by .rr.');
+    const request = parseRequestDocument(text);
+    const targetPath = request.path;
+    if (path.basename(uri.fsPath) !== path.basename(targetPath) + '.rr') throw new McpBridgeError('INVALID_REQUEST', 'The request filename must be the complete original filename followed by .rr.');
     if (!samePath(await fs.realpath(uri.fsPath), real)) throw new McpBridgeError('REQUEST_CHANGED', 'The request path changed while reading it.');
     await this.rejectDirty(uri, real);
     this.workspace(folder.uri.toString());
-    return {request, fingerprint: requestFingerprint(text), stamp: stat.dev + ':' + stat.ino + ':' + stat.birthtimeMs};
+    return {request, targetPath, revision: requestFingerprint(text),
+      fingerprint: proposalIdentity(request),
+      stamp: stat.dev + ':' + stat.ino + ':' + stat.birthtimeMs};
   }
   private async registerRequest(folder: vscode.WorkspaceFolder, uri: vscode.Uri, identity?: {clientRequestId: string; inputHash: string}) {
     return this.mutate(async records => {
-      const {request, fingerprint, stamp} = await this.inspectRequest(folder, uri);
+      const {targetPath, fingerprint, revision, stamp} = await this.inspectRequest(folder, uri);
       const existing = records.find(item => item.workspaceUri === folder.uri.toString() && item.uri === uri.toString() && item.fingerprint === fingerprint && item.stamp === stamp && item.receipt?.cleanup !== 'deleted');
       if (existing) {
+        existing.rawRevision = revision;
         if (identity) Object.assign(existing, identity);
         return {...existing};
       }
       const record: RequestRecord = {
         requestId: randomUUID(), workspaceUri: folder.uri.toString(), uri: uri.toString(),
-        path: request.files[0]!.path, fingerprint, stamp, createdAt: Date.now(), ...identity,
+        path: targetPath, fingerprint, rawRevision: revision, stamp, createdAt: Date.now(), ...identity,
       };
       records.push(record);
       return {...record};
@@ -162,30 +167,46 @@ export class McpHost {
   private unavailable(record: RequestRecord, issue: string): McpStatus {
     return {
       requestId: record.requestId, requestPath: path.relative(vscode.Uri.parse(record.workspaceUri).fsPath, vscode.Uri.parse(record.uri).fsPath).split(path.sep).join('/'),
-      path: record.path, revision: record.fingerprint, status: 'unavailable', pending: 0, accepted: 0, ignored: 0, hunks: [], issue,
+      path: record.path, revision: record.rawRevision ?? record.fingerprint, status: 'unavailable', pending: 0, accepted: 0, ignored: 0, hunks: [], issue,
     };
   }
   private async status(record: RequestRecord): Promise<McpStatus> {
     if (record.receipt?.cleanup === 'deleted') return {...record.receipt};
     const uri = vscode.Uri.parse(record.uri);
+    // Preparation may fill a missing creation time or recover a known interrupted
+    // metadata write. Read state first, then bind it to the saved raw revision.
+    let state = await this.service.getState(uri, false);
     let inspected: Awaited<ReturnType<McpHost['inspectRequest']>>;
-    try { inspected = await this.inspectRequest(this.workspace(record.workspaceUri), uri); }
-    catch (error) { return this.unavailable(record, error instanceof Error ? error.message : 'The request is unavailable.'); }
+    try {
+      inspected = await this.inspectRequest(this.workspace(record.workspaceUri), uri);
+      // A saved external status edit can reach disk before VS Code refreshes its
+      // clean text model. Wait briefly for that model, but never follow a different
+      // proposal or file generation and never treat a mismatched revision as valid.
+      const deadline = Date.now() + 1500;
+      while (state.revision !== inspected.revision && inspected.stamp === record.stamp &&
+          inspected.fingerprint === record.fingerprint && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        state = await this.service.getState(uri, false);
+        inspected = await this.inspectRequest(this.workspace(record.workspaceUri), uri);
+      }
+    } catch (error) { return this.unavailable(record, error instanceof Error ? error.message : 'The request is unavailable.'); }
     if (inspected.stamp !== record.stamp || inspected.fingerprint !== record.fingerprint) {
       return this.unavailable(record, 'This path now contains changed contents or a different request generation. List requests again.');
     }
-    const state = await this.service.getState(uri, false);
-    if (state.error || state.revision !== record.fingerprint) return this.unavailable(record, state.error ?? 'The request contents changed. List requests again to obtain its new requestId.');
-    const file = state.files[0]!;
-    const hunks = file.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision}) => ({id, oldStart, newStart, oldLines, newLines, decision}));
-    const pending = hunks.filter(item => item.decision === 'pending').length;
-    const accepted = hunks.filter(item => item.decision === 'accepted').length;
-    const ignored = hunks.filter(item => item.decision === 'ignored').length;
+    if (state.error || state.revision !== inspected.revision) return this.unavailable(record, state.error ?? 'The request changed while its status was being read. Try again.');
+    const file = state.files[0];
+    const hunks = file?.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision}) => ({id, oldStart, newStart, oldLines, newLines, decision})) ?? [];
+    const decisions = inspected.request.request.map(item => item.status);
+    const pending = decisions.filter(value => value === 'pending').length;
+    const accepted = decisions.filter(value => value === 'accepted').length;
+    const ignored = decisions.filter(value => value === 'ignored').length;
+    const issue = file?.issue || (!state.verified ? state.verificationIssue || 'The recorded decisions could not be verified against the current source.' : undefined);
     const result: McpStatus = {
-      ...this.unavailable(record, ''), status: pending || !hunks.length ? (file.issue ? 'stale' : 'pending') : 'completed',
-      pending, accepted, ignored, hunks, issue: file.issue,
+      ...this.unavailable(record, ''), revision: inspected.revision,
+      status: issue ? 'stale' : pending || !decisions.length ? 'pending' : 'completed',
+      pending, accepted, ignored, hunks, issue,
     };
-    if (!pending && hunks.length) {
+    if (result.status === 'completed') {
       result.cleanup = record.receipt?.cleanup ?? 'retained';
       result.completedAt = record.receipt?.completedAt;
       result.targetHash = record.receipt?.targetHash;
@@ -205,9 +226,12 @@ export class McpHost {
     if (!folder || folder.uri.scheme !== 'file') return;
     const record = await this.registerRequest(folder, uri);
     const status = await this.status(record);
-    if (status.pending || !status.hunks.length) return;
+    if (status.status !== 'completed' || status.issue || !status.hunks.length) return;
     let targetHash: string | undefined;
-    try { targetHash = (await this.readTarget(folder, record.path)).hash; } catch { /* Decisions remain authoritative even if the source changed externally. */ }
+    try { targetHash = (await this.readTarget(folder, record.path)).hash; } catch { return; }
+    const checkedState = await this.service.getState(uri, false);
+    if (checkedState.error || checkedState.revision !== status.revision || checkedState.files[0]?.issue ||
+        (!checkedState.verified || checkedState.verifiedTargetHash !== targetHash)) return;
     const receipt: McpStatus = {...status, status: 'completed', cleanup: 'retained', completedAt: new Date().toISOString(), targetHash,
       hunks: status.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision}) => ({id, oldStart, newStart, oldLines, newLines, decision}))};
     await this.mutate(async records => {
@@ -220,13 +244,20 @@ export class McpHost {
     const expectedHash = requiredString(args.expectedHash, 'expectedHash', 64).toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(expectedHash)) throw new McpBridgeError('INVALID_ARGUMENT', 'expectedHash must be the SHA-256 hash returned by read_target.');
     const clientRequestId = requiredString(args.clientRequestId, 'clientRequestId', 256);
-    const title = args.title === undefined ? 'Review ' + path.basename(filePath) : args.title;
-    // Parse both metadata and text before evaluating idempotency; canonical keys
-    // make retries insensitive to incoming JSON property order.
-    const validated = parseRequest(JSON.stringify({version: 1, title, files: [{path: filePath, before: '', after: args.after, reason: args.reason, explanations: args.explanations}]}));
-    const proposal = validated.files[0]!;
-    if (Buffer.from(proposal.after, 'utf8').toString('utf8') !== proposal.after) throw new McpBridgeError('UNSUPPORTED_TEXT', 'The proposed text contains an unpaired Unicode surrogate and cannot be saved exactly as UTF-8.');
-    const inputHash = hash(JSON.stringify({path: filePath, expectedHash, title: validated.title, after: proposal.after, reason: proposal.reason, explanations: proposal.explanations}));
+    if (Object.keys(args).some(key => !['path', 'expectedHash', 'clientRequestId', 'request'].includes(key))) {
+      throw new McpBridgeError('INVALID_ARGUMENT', 'Use path, expectedHash, clientRequestId, and request snippets. The server supplies creation time and pending statuses.');
+    }
+    if (!Array.isArray(args.request) || !args.request.length) throw new McpBridgeError('INVALID_ARGUMENT', 'request must contain at least one proposed change.');
+    const entries = args.request.map((value, index) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new McpBridgeError('INVALID_ARGUMENT', 'request[' + index + '] must be an object.');
+      const item = value as Record<string, unknown>;
+      if (Object.keys(item).some(key => !['line', 'before', 'after', 'reason'].includes(key))) {
+        throw new McpBridgeError('INVALID_ARGUMENT', 'MCP proposal entries accept only line, before, after, and reason. The server sets status to pending.');
+      }
+      return {line: item.line, before: item.before, after: item.after, reason: item.reason === undefined ? '' : item.reason, status: 'pending'};
+    });
+    const proposal = parseRequestDocument(JSON.stringify({path: filePath, request: entries}));
+    const inputHash = hash(JSON.stringify({path: filePath, expectedHash, request: proposal.request}));
     return this.service.runExclusive(async () => {
       this.workspace(folder.uri.toString());
       const retry = this.records().find(item => item.workspaceUri === folder.uri.toString() && item.clientRequestId === clientRequestId);
@@ -236,9 +267,10 @@ export class McpHost {
       }
       const source = await this.readTarget(folder, filePath);
       if (source.hash !== expectedHash) throw new McpBridgeError('STALE_TARGET', 'The saved target changed. Read it again before creating a request.');
-      const request = parseRequest(JSON.stringify({version: 1, title: validated.title, files: [{...proposal, before: source.content}]}));
-      if (source.content.startsWith('\uFEFF') !== proposal.after.startsWith('\uFEFF')) throw new McpBridgeError('BOM_CHANGED', 'Keep the original UTF-8 BOM unchanged in the proposal.');
-      if (!computeHunks(request.files[0]!).length) throw new McpBridgeError('NO_CHANGES', 'The proposal is identical to the saved source.');
+      const resolved = resolveRequest(proposal, source.content);
+      if (!resolved.hunks.length || resolved.file.before === resolved.file.after) throw new McpBridgeError('NO_CHANGES', 'The proposal is identical to the saved source.');
+      if (source.content.startsWith('\uFEFF') !== resolved.file.after.startsWith('\uFEFF')) throw new McpBridgeError('BOM_CHANGED', 'Keep the original UTF-8 BOM unchanged in the proposal.');
+      const request = {path: proposal.path, time: new Date().toISOString(), request: proposal.request};
       const uri = vscode.Uri.file(path.resolve(folder.uri.fsPath, filePath + '.rr'));
       const text = JSON.stringify(request, null, 2) + '\n';
       const root = await fs.realpath(folder.uri.fsPath);

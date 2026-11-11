@@ -7,7 +7,8 @@ export async function installMcpAdapter(extensionRoot: string, globalStoragePath
   const folder = path.join(globalStoragePath, 'mcp');
   await fs.mkdir(folder, {recursive: true, mode: 0o700});
   const adapterPath = path.join(folder, 'rr-mcp.cjs');
-  const bundle = await fs.readFile(path.join(extensionRoot, '.codex-build', 'mcp-server.cjs'));
+  const manifest = JSON.parse(await fs.readFile(path.join(extensionRoot, 'package.json'), 'utf8')) as {main: string};
+  const bundle = await fs.readFile(path.join(extensionRoot, path.dirname(manifest.main), 'mcp-server.cjs'));
   let identical = false;
   try { identical = bundle.equals(await fs.readFile(adapterPath)); } catch { /* First installation. */ }
   if (!identical) {

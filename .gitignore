@@ -4,3 +4,6 @@ node_modules/
 
 # Local Korean editorial copy; not published.
 /README.ko.md
+
+# Persistent plugin compatibility manifest.
+!plugin/.codex-plugin/

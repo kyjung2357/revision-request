@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "revision_request": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/launch-mcp.cjs"
+      ]
+    }
+  }
+}

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import {
   computeHunks,
   computeInlineChanges,
-  parseRequest,
+  validateRequestFile,
   renderAccepted,
   requestFingerprint,
   type Decision,
@@ -13,20 +13,10 @@ import {
 const make = (before: string, after: string, path = 'examples/manuscript.tex'): RequestFile => ({
   path, before, after,
 });
-const serialize = (overrides: Record<string, unknown> = {}) => JSON.stringify({
-  version: 1,
-  title: 'Revise the proof',
-  files: [make('old\n', 'new\n')],
-  ...overrides,
-});
-
-test('parsing preserves text snapshots and optional descriptions exactly', () => {
+test('snapshot validation preserves exact text and ignores untrusted internal groups', () => {
   const file = make('첫 줄\r\n😀 second', '첫 줄\r\n😀 revised\n');
   file.reason = 'Correct the coefficient.';
-  const request = parseRequest(serialize({ description: 'Review each change.', files: [file] }));
-  assert.deepEqual(request.files[0], file);
-  assert.equal(request.description, 'Review each change.');
-  assert.deepEqual(parseRequest('\uFEFF' + serialize()), parseRequest(serialize()));
+  assert.deepEqual(validateRequestFile({...file, reviewHunks: [{malicious: true}]}), file);
 });
 
 test('explanation metadata preserves exact text without changing hunk identities or application', () => {
@@ -40,14 +30,14 @@ test('explanation metadata preserves exact text without changing hunk identities
       { line: Number.MAX_SAFE_INTEGER, text: 'Unused location is harmless metadata.' },
     ],
   };
-  const parsed = parseRequest(serialize({files: [file]})).files[0]!;
+  const parsed = validateRequestFile(file);
   assert.deepEqual(parsed, file);
   assert.deepEqual(computeHunks(parsed), computeHunks(base));
   const hunks = computeHunks(parsed);
   assert.equal(renderAccepted(base.before, hunks,
     Object.fromEntries(hunks.map(hunk => [hunk.id, 'accepted']))), base.after);
-  assert.equal(Object.hasOwn(parseRequest(serialize()).files[0]!, 'explanations'), false);
-  assert.deepEqual(parseRequest(serialize({files: [{...base, explanations: []}]})).files[0]!.explanations, []);
+  assert.equal(Object.hasOwn(validateRequestFile(make('old\n', 'new\n')), 'explanations'), false);
+  assert.deepEqual(validateRequestFile({...base, explanations: []}).explanations, []);
 });
 
 test('explanations reject malformed locations, duplicates, NUL and excessive UTF-8 text', () => {
@@ -62,12 +52,10 @@ test('explanations reject malformed locations, duplicates, NUL and excessive UTF
     Array.from({length: 10_001}, (_, index) => ({line: index + 1, text: ''})),
   ];
   for (const value of malformed) {
-    assert.throws(() => parseRequest(serialize({files: [{...file, explanations: value}]})),
+    assert.throws(() => validateRequestFile({...file, explanations: value}),
       /explanations/);
   }
-  assert.equal(parseRequest(serialize({files: [{
-    ...file, explanations: [{line: 1, text: 'x'.repeat(50_000)}],
-  }]})).files[0]!.explanations![0]!.text.length, 50_000);
+  assert.equal(validateRequestFile({...file, explanations: [{line: 1, text: 'x'.repeat(50_000)}]}).explanations![0]!.text.length, 50_000);
 });
 
 test('opening and ignoring proposals leave the original text unchanged', () => {
@@ -165,25 +153,10 @@ test('hunk identifiers are deterministic and content- and path-bound', () => {
   assert.notEqual(requestFingerprint('same'), requestFingerprint('same '));
 });
 
-test('malformed requests fail with useful messages', () => {
-  const bad = [
-    ['{', /Invalid .rr JSON/],
-    ['null', /must be an object/],
-    ['[]', /must be an object/],
-    [serialize({ version: 2 }), /version must be 1/],
-    [serialize({ title: '' }), /must not be empty/],
-    [serialize({ title: 3 }), /must be a string/],
-    [serialize({ description: null }), /must be a string/],
-    [serialize({ files: [] }), /exactly one file/],
-    [serialize({ files: [null] }), /must be an object/],
-    [serialize({ files: [{ path: 'x.tex', before: 1, after: 'text' }] }), /before must be a string/],
-    [serialize({ files: [make('a\0b', 'text')] }), /NUL/],
-    [serialize({ files: [make('a', 'b'), make('a', 'c')] }), /exactly one file/],
-    [serialize({ files: [make('a', 'b', 'FILE.tex'), make('a', 'c', 'file.tex')] }), /exactly one file/],
-  ] as const;
-  for (const [input, pattern] of bad) {
-    assert.throws(() => parseRequest(input), pattern);
-  }
+test('malformed snapshots fail with useful messages', () => {
+  for (const value of [null, [], 'text']) assert.throws(() => validateRequestFile(value), /must be an object/);
+  assert.throws(() => validateRequestFile({path: 'x.tex', before: 1, after: 'text'}), /before must be a string/);
+  assert.throws(() => validateRequestFile(make('a\0b', 'text')), /NUL/);
 });
 
 test('paths cannot escape the workspace or alias Windows devices and streams', () => {
@@ -193,20 +166,14 @@ test('paths cannot escape the workspace or alias Windows devices and streams', (
     '//server/share', 'folder//proof.tex', 'folder/', 'folder/file.tex:stream',
     'NUL.tex', 'folder/CON', 'proof.tex.', 'proof.tex ', 'folder/*',
   ]) {
-    assert.throws(() => parseRequest(serialize({ files: [make('a', 'b', path)] })), { name: 'Error' }, path);
+    assert.throws(() => validateRequestFile(make('a', 'b', path)), { name: 'Error' }, path);
   }
-  assert.equal(parseRequest(serialize({ files: [make('a', 'b', '2027c/Proof with spaces.tex')] })).files[0]!.path,
+  assert.equal(validateRequestFile(make('a', 'b', '2027c/Proof with spaces.tex')).path,
     '2027c/Proof with spaces.tex');
 });
 
-test('request and file size limits prevent unbounded review input', () => {
-  assert.throws(() => parseRequest(' '.repeat(20 * 1024 * 1024 + 1)), /20 MiB limit/);
-  assert.throws(() => parseRequest(serialize({
-    files: [make('x'.repeat(5 * 1024 * 1024 + 1), 'small')],
-  })), /byte limit/);
-  assert.throws(() => parseRequest(serialize({
-    files: Array.from({ length: 129 }, (_, index) => make('a', 'b', `f${index}.txt`)),
-  })), /exactly one file/);
+test('snapshot size limits prevent unbounded review input', () => {
+  assert.throws(() => validateRequestFile(make('x'.repeat(5 * 1024 * 1024 + 1), 'small')), /byte limit/);
 });
 
 test('render rejects stale or overlapping change groups instead of producing a corrupt target', () => {

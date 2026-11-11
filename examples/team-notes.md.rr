@@ -1,0 +1,146 @@
+{
+  "path": "examples/team-notes.md",
+  "time": "2026-11-10T22:22:46-05:00",
+  "request": [
+    {
+      "line": 1,
+      "before": "notebook guide",
+      "after": "decision notebook",
+      "reason": "Make the purpose of the notebook explicit in its title.",
+      "status": "pending"
+    },
+    {
+      "line": 9,
+      "before": "Paste every message from the chat into the page",
+      "after": "List the people who attended",
+      "reason": "Replace transcript copying with a concise attendee list.",
+      "status": "pending"
+    },
+    {
+      "line": 10,
+      "before": "4. List the people who attended.",
+      "after": null,
+      "reason": "Remove the duplicate attendee step after combining the preceding steps.",
+      "status": "pending"
+    },
+    {
+      "line": 12,
+      "before": "ingle paragraph for the summary even when the meeting covered many topics, and leave the decisions at the very end so readers must scan the whole document to discover what changed",
+      "after": "hort summary for each topic and put the decisions near the top, so a reader joining the project can find the outcome, its owner, and the next action without reading the full meeting history or guessing which earlier discussion is still current",
+      "reason": "Make long notes easier to scan by surfacing decisions and ownership early.",
+      "status": "pending"
+    },
+    {
+      "line": 16,
+      "before": " and an owner",
+      "after": ", a named owner, and a review date",
+      "reason": "Require a named owner and a review date alongside each decision.",
+      "status": "pending"
+    },
+    {
+      "line": 17,
+      "before": "The owner may be written as TBD.",
+      "after": null,
+      "reason": "Remove guidance that would leave a decision without an accountable owner.",
+      "status": "pending"
+    },
+    {
+      "line": 22,
+      "before": "TBD",
+      "after": "Mina",
+      "reason": "Use a concrete name in the template example.",
+      "status": "pending"
+    },
+    {
+      "line": 23,
+      "before": "Next month",
+      "after": "2026-11-17",
+      "reason": "Use an unambiguous date in the template example.",
+      "status": "pending"
+    },
+    {
+      "line": 28,
+      "before": "Copy the entire design document into this note as a backup.",
+      "after": null,
+      "reason": "Avoid a duplicated design document that can become stale.",
+      "status": "pending"
+    },
+    {
+      "line": 30,
+      "before": null,
+      "after": "Include a heading or section link when the document is long.",
+      "reason": "Point readers directly to the relevant part of a long document.",
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": ";",
+      "after": ", and what evidence would cause the team to revisit the choice;",
+      "reason": "Record the evidence that would justify reconsidering the decision.",
+      "status": "pending"
+    },
+    {
+      "line": 35,
+      "before": "once a month",
+      "after": "at the next weekly meeting",
+      "reason": "Review actions at a predictable weekly meeting.",
+      "status": "pending"
+    },
+    {
+      "line": 37,
+      "before": "Delete the note after all items are done",
+      "after": "Link the result from each completed item",
+      "reason": "Keep a completion link and archive finished notes for later reference.",
+      "status": "pending"
+    },
+    {
+      "line": 38,
+      "before": null,
+      "after": "- Archive the note after all items are done.",
+      "reason": "Keep completed notes available for later reference.",
+      "status": "pending"
+    },
+    {
+      "line": 41,
+      "before": "Meeting notes",
+      "after": "Decision and next action",
+      "reason": "Make the template title describe the decision and its next action.",
+      "status": "pending"
+    },
+    {
+      "line": 43,
+      "before": "TBD",
+      "after": "Name the person responsible",
+      "reason": "Prompt the writer to name an accountable person.",
+      "status": "pending"
+    },
+    {
+      "line": 45,
+      "before": null,
+      "after": "",
+      "reason": "Insert a blank line to separate the surrounding sections.",
+      "status": "pending"
+    },
+    {
+      "line": 45,
+      "before": null,
+      "after": "Next review: YYYY-MM-DD",
+      "reason": "Add an explicit review-date field to the note template.",
+      "status": "pending"
+    },
+    {
+      "line": 45,
+      "before": null,
+      "after": "",
+      "reason": "Insert a blank line to separate the surrounding sections.",
+      "status": "pending"
+    },
+    {
+      "line": 45,
+      "before": null,
+      "after": "Keep the note in the shared project folder so the next meeting can start from the recorded decisions.",
+      "reason": "Explain where the team should keep the completed note.",
+      "status": "pending"
+    }
+  ]
+}

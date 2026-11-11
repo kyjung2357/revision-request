@@ -86,15 +86,16 @@ for (const hunk of fixture.files[0].hunks) {
   });
 }
 function mockScript() {
-  return `'use strict';\nwindow.__xss = 0;\nwindow.__messages = [];\nwindow.__savedState = {};\nwindow.__fixture = ${JSON.stringify(fixture)};\n` +
+  return `'use strict';\nwindow.__xss = 0;\nwindow.__messages = [];\nwindow.__savedState = JSON.parse(sessionStorage.getItem('rr-view-state') || '{}');\nwindow.__fixture = ${JSON.stringify(fixture)};\n` +
     `window.__setReview = next => { window.__review = structuredClone(next); window.dispatchEvent(new MessageEvent('message', { data: window.__review })); };\n` +
-    `window.acquireVsCodeApi = () => ({ getState: () => window.__savedState, setState: value => { window.__savedState = value; }, postMessage: message => {\n` +
+    `window.acquireVsCodeApi = () => ({ getState: () => window.__savedState, setState: value => { window.__savedState = value; sessionStorage.setItem('rr-view-state', JSON.stringify(value)); }, postMessage: message => {\n` +
     `window.__messages.push(structuredClone(message));\n` +
     `if (message.type === 'decide' || message.type === 'decideFile' || message.type === 'undo') {\n` +
     `const next = structuredClone(window.__review); const file = next.files.find(item => item.path === message.filePath);\n` +
     `if (!file || message.revision !== next.revision) throw new Error('Invalid decision transport');\n` +
     `if (message.type === 'undo') { const hunk = file.hunks.find(item => item.id === message.hunkId); if (!hunk || hunk.decision === 'pending') throw new Error('Invalid undo transport'); hunk.decision = 'pending'; }\n` +
     `else for (const hunk of file.hunks) if (hunk.decision === 'pending' && (message.type === 'decideFile' || hunk.id === message.hunkId)) hunk.decision = message.decision;\n` +
+    `if (next.closed && file.hunks.some(hunk => hunk.decision === 'pending')) next.closed = false;\n` +
     `window.__setReview(next); }\n` +
     `} });\n`;
 }
@@ -241,13 +242,14 @@ function assertAligned(measurements) {
     assert.ok(pair.left.height > 0, 'Pair ' + index + ' has visible height');
     assert.ok(Math.abs(pair.left.y - pair.right.y) < 0.6, 'Pair ' + index + ' starts at the same vertical position');
     assert.ok(Math.abs(pair.left.height - pair.right.height) < 0.6, 'Pair ' + index + ' has equal side heights');
-    assert.ok(Math.abs(pair.left.width - pair.right.width) < 1.1, 'Pair ' + index + ' has equal column widths');
+    assert.ok(Math.abs(pair.left.width - measurements.banner.left.width) < 1.1, 'Pair ' + index + ' matches the original column width');
+    assert.ok(Math.abs(pair.right.width - measurements.banner.right.width) < 1.1, 'Pair ' + index + ' matches the proposed column width');
   }
   for (const pair of [...measurements.headings, ...measurements.rows]) assert.ok(Math.abs(measurements.banner.right.x - pair.right.x) < 1.1, 'Banner and source column dividers align horizontally');
   assert.ok(measurements.scroll.height > 150, 'Comparison retains a usable height');
   assert.ok(measurements.scroll.total > measurements.scroll.height, 'Fixture must overflow vertically');
 }
-async function assertTextProjection() {
+async function assertTextProjection(sides = ['left', 'right']) {
   const actual = await cdp.evaluate(`(() => {
     const data = {};
     for (const side of ['left', 'right']) {
@@ -257,7 +259,7 @@ async function assertTextProjection() {
     return { data, state: window.__review };
   })()`);
   const file = actual.state.files[0];
-  for (const side of ['left', 'right']) {
+  for (const side of sides) {
     let expected = '', offset = 0;
     for (const hunk of file.hunks) {
       expected += file.before.slice(offset, hunk.start);
@@ -400,10 +402,17 @@ async function assertNoLayoutShift(before) {
 }
 
 async function editSnapshot() {
-  return cdp.evaluate("(() => { const popup = document.querySelector('.pending-editor'); if (!popup) return null; const area = popup.querySelector('textarea'); const box = popup.getBoundingClientRect(); return {draft:area.value, readOnly:area.readOnly, wrap:area.wrap, whiteSpace:getComputedStyle(area).whiteSpace, selection:[area.selectionStart,area.selectionEnd], scroll:[area.scrollTop,area.scrollLeft], error:popup.querySelector('.pending-editor-error')?.textContent, saveDisabled:popup.querySelector('[data-focus-key=\"edit:save\"]').disabled, focused:document.activeElement.dataset.focusKey, rect:{x:box.x,y:box.y,right:box.right,bottom:box.bottom}, persisted:window.__savedState.editing}; })()");
+  return cdp.evaluate("(() => { const editor = document.querySelector('.pending-editor'); if (!editor) return null; const area = editor.querySelector('textarea'); const box = editor.getBoundingClientRect(); const areaBox = area.getBoundingClientRect(); const gutter = editor.querySelector('.action-gutter').getBoundingClientRect(); return {draft:area.value, readOnly:area.readOnly, wrap:area.wrap, whiteSpace:getComputedStyle(area).whiteSpace, selection:[area.selectionStart,area.selectionEnd], scroll:[area.scrollTop,area.scrollLeft], error:editor.querySelector('.pending-editor-error')?.textContent, saveDisabled:editor.querySelector('[data-focus-key=\"edit:save\"]').disabled, focused:document.activeElement.dataset.focusKey, rect:{x:box.x,y:box.y,right:box.right,bottom:box.bottom}, area:{x:areaBox.x,right:areaBox.right,width:area.clientWidth,scrollWidth:area.scrollWidth}, gutter:{x:gutter.x,right:gutter.right}, position:getComputedStyle(editor).position, role:editor.getAttribute('role'), buttons:Array.from(editor.querySelectorAll('.action-gutter button'),node=>node.textContent), persisted:window.__savedState.editing}; })()");
 }
-async function openEdit(id, method = 'dblclick', row = 0) {
-  await cdp.evaluate("(() => { const source = Array.from(document.querySelectorAll('[data-edit-hunk]')).find(node => node.dataset.editHunk === " + JSON.stringify(id) + " && Number(node.dataset.editRow) === " + row + "); if (!source) throw new Error('Missing editable pending source'); source.focus({preventScroll:true}); source.dispatchEvent(" + (method === 'dblclick' ? "new MouseEvent('dblclick',{bubbles:true,cancelable:true})" : "new KeyboardEvent('keydown',{key:" + JSON.stringify(method) + ",bubbles:true,cancelable:true})") + "); })()");
+async function openEdit(id, method = 'click', row = 0) {
+  const findSource = "Array.from(document.querySelectorAll('[data-edit-hunk]')).find(node => node.dataset.editHunk === " + JSON.stringify(id) + " && Number(node.dataset.editRow) === " + row + ")";
+  if (method === 'click') {
+    const point = await cdp.evaluate("(() => { const source = " + findSource + "; if (!source) throw new Error('Missing editable pending source'); source.scrollIntoView({block:'nearest'}); const box=source.getBoundingClientRect(); return {x:box.x+Math.min(12,box.width/2),y:box.y+Math.min(10,box.height/2)}; })()");
+    await cdp.send('Input.dispatchMouseEvent', {type:'mousePressed',button:'left',clickCount:1,...point});
+    await cdp.send('Input.dispatchMouseEvent', {type:'mouseReleased',button:'left',clickCount:1,...point});
+  } else {
+    await cdp.evaluate("(() => { const source = " + findSource + "; if (!source) throw new Error('Missing editable pending source'); source.focus({preventScroll:true}); source.dispatchEvent(new KeyboardEvent('keydown',{key:" + JSON.stringify(method) + ",bubbles:true,cancelable:true})); })()");
+  }
   await settle();
 }
 async function editorKey(key, modifiers = {}) {
@@ -412,27 +421,53 @@ async function editorKey(key, modifiers = {}) {
 }
 async function writeDraft(draft) {
   await cdp.evaluate("(() => { const area = document.querySelector('.pending-editor textarea'); area.value = " + JSON.stringify(draft) + "; area.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'})); })()");
+  await settle();
 }
 async function editAck(message, fields) {
   await cdp.evaluate("window.dispatchEvent(new MessageEvent('message',{data:" + JSON.stringify({type:'editResult',filePath:message.filePath,hunkId:message.hunkId,editId:message.editId,...fields}) + "}))");
   await settle();
 }
+function assertInlineEditor(snapshot, width) {
+  assert.ok(snapshot, 'Pending code has an in-place editor');
+  assert.notEqual(snapshot.position, 'fixed', 'Editing must not open a floating popup');
+  assert.notEqual(snapshot.position, 'absolute', 'Editor participates in the comparison layout');
+  assert.notEqual(snapshot.role, 'dialog', 'Editing happens in the code column, not a dialog');
+  assert.equal(snapshot.wrap, 'soft');
+  assert.ok(['pre-wrap', 'break-spaces'].includes(snapshot.whiteSpace), 'Draft preserves source whitespace while soft-wrapping');
+  assert.ok(snapshot.rect.x >= width / 2 - 10 && snapshot.rect.right <= width + 0.6, 'Editor stays in the proposed pane');
+  assert.ok(snapshot.area.x >= snapshot.rect.x && snapshot.area.right <= snapshot.gutter.x + 0.6, 'Draft text ends before the action rail');
+  assert.ok(snapshot.area.scrollWidth <= snapshot.area.width + 1, 'The draft is fully readable without horizontal scrolling');
+  assert.deepEqual([...snapshot.buttons].sort(), ['Cancel', 'Save'], 'Save/Cancel replace decision controls on the editing block');
+}
+async function originalProjection() {
+  return cdp.evaluate("Array.from(document.querySelectorAll('.code-side.left[data-line] .code-text'),node=>node.textContent.replace(/\u200b/g,'')).join('\\n')");
+}
 async function runEditorTests(width) {
   await resetFixture(width);
-  await runTest(width + 'px: pending text edits open accessibly without changing rows or source, and cancel restores focus', async () => {
-    const before = await geometry();
-    await openEdit('grow', 'dblclick', 1);
-    const opened = await editSnapshot();
+  await runTest(width + 'px: one click edits pending code in place, reserves the action rail, and cancel restores the proposal', async () => {
+    const original = await originalProjection();
+    const originalInline = await cdp.evaluate("Array.from(document.querySelectorAll('[data-hunk-row=\"grow\"] .code-side.left .inline-common,[data-hunk-row=\"grow\"] .code-side.left .inline-changed'),node=>({text:node.textContent,changed:node.classList.contains('inline-changed')}))");
+    await openEdit('grow', 'click', 1);
+    const editingInline = await cdp.evaluate("Array.from(document.querySelectorAll('.hunk-editing .code-side.left .inline-common,.hunk-editing .code-side.left .inline-changed'),node=>({text:node.textContent,changed:node.classList.contains('inline-changed')}))");
+    assert.deepEqual(editingInline,originalInline,'In-place editing preserves the original side intraline highlights and common text');
+    assert.ok(editingInline.some(part=>part.changed)&&editingInline.some(part=>!part.changed));
+    let opened = await editSnapshot();
     assert.equal(opened.draft, fixture.files[0].hunks[0].after, 'Editing exposes the complete pending hunk');
-    assert.equal(opened.focused, 'edit:draft'); assert.equal(opened.wrap, 'off'); assert.equal(opened.whiteSpace, 'pre');
-    assert.equal(opened.selection[0], fixture.files[0].hunks[0].after.indexOf('\n') + 1, 'Caret starts at the clicked proposed row');
-    assert.ok(opened.rect.x >= 0 && opened.rect.right <= width && opened.rect.y >= 0 && opened.rect.bottom <= 850, 'Anchored editor fits the viewport');
-    assert.equal(await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button,.file-actions button')).every(button=>button.disabled)"), true, 'Drafting blocks review actions');
+    assert.equal(opened.focused, 'edit:draft');
+    assertInlineEditor(opened, width);
+    const clickedRowStart = fixture.files[0].hunks[0].after.indexOf('\n') + 1;
+    const clickedRowEnd = fixture.files[0].hunks[0].after.indexOf('\n', clickedRowStart);
+    assert.ok(opened.selection[0] >= clickedRowStart && opened.selection[0] <= clickedRowEnd, 'Caret starts within the clicked proposed row');
+    assert.equal(await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button,.file-actions button')).filter(button=>!button.dataset.focusKey?.startsWith('edit:')).every(button=>button.disabled)"), true, 'Drafting blocks review decisions');
     const messages = await cdp.evaluate('window.__messages.length');
-    await cdp.evaluate("document.querySelector('.inline-actions button').click()");
+    await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button')).find(node=>node.textContent==='Accept')?.click()");
     assert.equal(await cdp.evaluate('window.__messages.length'), messages, 'Disabled Accept cannot submit a decision');
-    await assertNoLayoutShift(before); await assertTextProjection();
+    assertAligned(await geometry());
+    assert.equal(await originalProjection(), original, 'Entering an editor preserves every original line');
     await screenshot('comparison-' + width + '-pending-editor');
+    await cdp.send('Input.insertText', {text:'Typed directly. '}); await settle();
+    opened = await editSnapshot();
+    assert.ok(opened.draft.includes('Typed directly. '), 'Real keyboard input edits the focused inline textarea');
     await writeDraft('Unsubmitted draft <script>window.__xss=99</script>\n');
     await cdp.evaluate("document.querySelector('[data-focus-key=\"edit:save\"]').focus()");
     await editorKey('Escape');
@@ -440,24 +475,28 @@ async function runEditorTests(width) {
     assert.equal(await cdp.evaluate('document.activeElement.dataset.editRow'), '1', 'Cancel restores the clicked row, including a non-first row');
     assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].after'), fixture.files[0].hunks[0].after);
     assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').length"), 0);
-    await openEdit('delete', 'F2'); assert.equal((await editSnapshot()).draft, '', 'Pure deletion has an editable empty proposal');
+    await assertTextProjection(); assertAligned(await geometry());
+    await openEdit('delete', 'click'); assert.equal((await editSnapshot()).draft, '', 'Pure deletion has an editable empty proposal');
+    await writeDraft('Replacement for the deleted lines.\nSecond line.\n');
+    assertInlineEditor(await editSnapshot(), width); assertAligned(await geometry());
     await editorKey('Escape');
+    await openEdit('insert', 'F2'); await writeDraft(''); assertInlineEditor(await editSnapshot(), width); await editorKey('Escape');
     await clickDecision('grow', 'accept'); await clickDecision('insert', 'ignore');
     assert.equal(await cdp.evaluate("Array.from(document.querySelectorAll('[data-edit-hunk]')).some(node=>['grow','insert'].includes(node.dataset.editHunk))"), false, 'Accepted and ignored rows are not editable');
     await clickUndo('grow'); await openEdit('grow', 'Enter'); await editorKey('Escape');
     await resetFixture(width);
   });
-  await runTest(width + 'px: pending draft, selection, and scroll survive host busy refreshes; stale revision never retargets', async () => {
+  await runTest(width + 'px: multiline inline draft and caret survive busy refreshes; stale revisions never retarget a save', async () => {
     await openEdit('grow', 'F2');
-    const draft = '\t' + 'long_draft '.repeat(90) + '<img src=x onerror="window.__xss=91">\n' + 'draft line\n'.repeat(20);
+    const draft = '\t' + 'long_draft '.repeat(35) + '<img src=x onerror="window.__xss=91">\n' + 'draft line\n'.repeat(20);
     await writeDraft(draft);
-    await cdp.evaluate("(() => { const area=document.querySelector('.pending-editor textarea'); area.setSelectionRange(7,19); area.scrollTop=68; area.scrollLeft=80; area.dispatchEvent(new Event('scroll')); })()");
-    const prior = await editSnapshot();
+    await cdp.evaluate("(() => { const area=document.querySelector('.pending-editor textarea'); area.setSelectionRange(7,19); area.dispatchEvent(new Event('select')); })()");
+    const prior = await editSnapshot(); assertInlineEditor(prior, width);
     await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop=44; window.__setReview({...window.__review,busy:true})"); await settle();
     let current = await editSnapshot();
     assert.equal(current.draft,draft); assert.deepEqual(current.selection,prior.selection); assert.deepEqual(current.scroll,prior.scroll);
     assert.equal(current.persisted.draft,draft); assert.equal(current.saveDisabled,true); assert.equal(current.focused,'edit:draft');
-    assert.ok(await cdp.evaluate("document.querySelector('.pending-editor textarea').scrollWidth>document.querySelector('.pending-editor textarea').clientWidth"), 'Long draft scrolls horizontally, never wraps');
+    assertInlineEditor(current, width);
     assert.equal((await geometry()).scroll.top,44); assertAligned(await geometry());
     await cdp.evaluate("window.__setReview({...window.__review,busy:false})"); await settle();
     assert.equal((await editSnapshot()).saveDisabled,false);
@@ -473,11 +512,34 @@ async function runEditorTests(width) {
     await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop=0");
     await resetFixture(width);
   });
-  await runTest(width + 'px: save correlates acknowledgements, keeps failed drafts, and updates only the proposal after success', async () => {
+  await runTest(width + 'px: a removed hunk or invalid request keeps the inline draft visible and cancellable', async () => {
+    const draft = 'Keep this unsaved proposal for copying.\nSecond draft line.\n';
+    for (const invalidRequest of [false,true]) {
+      await resetFixture(width); await openEdit('grow'); await writeDraft(draft);
+      await cdp.evaluate(invalidRequest
+        ? "window.__setReview({...window.__review,revision:'',files:[],error:'The request could not be parsed.'})"
+        : "(() => { const next=structuredClone(window.__review); next.revision='hunk-removed'; next.files[0].hunks=next.files[0].hunks.filter(hunk=>hunk.id!=='grow'); window.__setReview(next); })()");
+      await settle();
+      const editor = await editSnapshot();
+      assert.ok(editor, 'A stale or unparseable request cannot hide an unsaved draft');
+      assert.equal(editor.draft,draft); assert.equal(editor.saveDisabled,true);
+      assert.notEqual(editor.position,'fixed'); assert.notEqual(editor.role,'dialog');
+      assert.ok(editor.area.width > 40, 'Stale draft retains a visible text area');
+      assert.ok(editor.error.includes('request changed'));
+      await cdp.evaluate("document.querySelector('.pending-editor textarea').select()");
+      assert.deepEqual((await editSnapshot()).selection,[0,draft.length],'The complete draft remains selectable for copying');
+      const cancelDisabled = await cdp.evaluate("document.querySelector('.pending-editor [data-focus-key=\"edit:cancel\"]').disabled");
+      assert.equal(cancelDisabled,false,'Cancel stays available after the request disappears');
+      await cdp.evaluate("document.querySelector('.pending-editor [data-focus-key=\"edit:cancel\"]').click()"); await settle();
+      assert.equal(await editSnapshot(),null);
+    }
+    await resetFixture(width);
+  });
+  await runTest(width + 'px: inline Save correlates acknowledgements, keeps failed drafts, and updates only the proposal', async () => {
     await openEdit('grow');
     const draft = 'Edited proposal <svg onload="window.__xss=92">literal</svg>.\nA second revised line.\n';
     await writeDraft(draft);
-    const sourceBefore = await cdp.evaluate("Array.from(document.querySelectorAll('.code-side.left[data-line] .code-text'),node=>node.textContent).join('\\n')");
+    const sourceBefore = await originalProjection();
     await editorKey('Enter',{ctrlKey:true});
     let message = await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
     assert.deepEqual({...message,editId:undefined},{type:'editPending',filePath:fixture.files[0].path,hunkId:'grow',draft,revision:fixture.revision,editId:undefined});
@@ -501,7 +563,7 @@ async function runEditorTests(width) {
     await cdp.evaluate("(() => { const next=structuredClone(window.__review); next.revision='browser-edited-v2'; const hunk=next.files[0].hunks[0]; hunk.after=" + JSON.stringify(draft) + "; hunk.id='grow-edited'; hunk.newLines=2; delete hunk.inlineChanges; window.__setReview(next); })()");
     await settle();
     assert.equal((await editSnapshot()).draft,draft,'New state before acknowledgement still preserves the draft');
-    assert.equal(await cdp.evaluate("Array.from(document.querySelectorAll('.code-side.left[data-line] .code-text'),node=>node.textContent).join('\\n')"),sourceBefore,'Saving proposal does not alter the original projection');
+    assert.equal(await originalProjection(),sourceBefore,'Saving proposal does not alter the original projection');
     await editAck(retry,{success:true,revision:'browser-edited-v2',changed:true});
     assert.equal(await editSnapshot(),null,'Only matching successful acknowledgement closes the editor');
     assert.equal(await cdp.evaluate('document.activeElement.dataset.editHunk'),'grow-edited','Focus follows the newly computed pending hunk');
@@ -510,6 +572,213 @@ async function runEditorTests(width) {
     await assertTextProjection(); assertAligned(await geometry()); assert.equal(await cdp.evaluate('window.__xss'),0);
     await screenshot('comparison-' + width + '-edited-proposal');
     await resetFixture(width);
+  });
+}
+
+async function completionSnapshot() {
+  return cdp.evaluate(`(() => {
+    const dialog=document.querySelector('.completion-dialog'); if(!dialog)return null;
+    const box=dialog.getBoundingClientRect(), input=dialog.querySelector('.completion-remember input');
+    const yes=dialog.querySelector('[data-focus-key="completion:yes"]'), no=dialog.querySelector('[data-focus-key="completion:no"]');
+    const label=input.closest('label').getBoundingClientRect(), actions=yes.parentElement.getBoundingClientRect();
+    return {text:dialog.textContent,role:dialog.getAttribute('role'),modal:dialog.getAttribute('aria-modal'),focusWithin:dialog.contains(document.activeElement),focusedKey:document.activeElement.dataset.focusKey,
+      checked:input.checked,checkDisabled:input.disabled,yesDisabled:yes.disabled,noDisabled:no.disabled,
+      error:dialog.querySelector('.completion-error')?.textContent,
+      rect:{x:box.x,y:box.y,right:box.right,bottom:box.bottom},label:{x:label.x,right:label.right},actions:{x:actions.x,right:actions.right}};
+  })()`);
+}
+async function showCompletion(id, width) {
+  await resetFixture(width);
+  await cdp.evaluate("(() => { const next=structuredClone(window.__review); for(const hunk of next.files[0].hunks)hunk.decision='ignored'; window.__setReview(next); })()");
+  await settle();
+  const message={type:'completionPrompt',completionId:id,revision:fixture.revision,requestName:fixture.requestName};
+  await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify(message)+'}))'); await settle();
+  return message;
+}
+async function completionAck(prompt, fields) {
+  await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'completionResult',completionId:prompt.completionId,revision:prompt.revision,...fields})+'}))'); await settle();
+}
+async function runCompletionTests(width) {
+  await runTest(width + 'px: completed state alone stays quiet and explicit deletion prompt sends No with the chosen preference', async () => {
+    await resetFixture(width);
+    await cdp.evaluate("(() => { const next=structuredClone(window.__review); for(const hunk of next.files[0].hunks)hunk.decision='ignored'; window.__setReview(next); })()"); await settle();
+    assert.equal(await completionSnapshot(),null,'Opening an already completed request never asks for deletion');
+    const prompt=await showCompletion('completion-no-'+width,width);
+    let snapshot=await completionSnapshot();
+    assert.ok(snapshot); assert.ok(snapshot.text.includes('Delete this .rr file?'));
+    assert.equal(snapshot.role,'dialog'); assert.equal(snapshot.modal,'true'); assert.equal(snapshot.checked,false);
+    assert.equal(snapshot.focusWithin,true); assert.equal(snapshot.focusedKey,'completion:no','The initial keyboard action keeps the request');
+    assert.ok(snapshot.text.includes('Remember my choice'));
+    assert.ok(snapshot.rect.x>=0&&snapshot.rect.right<=width&&snapshot.rect.y>=0&&snapshot.rect.bottom<=850,'Completion prompt fits the viewport');
+    assert.ok(snapshot.label.right<=snapshot.actions.x+1,'Remember checkbox stays to the left of Yes/No');
+    await screenshot('comparison-'+width+'-completion-prompt');
+    await cdp.evaluate("document.querySelector('.completion-remember input').click(); document.querySelector('[data-focus-key=\"completion:no\"]').click()"); await settle();
+    let message=await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').at(-1)");
+    assert.deepEqual(message,{type:'resolveCompletion',completionId:prompt.completionId,revision:prompt.revision,deleteRequest:false,rememberChoice:true});
+    snapshot=await completionSnapshot();
+    assert.equal(snapshot.yesDisabled,true); assert.equal(snapshot.noDisabled,true); assert.equal(snapshot.checkDisabled,true);
+    assert.equal(snapshot.focusWithin,true,'Resolving keeps keyboard focus inside the modal even when its controls are disabled');
+    await completionAck(prompt,{completionId:'unrelated-prompt',success:true});
+    assert.ok(await completionSnapshot(),'A different completion acknowledgement cannot close this prompt');
+    await completionAck(prompt,{success:false,error:'Could not retain the request <img src=x onerror="window.__xss=96">.'});
+    snapshot=await completionSnapshot();
+    assert.ok(snapshot.error.includes('Could not retain')); assert.equal(snapshot.checked,true); assert.equal(snapshot.noDisabled,false);
+    assert.equal(await cdp.evaluate('window.__xss'),0);
+    await cdp.evaluate("document.querySelector('[data-focus-key=\"completion:no\"]').click()"); await settle();
+    await completionAck(prompt,{success:true});
+    assert.equal(await completionSnapshot(),null);
+    await cdp.evaluate("window.__setReview(structuredClone(window.__review))"); await settle();
+    assert.equal(await completionSnapshot(),null,'A state refresh after No cannot reopen the prompt');
+    await resetFixture(width);
+  });
+  await runTest(width + 'px: completion Yes is revision-bound and dismissing the dialog does not remember a delete choice', async () => {
+    const prompt=await showCompletion('completion-yes-'+width,width);
+    await cdp.evaluate("document.querySelector('.completion-remember input').click(); document.querySelector('[data-focus-key=\"completion:yes\"]').click()"); await settle();
+    const message=await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').at(-1)");
+    assert.deepEqual(message,{type:'resolveCompletion',completionId:prompt.completionId,revision:prompt.revision,deleteRequest:true,rememberChoice:true});
+    await completionAck(prompt,{success:false,error:'The request could not be deleted.'});
+    await cdp.evaluate("window.__setReview({...window.__review,busy:true})"); await settle();
+    assert.equal((await completionSnapshot()).yesDisabled,true,'Busy review cannot submit deletion');
+    await cdp.evaluate("window.__setReview({...window.__review,busy:false,revision:'changed-after-completion'})"); await settle();
+    assert.equal((await completionSnapshot()).yesDisabled,true,'Stale completion cannot delete a changed request');
+    const count=await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').length");
+    await cdp.evaluate("document.querySelector('[data-focus-key=\"completion:yes\"]').click()"); await settle();
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').length"),count);
+    await cdp.evaluate("document.querySelector('[data-focus-key=\"completion:close\"]').click()"); await settle();
+    const dismissal=await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').at(-1)");
+    assert.deepEqual(dismissal,{type:'resolveCompletion',completionId:prompt.completionId,revision:prompt.revision,deleteRequest:false,rememberChoice:false},'Close keeps the request without persisting the checkbox');
+    await completionAck(prompt,{success:true}); assert.equal(await completionSnapshot(),null);
+    const escape=await showCompletion('completion-escape-'+width,width);
+    await cdp.evaluate("document.querySelector('.completion-remember input').click(); document.querySelector('.completion-dialog').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}))"); await settle();
+    assert.deepEqual(await cdp.evaluate("window.__messages.filter(message=>message.type==='resolveCompletion').at(-1)"),{type:'resolveCompletion',completionId:escape.completionId,revision:escape.revision,deleteRequest:false,rememberChoice:false});
+    await completionAck(escape,{success:true}); await resetFixture(width);
+  });
+  await runTest(width + 'px: invalid RR exposes a direct Delete this RR action below Open RR as JSON', async () => {
+    await resetFixture(width);
+    await cdp.evaluate("window.__setReview({...window.__review,revision:'',files:[],error:'The request could not be parsed.'})"); await settle();
+    const actions=await cdp.evaluate(`(() => {const open=document.querySelector('[data-focus-key="empty:source"]'), remove=document.querySelector('[data-focus-key="empty:delete-request"]');if(!open||!remove)return null;const a=open.getBoundingClientRect(),b=remove.getBoundingClientRect();return {label:remove.textContent,openBottom:a.bottom,deleteTop:b.y,disabled:remove.disabled};})()`);
+    assert.ok(actions); assert.equal(actions.label,'Delete this RR'); assert.equal(actions.disabled,false);
+    assert.ok(actions.deleteTop>=actions.openBottom,'Delete this RR is below Open RR as JSON');
+    await cdp.evaluate("document.querySelector('[data-focus-key=\"empty:delete-request\"]').click()"); await settle();
+    assert.deepEqual(await cdp.evaluate("window.__messages.filter(message=>message.type==='deleteRequest').at(-1)"),{type:'deleteRequest'});
+    await resetFixture(width);
+  });
+}
+
+async function splitSnapshot() {
+  return cdp.evaluate(`(() => {
+    const separator=document.querySelector('.pane-splitter'), header=document.querySelector('.comparison-header'), scroll=document.querySelector('[data-scroll-area]');
+    const box=separator.getBoundingClientRect(), left=header.children[0].getBoundingClientRect(), right=header.children[1].getBoundingClientRect();
+    const rail=document.querySelector('.action-gutter').getBoundingClientRect();
+    return {role:separator.getAttribute('role'),orientation:separator.getAttribute('aria-orientation'),
+      value:Number(separator.getAttribute('aria-valuenow')),min:Number(separator.getAttribute('aria-valuemin')),max:Number(separator.getAttribute('aria-valuemax')),
+      x:box.x+box.width/2,y:Math.min(24,box.bottom-2),available:scroll.clientWidth,
+      left:left.width,right:right.width,divider:right.x,rail:rail.width,ratio:left.width/scroll.clientWidth,
+      saved:window.__savedState.splitRatio,dragging:document.querySelector('.review-app').classList.contains('resizing-panes'),
+      sourceWidths:Array.from(document.querySelectorAll('.code-side .code-source'),node=>({side:node.closest('.code-side').classList.contains('right')?'right':'left',width:node.clientWidth,scrollWidth:node.scrollWidth})),
+      headerFit:Array.from(header.querySelectorAll('.summary .badge,.file-actions .button'),node=>{const r=node.getBoundingClientRect();return r.x>=right.x-1&&r.right<=right.right+1;})};
+  })()`);
+}
+async function dragSplitter(ratio, cancel = false, refresh = false) {
+  const start=await splitSnapshot();
+  await cdp.evaluate("document.querySelector('.pane-splitter').addEventListener('pointerdown',event=>window.__splitPointer=event.pointerId,{once:true})");
+  await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,x:start.x,y:start.y});
+  await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',button:'left',buttons:1,x:start.available*ratio,y:start.y});
+  await settle();
+  if(cancel) await cdp.evaluate("document.querySelector('.pane-splitter').dispatchEvent(new PointerEvent('pointercancel',{pointerId:window.__splitPointer,bubbles:true}))");
+  if(refresh) await cdp.evaluate("window.__setReview(structuredClone(window.__review))");
+  await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,x:start.available*ratio,y:start.y});
+  await settle();
+  return splitSnapshot();
+}
+async function splitKey(key, shiftKey = false) {
+  await cdp.evaluate("(() => {const separator=document.querySelector('.pane-splitter');separator.focus({preventScroll:true});separator.dispatchEvent(new KeyboardEvent('keydown',"+JSON.stringify({key,shiftKey,bubbles:true,cancelable:true})+"));})()");
+  await settle(); return splitSnapshot();
+}
+async function resetSplit() {
+  const point=await splitSnapshot();
+  for(const clickCount of [1,2]) {
+    await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount,x:point.x,y:point.y});
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount,x:point.x,y:point.y});
+  }
+  await settle();
+}
+function assertSplitGeometry(value) {
+  assert.equal(value.role,'separator'); assert.equal(value.orientation,'vertical');
+  assert.ok(Math.abs(value.x-value.divider)<1.1,'Splitter hit target is centered on the header/body divider');
+  assert.ok(Math.abs(value.left+value.right-value.available)<1.1,'Both panes fill the width excluding the native vertical scrollbar');
+  assert.ok(value.headerFit.every(Boolean),'Status badges and action buttons remain within the right pane');
+  for(const source of value.sourceWidths) {
+    assert.ok(source.width>=79,'Minimum pane widths leave readable code beside the fixed rail');
+    assert.ok(source.scrollWidth<=source.width+1,'Resizing never hides code horizontally');
+  }
+}
+async function reloadPreview() {
+  await cdp.send('Page.reload',{ignoreCache:true});
+  const deadline=Date.now()+6000;
+  while(Date.now()<deadline) {
+    if(await cdp.evaluate("Boolean(window.__messages?.some(message=>message.type==='ready'))"))break;
+    await delay(40);
+  }
+  await cdp.evaluate("window.__setReview(structuredClone(window.__fixture))"); await settle();
+}
+async function runSplitterTests(width) {
+  await resetFixture(width); await resetSplit();
+  await runTest(width+'px: dragging the central divider resizes every paired row and keeps the fixed action rail',async()=>{
+    const before=await splitSnapshot(), text=await cdp.evaluate("JSON.stringify(window.__review)");
+    const moved=await dragSplitter(.35);
+    assertSplitGeometry(moved); assert.ok(moved.left<before.left-30); assert.ok(moved.right>before.right+30);
+    assert.ok(Math.abs(moved.rail-before.rail)<.6,'The action rail retains its fixed width');
+    assert.ok(Math.abs(moved.saved-moved.ratio)<.002); assert.equal(moved.dragging,false);
+    assertAligned(await geometry()); await assertTextProjection();
+    assert.equal(await cdp.evaluate("JSON.stringify(window.__review)"),text,'Pane resizing cannot alter review content or decisions');
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>['decide','editPending','undo'].includes(message.type)).length"),0);
+    await screenshot('comparison-'+width+'-resized-panes');
+    const cancelled=await dragSplitter(.52,true);
+    assert.ok(Math.abs(cancelled.ratio-moved.ratio)<.002,'Pointer cancellation restores the pre-drag ratio');
+    assert.equal(cancelled.dragging,false);
+    const refreshed=await dragSplitter(.4,false,true);
+    assert.ok(Math.abs(refreshed.ratio-.4)<.003,'A host refresh safely finishes and retains the current drag');
+    assert.equal(refreshed.dragging,false); assertAligned(await geometry());
+    await resetSplit();
+  });
+  await runTest(width+'px: divider keyboard controls honor minimum widths and double-click restores equal panes',async()=>{
+    let current=await splitKey('ArrowLeft');
+    assert.ok(Math.abs(current.ratio-.48)<.003);
+    current=await splitKey('ArrowLeft',true);
+    assert.ok(Math.abs(current.ratio-.38)<.003);
+    current=await splitKey('Home'); assertSplitGeometry(current);
+    assert.ok(Math.abs(current.ratio*100-current.min)<1);
+    current=await splitKey('End'); assertSplitGeometry(current);
+    assert.ok(Math.abs(current.ratio*100-current.max)<1);
+    assertAligned(await geometry()); await assertTextProjection();
+    await resetSplit(); current=await splitSnapshot();
+    assert.ok(Math.abs(current.ratio-.5)<.002,'Double-click resets to an even split');
+    assert.equal(current.saved,.5);
+  });
+  await runTest(width+'px: resizing an inline draft preserves its caret, grows its height, and survives preview reload',async()=>{
+    await openEdit('grow');
+    const draft='Long proposed line: '+'wide_code '.repeat(45)+'\nSecond line.\n';
+    await writeDraft(draft);
+    await cdp.evaluate("(() => {const area=document.querySelector('.pending-editor textarea');area.setSelectionRange(7,19);area.dispatchEvent(new Event('select'));window.__splitDraftNode=area;})()");
+    const before=await editSnapshot(), original=await originalProjection();
+    const oldHeight=await cdp.evaluate("document.querySelector('.pending-editor textarea').getBoundingClientRect().height");
+    const moved=await dragSplitter(.35);
+    const after=await editSnapshot();
+    assert.equal(after.draft,draft); assert.deepEqual(after.selection,before.selection);
+    assert.equal(await cdp.evaluate("window.__splitDraftNode===document.querySelector('.pending-editor textarea')"),true,'Dragging does not replace the focused input DOM');
+    assert.equal(after.focused,'edit:draft'); assert.equal(await originalProjection(),original);
+    const newHeight=await cdp.evaluate("document.querySelector('.pending-editor textarea').getBoundingClientRect().height");
+    assert.ok(newHeight<oldHeight,'A wider proposed pane reflows and reduces the draft height');
+    assert.ok(after.area.scrollWidth<=after.area.width+1); assertAligned(await geometry());
+    await cdp.evaluate("window.__setReview(structuredClone(window.__review))"); await settle();
+    assert.equal((await editSnapshot()).draft,draft); assert.deepEqual((await editSnapshot()).selection,before.selection);
+    assert.ok(Math.abs((await splitSnapshot()).ratio-moved.ratio)<.002);
+    await editorKey('Escape'); await reloadPreview();
+    const reloaded=await splitSnapshot();
+    assert.ok(Math.abs(reloaded.ratio-moved.ratio)<.002,'The saved pane ratio restores after the preview webview reloads');
+    assertAligned(await geometry()); await assertTextProjection();
+    await resetSplit(); await resetFixture(width);
   });
 }
 
@@ -527,10 +796,10 @@ async function runLayoutTests() {
       await assertTextProjection(); await screenshot('comparison-' + width + '-initial');
       return { rows: measurements.rows.length, bannerHeight: measurements.banner.left.height, spacers: measurements.spacers };
     });
-    await runTest(width + 'px: long source lines stay single-row and scroll fully with independent pane gestures', async () => {
-      const prefix = '\tconst long_value = ' + 'long_token\t'.repeat(160);
-      const beforeLine = prefix + 'ORIGINAL_END\n';
-      const afterLine = prefix + 'PROPOSED_END\n';
+    await runTest(width + 'px: long code wraps before controls with aligned logical rows and no hidden final text', async () => {
+      const prefix = '\tconst long_value = ' + 'long_token '.repeat(12) + 'UNBROKEN_' + 'x'.repeat(95);
+      const beforeLine = prefix + ' ORIGINAL_END\n';
+      const afterLine = prefix + ' PROPOSED_END\n';
       const tail = Array.from({length: 105}, (_, index) => 'unchanged tail ' + index + '\n').join('');
       const parts = diffChars(beforeLine.slice(0, -1), afterLine.slice(0, -1));
       const longState = { ...structuredClone(fixture), files: [{path: fixture.files[0].path, before: beforeLine + tail,
@@ -539,57 +808,92 @@ async function runLayoutTests() {
           inlineChanges: [{before: parts.filter(part => !part.added).map(part => ({text: part.value, changed: Boolean(part.removed)})),
             after: parts.filter(part => !part.removed).map(part => ({text: part.value, changed: Boolean(part.added)}))}]}] }] };
       const metrics = () => cdp.evaluate(`(() => {
-        const rect = node => { const box = node.getBoundingClientRect(); return {x: box.x, y: box.y, right: box.right, width: box.width, height: box.height}; };
-        const data = { vertical: document.querySelector('[data-scroll-area]').scrollTop };
+        const rect = node => { const box = node.getBoundingClientRect(); return {x: box.x, y: box.y, right: box.right, bottom:box.bottom, width: box.width, height: box.height}; };
+        const data = {horizontalBars:document.querySelectorAll('[data-horizontal],.horizontal-bars').length};
         for (const side of ['left', 'right']) {
           const cell = document.querySelector('.hunk .code-side.' + side); const source = cell.querySelector('.code-source');
           const code = source.querySelector('.code-text'); const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
           const nodes = []; while (walker.nextNode()) if (walker.currentNode.textContent.length) nodes.push(walker.currentNode);
           const first = document.createRange(); first.setStart(nodes[0], 0); first.setEnd(nodes[0], 1);
           const lastNode = nodes.at(-1); const last = document.createRange(); last.setStart(lastNode, lastNode.textContent.length - 1); last.setEnd(lastNode, lastNode.textContent.length);
-          const scroller = document.querySelector('[data-horizontal=' + side + ']');
+          const action = cell.querySelector('.inline-actions');
           data[side] = {source: rect(source), code: rect(code), first: rect(first), last: rect(last),
             row: rect(cell), gutter: cell.querySelector('.action-gutter') ? rect(cell.querySelector('.action-gutter')) : null,
-            scroll: scroller.scrollLeft, max: scroller.scrollWidth - scroller.clientWidth, whitespace: getComputedStyle(code).whiteSpace};
+            action:action ? rect(action) : null, text:code.textContent,
+            clientWidth:source.clientWidth, scrollWidth:source.scrollWidth,
+            numbers:Array.from(cell.querySelectorAll('.line-number'),node=>node.textContent), whitespace:getComputedStyle(code).whiteSpace,
+            lineHeight:parseFloat(getComputedStyle(code).lineHeight)};
         }
         return data;
       })()`);
+      const check = async () => {
+        const current = await metrics();
+        assert.equal(current.horizontalBars, 0, 'Soft-wrapped comparison has no horizontal scrollbars');
+        for (const side of ['left', 'right']) {
+          const value = current[side];
+          assert.ok(['pre-wrap','break-spaces'].includes(value.whitespace), 'Whitespace is preserved while code wraps');
+          assert.ok(value.last.y > value.first.y + value.lineHeight, 'A long logical line spans multiple visual lines');
+          assert.ok(value.last.x >= value.source.x - 0.6 && value.last.right <= value.source.right + 0.6, 'The complete final character remains within the source column');
+          assert.ok(value.last.bottom <= value.source.bottom + 0.6, 'The final wrapped line is not vertically clipped');
+          assert.ok(value.scrollWidth <= value.clientWidth + 1, 'No source text is hidden in horizontal overflow, including long unbroken tokens');
+          assert.deepEqual(value.numbers,['1'],'Wrapped continuations do not invent logical line numbers');
+          assert.equal(value.text, (side === 'left' ? beforeLine : afterLine).slice(0,-1), 'Soft wrapping never changes source text, tabs, or spaces');
+        }
+        assert.ok(current.right.source.right <= current.right.gutter.x + 0.6, 'Code column ends before the fixed action rail');
+        assert.ok(current.right.action.y - current.right.row.y < current.right.lineHeight, 'Action buttons stay on the first visual line');
+        const layout = await geometry(); assertAligned(layout); await assertTextProjection();
+        assert.ok(layout.scroll.rect.y + layout.scroll.rect.height >= layout.viewport.height - 1, 'Removing the horizontal scrollbar also removes its reserved bottom strip');
+        return current;
+      };
       try {
         await cdp.evaluate('window.__setReview(' + JSON.stringify(longState) + ')'); await settle();
-        const start = await metrics();
-        for (const side of ['left', 'right']) {
-          assert.equal(start[side].whitespace, 'pre');
-          assert.ok(Math.abs(start[side].first.y - start[side].last.y) < 0.6, 'First and last characters share one visual line');
-          assert.ok(start[side].max > start[side].source.width * 3, 'Fixture overflows each pane substantially');
-        }
-        await cdp.evaluate("document.querySelectorAll('[data-horizontal]').forEach(node => { node.scrollLeft = node.scrollWidth; })"); await settle();
-        const end = await metrics();
-        for (const side of ['left', 'right']) {
-          assert.ok(end[side].last.x >= end[side].source.x - 0.6 && end[side].last.right <= end[side].source.right + 0.6, 'The complete final character is reachable through horizontal scrolling');
-          assert.equal(end[side].row.height, start[side].row.height);
-        }
-        assert.deepEqual(end.right.gutter, start.right.gutter, 'Action rail does not move with source text');
-        await screenshot('comparison-' + width + '-long-line-end');
-        await cdp.evaluate("document.querySelectorAll('[data-horizontal]').forEach(node => { node.scrollLeft = 0; })"); await settle();
-        await cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: start.right.source.x + 16, y: start.right.source.y + 10, deltaX: 140, deltaY: 0});
-        await settle(); let moved = await metrics();
-        assert.ok(moved.right.scroll > 0, 'Trackpad horizontal gesture over code moves the proposed pane');
-        assert.equal(moved.left.scroll, 0, 'The other pane keeps its independent offset'); assert.equal(moved.vertical, 0);
-        await cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: start.left.source.x + 16, y: start.left.source.y + 10, deltaX: 0, deltaY: 120, modifiers: 8});
-        await settle(); moved = await metrics();
-        assert.ok(moved.left.scroll > 0, 'Shift-wheel over original code scrolls it horizontally'); assert.equal(moved.vertical, 0);
-        const saved = {left: moved.left.scroll, right: moved.right.scroll};
-        await cdp.evaluate('window.__setReview(structuredClone(window.__review))'); await settle();
-        moved = await metrics(); assert.deepEqual({left: moved.left.scroll, right: moved.right.scroll}, saved, 'Both pane offsets survive rerender');
-        await cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: start.right.source.x + 16, y: start.right.source.y + 10, deltaX: 0, deltaY: 100});
-        await settle(); moved = await metrics(); assert.ok(moved.vertical > 0, 'Ordinary wheel retains shared vertical scrolling');
-        assertAligned(await geometry());
+        const start = await check();
+        await screenshot('comparison-' + width + '-wrapped-long-code');
+        await cdp.send('Emulation.setDeviceMetricsOverride', {width:width===1200?620:1200,height:850,deviceScaleFactor:1,mobile:false});
+        await settle(); await check();
+        await cdp.send('Emulation.setDeviceMetricsOverride', {width,height:850,deviceScaleFactor:1,mobile:false});
+        await settle(); const restored = await check();
+        assert.deepEqual(restored.right.gutter,start.right.gutter,'Resizing back restores the action rail and row geometry');
+        await cdp.evaluate("window.__setReview(structuredClone(window.__review))"); await settle(); await check();
       } finally {
-        await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop = 0; document.querySelectorAll('[data-horizontal]').forEach(node => { node.scrollLeft = 0; })");
+        await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop = 0");
         await settle(); await resetFixture(width);
       }
     });
     await runEditorTests(width);
+    await runCompletionTests(width);
+    await runSplitterTests(width);
+    await runTest(width+'px: closed requests show completion status without suppressing action errors or target guards',async()=>{
+      await resetFixture(width);
+      await cdp.evaluate("(() => {const next=structuredClone(window.__review);next.closed=true;for(const hunk of next.files[0].hunks)hunk.decision='accepted';next.files[0].issue='The original changed after this request was closed.';next.files[0].currentText='CURRENT FILE INTRODUCTION'+String.fromCharCode(10)+next.files[0].before+['Additional current line.','Another current line.',''].join(String.fromCharCode(10));window.__setReview(next);})()");await settle();
+      const closed=await cdp.evaluate("({info:Array.from(document.querySelectorAll('.notice-info p'),node=>node.textContent),errors:Array.from(document.querySelectorAll('.notice-error p'),node=>node.textContent),undo:Array.from(document.querySelectorAll('.inline-actions button'),node=>({text:node.textContent,disabled:node.disabled}))})");
+      assert.deepEqual(closed.info,['This revision request is closed.']);assert.deepEqual(closed.errors,[]);
+      const currentText='CURRENT FILE INTRODUCTION\n'+fixture.files[0].before+'Additional current line.\nAnother current line.\n';
+      assert.equal(await originalProjection(),currentText,'Closed original shows the complete current file, including external prefix and appended lines');
+      const neutral=await cdp.evaluate("({label:document.querySelector('.pane-banner.left .eyebrow').textContent,highlights:document.querySelectorAll('.paired-document .code-side.left .inline-changed,.paired-document .code-side.left.removed,.paired-document .code-side.left.added').length,editable:document.querySelectorAll('[data-edit-hunk]').length,numbers:Array.from(document.querySelectorAll('.code-side.left[data-line]'),node=>Number(node.dataset.line))})");
+      assert.equal(neutral.label,'ORIGINAL');assert.equal(neutral.highlights,0);assert.equal(neutral.editable,0);
+      assert.deepEqual(neutral.numbers,neutral.numbers.map((_,index)=>index+1),'Current original lines are neither duplicated nor dropped');
+      await assertTextProjection(['right']);assertAligned(await geometry());
+      await screenshot('comparison-'+width+'-closed-current-original');
+      await cdp.evaluate("(() => {const next=structuredClone(window.__review);next.files[0].currentText='Short current file without a final newline';window.__setReview(next);})()");await settle();
+      assert.equal(await originalProjection(),'Short current file without a final newline');
+      await assertTextProjection(['right']);assertAligned(await geometry());
+      await cdp.evaluate("(() => {const next=structuredClone(window.__review);next.files[0].currentText="+JSON.stringify(currentText)+";window.__setReview(next);})()");await settle();
+      assert.ok(closed.undo.length>0&&closed.undo.every(button=>button.text==='Undo'&&button.disabled),'Closed display does not weaken stale target Undo guards');
+      await cdp.evaluate("window.__setReview({...window.__review,error:'Undo could not be completed.'})");await settle();
+      assert.deepEqual(await cdp.evaluate("Array.from(document.querySelectorAll('.notice-error p'),node=>node.textContent)"),['Undo could not be completed.']);
+      await cdp.evaluate("(() => {const next=structuredClone(window.__review);next.error=undefined;next.files[0].issue=undefined;window.__setReview(next);})()");await settle();
+      await clickUndo('grow');
+      assert.equal(await cdp.evaluate('window.__review.closed'),false);
+      assert.ok(await cdp.evaluate("document.querySelectorAll('.paired-document .left .code-text').length>0"),'Undo restores the original column when a change becomes pending');
+      await assertTextProjection();assertAligned(await geometry());
+      await cdp.evaluate("window.__setReview({...window.__review,closed:true,files:[],error:undefined})");await settle();
+      assert.equal(await cdp.evaluate("document.querySelector('.empty-state h2').textContent"),'This revision request is closed.');
+      assert.ok(await cdp.evaluate("Boolean(document.querySelector('[data-focus-key=\"empty:source\"]')&&document.querySelector('[data-focus-key=\"empty:delete-request\"]'))"));
+      assert.equal(await completionSnapshot(),null,'Closed state never invents a deletion confirmation');
+      await resetFixture(width);
+    });
+
     await runTest(width + 'px: larger banner items align actual bulk button edges with inline controls', async () => {
       const layout = await cdp.evaluate(`(() => {
         const rect = node => { const box = node.getBoundingClientRect(); return { x: box.x, y: box.y, right: box.right, bottom: box.bottom, width: box.width, height: box.height }; };
@@ -651,7 +955,7 @@ async function runLayoutTests() {
         assert.equal(row.first, true); assert.deepEqual(row.labels, ['Accept', 'Ignore', 'Why']);
         assert.ok(row.actionY >= row.y - 0.6 && row.actionY + row.actionHeight <= row.y + row.height + 0.6, 'Controls fit within their source row');
         assert.ok(row.gap >= 0 && row.gap <= 12, 'Controls sit at the far right of the proposed pane');
-        assert.ok(row.sourceEnd <= row.actionStart + 0.6, 'Source text is clipped before controls');
+        assert.ok(row.sourceEnd <= row.actionStart + 0.6, 'Source text wraps before controls');
       }
     });
     await runTest(width + 'px: left filename opens only the original target without changing review state', async () => {
@@ -732,7 +1036,7 @@ async function runLayoutTests() {
       assert.equal(popover.text, fixture.files[0].hunks[0].explanation); assert.equal(popover.role, 'dialog');
       assert.equal(popover.injected, 0); assert.equal(popover.xss, 0); assert.equal(popover.focused, true, 'Why dialog receives keyboard focus');
       assert.ok(popover.close.width >= 24 && popover.close.height >= 24, 'Why close has a generous hit area');
-      assert.equal(popover.close.beforeWidth, '14px'); assert.equal(popover.close.afterWidth, '14px');
+      assert.equal(popover.close.beforeWidth, '10px'); assert.equal(popover.close.afterWidth, '10px');
       assert.notEqual(popover.close.beforeContent, 'none'); assert.notEqual(popover.close.afterContent, 'none');
       assert.ok(popover.x >= 0 && popover.right <= popover.viewportWidth + 1, 'Popover fits horizontally');
       assert.ok(popover.y >= 0 && popover.bottom <= popover.viewportHeight + 1, 'Popover fits vertically');
@@ -847,7 +1151,7 @@ async function runLayoutTests() {
       const reviewBeforeDismissal = await cdp.evaluate('JSON.stringify(window.__review)');
       const close = await cdp.evaluate(`(() => { const button = document.querySelector('.notice-error .notice-close'); const box = button.getBoundingClientRect();
         return {width: box.width, height: box.height, stroke: getComputedStyle(button, '::before').width, label: button.getAttribute('aria-label')}; })()`);
-      assert.equal(close.width, 24); assert.equal(close.height, 24); assert.equal(close.stroke, '14px'); assert.equal(close.label, 'Dismiss error message');
+      assert.equal(close.width, 24); assert.equal(close.height, 24); assert.equal(close.stroke, '10px'); assert.equal(close.label, 'Dismiss error message');
       await cdp.evaluate("document.querySelector('.notice-error .notice-close').click()"); await settle();
       assert.deepEqual(await cdp.evaluate("Array.from(document.querySelectorAll('.notice-error p'), node => node.textContent)"), [missing], 'Closing one message retains a distinct issue');
       await cdp.evaluate("document.querySelector('.notice-error .notice-close').click()"); await settle();

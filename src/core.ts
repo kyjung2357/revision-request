@@ -18,13 +18,8 @@ export interface RequestFile {
   after: string;
   reason?: string;
   explanations?: RequestExplanation[];
-}
-
-export interface RevisionRequest {
-  version: 1;
-  title: string;
-  description?: string;
-  files: RequestFile[];
+  /** Internal atomic groups resolved from snippets; never read from raw JSON. */
+  reviewHunks?: Hunk[];
 }
 
 export interface Hunk {
@@ -35,6 +30,8 @@ export interface Hunk {
   end: number;
   before: string;
   after: string;
+  /** Display-only line text when a physical append includes its preceding separator. */
+  displayAfter?: string;
   /** One-based line positions. A pure insertion/deletion may have zero lines. */
   oldStart: number;
   oldLines: number;
@@ -44,7 +41,6 @@ export interface Hunk {
   contextAfter: string[];
 }
 
-const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
 const MAX_TEXT_BYTES = 5 * 1024 * 1024;
 
 
@@ -115,56 +111,16 @@ function relativePath(value: unknown, label: string): string {
   return result;
 }
 
-/**
- * Parse a request without reading or writing a target file.
- * An optional $schema property and other metadata are deliberately ignored.
- */
-export function parseRequest(text: string): RevisionRequest {
-  if (Buffer.byteLength(text, 'utf8') > MAX_REQUEST_BYTES) {
-    throw new Error('The revision request exceeds the 20 MiB limit.');
-  }
-  let input: unknown;
-  try {
-    // UTF-8 BOMs are common in files produced by Windows tools.
-    input = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
-  } catch (error) {
-    throw new Error(`Invalid .rr JSON: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  const request = object(input, 'Request');
-  if (request.version !== 1) {
-    throw new Error('Request.version must be 1.');
-  }
-  const title = string(request.title, 'Request.title', 2000, true);
-  const description = optionalString(request.description, 'Request.description', 50_000);
-  if (!Array.isArray(request.files) || request.files.length !== 1) {
-    throw new Error('Request.files must contain exactly one file.');
-  }
-
-  const paths = new Set<string>();
-  const files = request.files.map((value, index): RequestFile => {
-    const label = `Request.files[${index}]`;
-    const file = object(value, label);
-    const path = relativePath(file.path, `${label}.path`);
-    // Case-insensitive uniqueness also prevents aliases on Windows/macOS.
-    const key = path.toLowerCase();
-    if (paths.has(key)) {
-      throw new Error(`Duplicate target path: ${path}`);
-    }
-    paths.add(key);
-    return {
-      path,
-      before: string(file.before, `${label}.before`, MAX_TEXT_BYTES),
-      after: string(file.after, `${label}.after`, MAX_TEXT_BYTES),
-      ...(file.reason === undefined ? {} : {
-        reason: optionalString(file.reason, `${label}.reason`, 50_000),
-      }),
-      ...(file.explanations === undefined ? {} : {
-        explanations: explanations(file.explanations, `${label}.explanations`),
-      }),
-    };
-  });
-
-  return { version: 1, title, ...(description === undefined ? {} : { description }), files };
+/** Validate internal complete snapshots used to compute or generate review groups. */
+export function validateRequestFile(value: unknown): RequestFile {
+  const file = object(value, 'File');
+  return {
+    path: relativePath(file.path, 'File.path'),
+    before: string(file.before, 'File.before', MAX_TEXT_BYTES),
+    after: string(file.after, 'File.after', MAX_TEXT_BYTES),
+    ...(file.reason === undefined ? {} : {reason: optionalString(file.reason, 'File.reason', 50_000)}),
+    ...(file.explanations === undefined ? {} : {explanations: explanations(file.explanations, 'File.explanations')}),
+  };
 }
 
 /** Split text without normalizing CRLF, CR, LF, or the final newline. */
@@ -226,8 +182,15 @@ export function computeInlineChanges(
   return result;
 }
 
+export function validateRequestPath(value: unknown): string { return relativePath(value, 'Request.path'); }
+
 /** Derive independently reviewable groups; does not access the filesystem. */
 export function computeHunks(file: RequestFile): Hunk[] {
+  if (file.reviewHunks) {
+    const accepted = Object.fromEntries(file.reviewHunks.map(hunk => [hunk.id, 'accepted' as Decision]));
+    if (renderAccepted(file.before, file.reviewHunks, accepted) !== file.after) throw new Error('Invalid atomic review groups.');
+    return file.reviewHunks.map(hunk => ({...hunk}));
+  }
   if (file.before === file.after) {
     return [];
   }

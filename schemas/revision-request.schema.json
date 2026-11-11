@@ -2,86 +2,112 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/kyjung2357/revision-request/blob/main/schemas/revision-request.schema.json",
   "title": "Revision Request",
-  "description": "A single-file review proposal named <complete-target-filename>.rr, such as manuscript.tex.rr. Opening it does not change the target.",
+  "description": "Line-based requests named <complete-original-filename>.rr. Opening or changing status metadata never applies a source edit.",
   "type": "object",
   "additionalProperties": true,
   "required": [
-    "version",
-    "title",
-    "files"
+    "path",
+    "request"
   ],
   "properties": {
-    "version": {
-      "const": 1,
-      "description": "The Revision Request format version."
-    },
-    "title": {
+    "path": {
       "type": "string",
       "minLength": 1,
-      "description": "Nonblank request-title metadata, at most 2,000 UTF-8 bytes. Not displayed in the preview banner."
+      "description": "Forward-slash path relative to the VS Code workspace folder containing this .rr file. Must remain inside that folder. Use nonempty segments; . and .., Windows reserved device names, colons, backslashes, and trailing dots or spaces are rejected.",
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\u0000<>\"|?*])(?!.*[. ](?:/|$))(?!.*\\/$).+$"
     },
-    "description": {
+    "time": {
       "type": "string",
-      "description": "Optional request-level metadata; not displayed as a banner explanation. At most 50,000 UTF-8 bytes."
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "description": "Creation time in ISO 8601 with timezone. Generators add it automatically. Missing time in hand-written requests is filled from file creation time when reviewed."
     },
-    "files": {
+    "request": {
       "type": "array",
-      "minItems": 1,
-      "maxItems": 1,
+      "maxItems": 10000,
+      "description": "Each entry is one atomic review decision. Empty arrays have no pending requests.",
       "items": {
         "type": "object",
         "additionalProperties": true,
         "required": [
-          "path",
+          "line",
           "before",
-          "after"
+          "after",
+          "status"
+        ],
+        "anyOf": [
+          {
+            "properties": {
+              "before": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "properties": {
+              "after": {
+                "type": "string"
+              }
+            }
+          }
         ],
         "properties": {
-          "path": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Forward-slash path relative to the VS Code workspace folder containing this .rr file. Must remain inside that folder. Use nonempty segments; . and .., Windows reserved device names, colons, backslashes, and trailing dots or spaces are rejected.",
-            "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\u0000<>\"|?*])(?!.*[. ](?:/|$))(?!.*\\/$).+$"
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991,
+            "description": "1-based line in the original request baseline. Insertions occur before this line; original line count + 1 appends. Line numbers do not shift when other entries are accepted."
           },
           "before": {
-            "type": "string",
-            "description": "Exact original UTF-8 text, including its original line endings and final newline. At most 5 MiB of UTF-8 text; NUL is not supported."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact single-line fragment that occurs once in the indicated original line, or null to insert a complete new line. For deletion, provide the full original line content. No CR or LF.",
+            "pattern": "^[^\\r\\n]*$(?![\\s\\S])"
           },
           "after": {
-            "type": "string",
-            "description": "Exact proposed replacement text. No changes are written until accepted. At most 5 MiB of UTF-8 text; NUL is not supported."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Single-line replacement fragment, or null to delete the indicated original line. For insertion, provide the complete new line. Empty string is text/a blank line, not null. No CR or LF.",
+            "pattern": "^[^\\r\\n]*$(?![\\s\\S])"
           },
           "reason": {
             "type": "string",
-            "description": "Default explanation for each change block. A matching explanations entry overrides it; blank text disables the block Why button. At most 50,000 UTF-8 bytes."
+            "description": "Optional explanation for this entry; blank or absent disables Why. At most 50000 UTF-8 bytes."
           },
-          "explanations": {
-            "type": "array",
-            "maxItems": 10000,
-            "description": "Block explanations matched by the exact first original line (oldStart). Each line must be unique. Unmatched entries are unused.",
-            "items": {
-              "type": "object",
-              "additionalProperties": true,
-              "required": [
-                "line",
-                "text"
-              ],
-              "properties": {
-                "line": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991,
-                  "description": "One-based first original line of the block, or original insertion position for a pure insertion."
-                },
-                "text": {
-                  "type": "string",
-                  "description": "Specific block explanation, overriding reason. Empty or whitespace-only text disables Why for this block. At most 50,000 UTF-8 bytes; NUL is rejected."
-                }
-              }
-            }
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "ignored",
+              "accepted"
+            ],
+            "default": "pending",
+            "description": "New requests start pending. Accept/Ignore/Undo update this metadata; manually changing it never applies a source edit."
           }
         }
       }
     }
-  }
+  },
+  "defaultSnippets": [
+    {
+      "label": "Revision Request",
+      "description": "Create a pending line change; creation time is filled automatically when reviewed.",
+      "body": {
+        "path": "${1:src/main.py}",
+        "request": [
+          {
+            "line": 1,
+            "before": "${2:original fragment}",
+            "after": "${3:proposed fragment}",
+            "reason": "${4:explanation}",
+            "status": "pending"
+          }
+        ]
+      }
+    }
+  ]
 }

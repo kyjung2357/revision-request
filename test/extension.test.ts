@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { ReviewState } from '../src/extension';
+import type { ReviewState, CompletionPrompt } from '../src/extension';
 import { createHash, randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { BridgeMethod, McpStatus } from '../src/mcpTypes';
+import { createRequestFromSnapshots } from '../src/createRequest';
 
 interface ExtensionApi {
   getReadyCount(): number;
@@ -16,7 +17,9 @@ interface ExtensionApi {
   testFailNextRequestWriteAfterSave(): void;
   getState(uri: vscode.Uri): Promise<ReviewState>;
   decide(uri: vscode.Uri, file: string, hunk: string | undefined,
-    decision: 'accepted' | 'ignored', revision: string): Promise<void>;
+    decision: 'accepted' | 'ignored', revision: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
+  resolveCompletion(uri: vscode.Uri, completionId: string, revision: string, deleteRequest: boolean, rememberChoice: boolean): Promise<{deleted: boolean}>;
+  deleteRequest(uri: vscode.Uri): Promise<void>;
   undo(uri: vscode.Uri, file: string, hunk: string, revision: string): Promise<void>;
   editPending(uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string): Promise<{changed: boolean; revision: string}>;
 }
@@ -46,16 +49,17 @@ export async function run(): Promise<void> {
     const target = vscode.Uri.joinPath(workspace!, relative);
     const request = vscode.Uri.joinPath(workspace!, relative + '.rr');
     await vscode.workspace.fs.writeFile(target, Buffer.from(before, 'utf8'));
-    await vscode.workspace.fs.writeFile(request, Buffer.from(JSON.stringify({
-      version: 1,
-      title: name,
-      files: [{ path: relative, before, after }],
-    }, null, 2), 'utf8'));
+    await vscode.workspace.fs.writeFile(request, Buffer.from(JSON.stringify(createRequestFromSnapshots(relative, before, after), null, 2), 'utf8'));
     return { request, target, relative, before, after };
   }
   const bytes = async (uri: vscode.Uri) => Buffer.from(await vscode.workspace.fs.readFile(uri));
+  const latestRevision = async (uri: vscode.Uri) => (await api.getState(uri)).revision;
   async function ready(item: Fixture) {
-    const state = await api.getState(item.request);
+    let state = await api.getState(item.request);
+    const deadline = Date.now() + 5000;
+    while (state.error?.includes('changed while loading') && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25)); state = await api.getState(item.request);
+    }
     assert.equal(state.error, undefined, state.error);
     assert.equal(state.files.length, 1);
     assert.equal(state.files[0]!.issue, undefined, state.files[0]!.issue);
@@ -84,22 +88,21 @@ export async function run(): Promise<void> {
       'The real built-in JSON extension must be active as a dependency.');
     const schemaUri = vscode.Uri.joinPath(workspace!, 'schema-check.tex.rr');
     const schemaText = JSON.stringify({
-      version: 2, title: 'Schema check',
-      files: [{path: 'schema-check.tex', before: 'before', after: 'after'}],
+      path: 'schema-check.tex', request: [{line: 1, before: 'before', after: 'after', status: 'invalid'}],
     });
     await vscode.workspace.fs.writeFile(schemaUri, Buffer.from(schemaText));
     const document = await vscode.workspace.openTextDocument(schemaUri);
     assert.equal(document.languageId, 'revision-request');
     await vscode.window.showTextDocument(document, {preview: false});
-    const versionPosition = document.positionAt(schemaText.indexOf(':2') + 1);
+    const statusPosition = document.positionAt(schemaText.indexOf('invalid'));
     const diagnosticDeadline = Date.now() + 20000;
-    const versionDiagnostics = () => vscode.languages.getDiagnostics(schemaUri)
-      .filter(diagnostic => diagnostic.range.contains(versionPosition) && diagnostic.severity <= vscode.DiagnosticSeverity.Warning);
-    while (versionDiagnostics().length === 0 && Date.now() < diagnosticDeadline) {
+    const statusDiagnostics = () => vscode.languages.getDiagnostics(schemaUri)
+      .filter(diagnostic => diagnostic.range.contains(statusPosition) && diagnostic.severity <= vscode.DiagnosticSeverity.Warning);
+    while (statusDiagnostics().length === 0 && Date.now() < diagnosticDeadline) {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    assert.ok(versionDiagnostics().some(diagnostic => /1/.test(diagnostic.message)),
-      'The bundled RR schema must reject version 2 through the built-in JSON language server. Diagnostics: ' +
+    assert.ok(statusDiagnostics().some(diagnostic => /pending|accepted|ignored/.test(diagnostic.message)),
+      'The bundled RR schema must reject invalid status through the built-in JSON language server. Diagnostics: ' +
       JSON.stringify(vscode.languages.getDiagnostics(schemaUri).map(diagnostic => ({message: diagnostic.message, range: diagnostic.range}))));
     const formatting = await vscode.commands.executeCommand<vscode.TextEdit[]>(
       'vscode.executeFormatDocumentProvider', schemaUri, {tabSize: 2, insertSpaces: true});
@@ -119,8 +122,9 @@ export async function run(): Promise<void> {
     const completion = await vscode.commands.executeCommand<vscode.CompletionList>(
       'vscode.executeCompletionItemProvider', completionUri, new vscode.Position(1, 2));
     const labels = completion?.items.map(item => typeof item.label === 'string' ? item.label : item.label.label) ?? [];
-    assert.ok(labels.some(label => label.includes('version')), 'RR schema properties must appear in completion.');
-    assert.ok(labels.some(label => label.includes('files')));
+    assert.ok(labels.some(label => label.includes('path')), 'RR schema properties must appear in completion.');
+    assert.ok(labels.some(label => label.includes('request')));
+    assert.equal(labels.some(label => label.includes('version')), false);
 
     const ordinaryUri = vscode.Uri.joinPath(workspace!, 'ordinary.json');
     await vscode.workspace.fs.writeFile(ordinaryUri, Buffer.from('{"ordinary":true}'));
@@ -168,7 +172,7 @@ export async function run(): Promise<void> {
     let state = await ready(item);
     assert.equal(state.files[0]!.hunks.length, 2);
     assert.deepEqual(await bytes(item.target), original);
-    await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'ignored', state.revision);
+    await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'ignored', await latestRevision(item.request));
     state = await ready(item);
     assert.equal(state.files[0]!.hunks[0]!.decision, 'ignored');
     assert.equal(state.files[0]!.hunks[1]!.decision, 'pending');
@@ -188,24 +192,25 @@ export async function run(): Promise<void> {
     assert.equal((await vscode.workspace.openTextDocument(diff.modified)).getText(), 'alpha\r\nbeta\r\nGAMMA',
       'The comparison must include pending edits while excluding the ignored first change.');
     assert.deepEqual(await bytes(item.target), original);
-    await api.decide(item.request, item.relative, undefined, 'ignored', state.revision);
+    await api.decide(item.request, item.relative, undefined, 'ignored', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), original);
-    assert.deepEqual(await bytes(item.request), sourceBefore, 'Decisions must not rewrite the .rr proposal.');
+    assert.notDeepEqual(await bytes(item.request), sourceBefore, 'Decisions must persist in the .rr request.');
+    assert.deepEqual(JSON.parse((await bytes(item.request)).toString('utf8')).request.map((entry: {status: string}) => entry.status), ['ignored', 'ignored']);
   });
 
   await check('Partial approvals change only selected groups, in either order', async () => {
     const item = await fixture('partial-accept',
       'one\ntwo\nthree\nfour\nfive\n',
-      'ONE\nextra\ntwo\nthree\nfour\nFIVE\n');
+      'ONE\ntwo\nthree\nfour\nFIVE\n');
     let state = await ready(item);
     const hunks = state.files[0]!.hunks;
     assert.equal(hunks.length, 2);
-    await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from('one\ntwo\nthree\nfour\nFIVE\n'));
     state = await ready(item);
     assert.equal(state.files[0]!.hunks[0]!.decision, 'pending');
     assert.equal(state.files[0]!.hunks[1]!.decision, 'accepted');
-    await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
     state = await ready(item);
     assert.ok(state.files[0]!.hunks.every(hunk => hunk.decision === 'accepted'));
@@ -252,7 +257,7 @@ export async function run(): Promise<void> {
     const old = await ready(item);
     const requestDocument = await vscode.workspace.openTextDocument(item.request);
     const request = JSON.parse(requestDocument.getText());
-    request.files[0].after = 'a different proposal\n';
+    request.request[0].after = 'a different proposal';
     const edit = new vscode.WorkspaceEdit();
     edit.replace(item.request, new vscode.Range(new vscode.Position(0, 0),
       requestDocument.positionAt(requestDocument.getText().length)), JSON.stringify(request, null, 2));
@@ -273,7 +278,7 @@ export async function run(): Promise<void> {
     const state = await ready(item);
     const original = await bytes(item.target);
     assert.deepEqual(original.subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]));
-    await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, undefined, 'accepted', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from(item.after, 'utf8'));
     assert.equal((await ready(item)).files[0]!.hunks[0]!.decision, 'accepted');
   });
@@ -313,21 +318,23 @@ export async function run(): Promise<void> {
         }
         const [first, last] = state.files[0]!.hunks;
         assert.ok(first && last);
-        await api.decide(item.request, item.relative, first.id, 'ignored', state.revision);
+        await api.decide(item.request, item.relative, first.id, 'ignored', await latestRevision(item.request));
         state = await ready(item);
         assert.equal(state.files[0]!.hunks[0]!.decision, 'ignored');
         assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
-        await api.undo(item.request, item.relative, first.id, state.revision);
-        await api.decide(item.request, item.relative, last.id, 'accepted', state.revision);
+        await api.undo(item.request, item.relative, first.id, await latestRevision(item.request));
+        await api.decide(item.request, item.relative, last.id, 'accepted', await latestRevision(item.request));
         state = await ready(item);
         assert.equal(state.files[0]!.hunks[1]!.decision, 'accepted');
         assert.deepEqual(await bytes(item.target), Buffer.from('\uFEFFold\r\ncontext\r\nLAST'));
-        await api.undo(item.request, item.relative, last.id, state.revision);
+        await api.undo(item.request, item.relative, last.id, await latestRevision(item.request));
         assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
         assert.deepEqual(await bytes(item.request), originalRequest, 'Review must not rewrite request whitespace or its BOM.');
         if (style === 'mixed') {
           await config.update('autoDeleteCompleted', true, vscode.ConfigurationTarget.Workspace);
-          await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
+          const completion = (await api.decide(item.request, item.relative, undefined, 'accepted', await latestRevision(item.request)))?.completionPrompt;
+          assert.ok(completion, 'Batch completion asks before deleting a mixed-EOL request.');
+          await api.resolveCompletion(item.request, completion.completionId, completion.revision, true, false);
           assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
           await assert.rejects(async () => vscode.workspace.fs.stat(item.request), 'A completed mixed-EOL request must still be cleaned up.');
         }
@@ -348,16 +355,17 @@ export async function run(): Promise<void> {
       let state = await ready(item);
       const [first, middle, last] = state.files[0]!.hunks;
       assert.ok(first && middle && last);
-      await api.decide(item.request, item.relative, first.id, 'accepted', state.revision);
-      await api.decide(item.request, item.relative, last.id, 'ignored', state.revision);
+      await api.decide(item.request, item.relative, first.id, 'accepted', await latestRevision(item.request));
+      await api.decide(item.request, item.relative, last.id, 'ignored', await latestRevision(item.request));
       state = await ready(item);
       const original = await bytes(item.target);
-      const pendingDraft = 'EDITED MIDDLE\nnew pending line\n';
-      const expectedAfter = 'FIRST\ncontext 1\nEDITED MIDDLE\nnew pending line\ncontext 2\nLAST\n';
-      const edited = await api.editPending(item.request, item.relative, middle.id, pendingDraft, state.revision);
+      const pendingDraft = 'EDITED MIDDLE\n';
+      await assert.rejects(api.editPending(item.request, item.relative, middle.id, 'two\nlines\n', state.revision), /one line|single.line|line break/i);
+      const beforeDraft = (await bytes(item.request)).toString('utf8');
+      const edited = await api.editPending(item.request, item.relative, middle.id, pendingDraft, await latestRevision(item.request));
       assert.equal(edited.changed, true); assert.notEqual(edited.revision, state.revision);
       assert.deepEqual(await bytes(item.target), original);
-      assert.deepEqual(await bytes(item.request), Buffer.from(raw.replace(JSON.stringify(item.after), JSON.stringify(expectedAfter))),
+      assert.deepEqual(await bytes(item.request), Buffer.from(beforeDraft.replace(JSON.stringify('MIDDLE'), JSON.stringify('EDITED MIDDLE'))),
         'All bytes outside the after token, including unknown numeric metadata and BOM, must survive.');
       const oldRevision = state.revision;
       state = await ready(item);
@@ -370,15 +378,15 @@ export async function run(): Promise<void> {
       await assert.rejects(api.editPending(item.request, item.relative, first.id, 'resolved\n', state.revision), /pending|resolved/i);
       await assert.rejects(api.editPending(item.request, item.relative, last.id, 'resolved\n', state.revision), /pending|resolved/i);
       const beforeNoop = await bytes(item.request);
-      assert.deepEqual(await api.editPending(item.request, item.relative, pending.id, pending.after, state.revision),
+      assert.deepEqual(await api.editPending(item.request, item.relative, pending.id, pending.after, await latestRevision(item.request)),
         {changed: false, revision: state.revision});
       assert.deepEqual(await bytes(item.request), beforeNoop);
-      await api.decide(item.request, item.relative, pending.id, 'accepted', state.revision);
-      assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext 1\nEDITED MIDDLE\nnew pending line\ncontext 2\nlast\n'));
-      await api.undo(item.request, item.relative, pending.id, state.revision);
+      await api.decide(item.request, item.relative, pending.id, 'accepted', await latestRevision(item.request));
+      assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext 1\nEDITED MIDDLE\ncontext 2\nlast\n'));
+      await api.undo(item.request, item.relative, pending.id, await latestRevision(item.request));
       assert.deepEqual(await bytes(item.target), original, 'Undo restores only the edited block and keeps the prior acceptance.');
       await config.update('autoDeleteCompleted', true, vscode.ConfigurationTarget.Workspace);
-      await api.editPending(item.request, item.relative, pending.id, pending.before, state.revision);
+      await api.editPending(item.request, item.relative, pending.id, pending.before, await latestRevision(item.request));
       state = await ready(item);
       assert.ok(state.files[0]!.hunks.every(hunk => hunk.decision !== 'pending'));
       await vscode.workspace.fs.stat(item.request); // Editing away the last pending change does not auto-delete.
@@ -426,11 +434,11 @@ export async function run(): Promise<void> {
     let state = await ready(item);
     const [first, last] = state.files[0]!.hunks;
     assert.ok(first && last);
-    await api.decide(item.request, item.relative, first.id, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, first.id, 'accepted', await latestRevision(item.request));
     const original = await bytes(item.target);
     api.testFailNextRequestWriteAfterSave();
-    await assert.rejects(api.editPending(item.request, item.relative, last.id, 'EDITED\n', state.revision), /Injected request-write failure after saving bytes/);
-    assert.equal(JSON.parse((await bytes(item.request)).toString('utf8')).files[0].after, 'FIRST\ncontext\nEDITED\n');
+    await api.editPending(item.request, item.relative, last.id, 'EDITED\n', await latestRevision(item.request));
+    assert.equal(JSON.parse((await bytes(item.request)).toString('utf8')).request[1].after, 'EDITED');
     const deadline = Date.now() + 5000;
     do {
       state = await api.getState(item.request);
@@ -443,7 +451,7 @@ export async function run(): Promise<void> {
     assert.deepEqual(await bytes(item.target), original);
     const pending = state.files[0]!.hunks.find(hunk => hunk.decision === 'pending');
     assert.ok(pending);
-    await api.decide(item.request, item.relative, pending.id, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, pending.id, 'accepted', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext\nEDITED\n'));
   });
 
@@ -478,12 +486,12 @@ export async function run(): Promise<void> {
       assert.ok(edits?.some(edit => edit.newText.includes('UNAPPROVED FORMATTER EDIT')),
         'The deliberately mutating formatter must actually be registered.');
       formattingCalls = 0;
-      await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
+      await api.decide(item.request, item.relative, undefined, 'accepted', await latestRevision(item.request));
       assert.equal(formattingCalls, 0, 'Approval must not invoke a save-time formatter.');
       assert.deepEqual(await bytes(item.target), Buffer.from(item.after),
         'Only the reviewed text may be saved, including its trailing spaces and missing final newline.');
       assert.equal((await ready(item)).files[0]!.hunks[0]!.decision, 'accepted');
-      await api.undo(item.request, item.relative, state.files[0]!.hunks[0]!.id, state.revision);
+      await api.undo(item.request, item.relative, state.files[0]!.hunks[0]!.id, await latestRevision(item.request));
       assert.equal(formattingCalls, 0, 'Undo must not invoke save-time formatters either.');
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before),
         'Undo must preserve original trailing whitespace and absent final newline.');
@@ -514,17 +522,22 @@ export async function run(): Promise<void> {
     const state = await ready(item);
     const hunks = state.files[0]!.hunks;
     assert.equal(hunks.length, 2);
-    await Promise.all([
+    const concurrent = await Promise.allSettled([
       api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', state.revision),
       api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', state.revision),
     ]);
+    assert.equal(concurrent.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(concurrent.filter(result => result.status === 'rejected').length, 1);
+    const refreshed = await ready(item);
+    const remaining = refreshed.files[0]!.hunks.find(hunk => hunk.decision === 'pending')!;
+    await api.decide(item.request, item.relative, remaining.id, 'accepted', refreshed.revision);
     assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
     assert.ok((await ready(item)).files[0]!.hunks.every(hunk => hunk.decision === 'accepted'));
   });
 
   await check('An open clean editor reloads the exact result after rapid partial approvals', async () => {
     const item = await fixture('open-editor-reload',
-      'first\r\nmiddle\r\nlast', 'FIRST\r\nextra\r\nmiddle\r\nLAST');
+      'first\r\nmiddle\r\nlast', 'FIRST\r\nmiddle\r\nLAST');
     const state = await ready(item);
     const document = await vscode.workspace.openTextDocument(item.target);
     await vscode.window.showTextDocument(document);
@@ -532,8 +545,8 @@ export async function run(): Promise<void> {
     assert.equal(document.getText(), item.before);
     const hunks = state.files[0]!.hunks;
     assert.equal(hunks.length, 2);
-    await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', state.revision);
-    await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', state.revision);
+    await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', await latestRevision(item.request));
+    await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', await latestRevision(item.request));
     const deadline = Date.now() + 5000;
     while (document.getText() !== item.after && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 25));
@@ -550,9 +563,9 @@ export async function run(): Promise<void> {
     await vscode.workspace.fs.writeFile(wrong, await bytes(item.request));
     const invalid = await api.getState(wrong);
     assert.ok(invalid.error, 'A mismatched request filename must be rejected.');
-    assert.match(invalid.error, /filename-check\.tex\.rr/i);
+    assert.equal(invalid.error, 'The request filename does not match "filename-check.tex".');
     await assert.rejects(api.decide(wrong, item.relative, undefined, 'accepted', valid.revision),
-      /filename-check\.tex\.rr/i);
+      /filename does not match "filename-check\.tex"/i);
     assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
   });
 
@@ -563,11 +576,11 @@ export async function run(): Promise<void> {
     assert.equal(path.basename(markdown.request.fsPath), 'same-name.md.rr');
     const texState = await ready(tex);
     const markdownState = await ready(markdown);
-    await api.decide(tex.request, tex.relative, undefined, 'accepted', texState.revision);
+    await api.decide(tex.request, tex.relative, undefined, 'accepted', await latestRevision(tex.request));
     assert.deepEqual(await bytes(tex.target), Buffer.from(tex.after));
     assert.deepEqual(await bytes(markdown.target), Buffer.from(markdown.before));
     assert.equal((await ready(markdown)).files[0]!.hunks[0]!.decision, 'pending');
-    await api.decide(markdown.request, markdown.relative, undefined, 'ignored', markdownState.revision);
+    await api.decide(markdown.request, markdown.relative, undefined, 'ignored', await latestRevision(markdown.request));
     assert.deepEqual(await bytes(markdown.target), Buffer.from(markdown.before));
     assert.equal((await ready(tex)).files[0]!.hunks[0]!.decision, 'accepted');
   });
@@ -600,6 +613,33 @@ export async function run(): Promise<void> {
       assert.equal(vscode.window.activeTextEditor?.document.uri.toString(), item.request.toString(),
         'View Source must keep the JSON editor active even when auto-preview is enabled.');
       assert.equal(api.getReadyCount(), count, 'View Source must not trigger a second automatic preview.');
+      const previewTabs = () => vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab =>
+        tab.input instanceof vscode.TabInputWebview && tab.label === path.basename(item.request.fsPath) + ' — Preview');
+      await vscode.window.tabGroups.close(previewTabs(), true);
+      await vscode.window.showTextDocument(item.target);
+      await vscode.window.showTextDocument(item.request);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      assert.equal(api.getReadyCount(), count, 'Returning to the already-open RR source must not reopen a closed preview.');
+      assert.equal(previewTabs().length, 0);
+      await vscode.commands.executeCommand('revisionRequest.openPreview', item.request);
+      const explicitDeadline = Date.now() + 10000;
+      while (api.getReadyCount() <= count && Date.now() < explicitDeadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(api.getReadyCount() > count, 'Explicit Open Preview remains available after closing automatic preview.');
+      const explicitCount = api.getReadyCount();
+      await vscode.window.tabGroups.close(previewTabs(), true);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      assert.equal(api.getReadyCount(), explicitCount, 'Closing an explicitly reopened preview must also stay closed.');
+      const sourceDocument = await vscode.workspace.openTextDocument(item.request);
+      const sourceTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs).filter(tab =>
+        tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === item.request.toString());
+      await vscode.window.tabGroups.close(sourceTabs, true);
+      const closedDeadline = Date.now() + 5000;
+      while (!sourceDocument.isClosed && Date.now() < closedDeadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(sourceDocument.isClosed, true, 'The source must truly close before testing a fresh document lifecycle.');
+      await vscode.commands.executeCommand('vscode.open', item.request, {preview: false});
+      const freshDeadline = Date.now() + 10000;
+      while (api.getReadyCount() <= explicitCount && Date.now() < freshDeadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(api.getReadyCount() > explicitCount, 'A freshly opened document may automatically preview once again.');
     } finally {
       await config.update('previewOnOpen', previous, vscode.ConfigurationTarget.Workspace);
     }
@@ -649,9 +689,9 @@ export async function run(): Promise<void> {
       await config.update('showOnlyChangedText', previousOnly, vscode.ConfigurationTarget.Workspace);
     }
   });
-  await check('Automatic deletion defaults on, preserves partial requests, and removes final accepted requests', async () => {
+  await check('Automatic deletion defaults off, and opting in preserves partial requests but removes final accepted requests', async () => {
     const config = vscode.workspace.getConfiguration('revisionRequest');
-    assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.defaultValue, true);
+    assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.defaultValue, false);
     const previous = config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue;
     const previousPreview = config.inspect<boolean>('previewOnOpen')?.workspaceValue;
     try {
@@ -673,11 +713,11 @@ export async function run(): Promise<void> {
       const state = await ready(item);
       const hunks = state.files[0]!.hunks;
       assert.equal(hunks.length, 2);
-      await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', state.revision);
+      await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', await latestRevision(item.request));
       assert.equal((await fs.stat(item.request.fsPath)).isFile(), true, 'A partially reviewed request must remain.');
       assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\nmiddle\nlast\n'));
       const readyBeforeFinal = api.getReadyCount();
-      await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', state.revision);
+      await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', await latestRevision(item.request));
       await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
       assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
       const closedDeadline = Date.now() + 5000;
@@ -710,10 +750,12 @@ export async function run(): Promise<void> {
       }
       assert.ok(api.getReadyCount() > readyBefore, 'The original request must have a live preview before final Ignore.');
       const state = await ready(item);
-      await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'ignored', state.revision);
+      await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'ignored', await latestRevision(item.request));
       assert.equal((await fs.stat(item.request.fsPath)).isFile(), true);
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
-      await api.decide(item.request, item.relative, undefined, 'ignored', state.revision);
+      const completion = (await api.decide(item.request, item.relative, undefined, 'ignored', await latestRevision(item.request)))?.completionPrompt;
+      assert.ok(completion, 'Ignore all asks even when automatic cleanup is enabled.');
+      await api.resolveCompletion(item.request, completion.completionId, completion.revision, true, false);
       await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
       await vscode.workspace.fs.writeFile(item.request, requestBytes);
@@ -745,8 +787,8 @@ export async function run(): Promise<void> {
       const item = await fixture('retain-completed', 'old\n', 'new\n');
       const state = await ready(item);
       const requestBytes = await bytes(item.request);
-      await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
-      assert.deepEqual(await bytes(item.request), requestBytes);
+      await api.decide(item.request, item.relative, undefined, 'accepted', await latestRevision(item.request));
+      assert.deepEqual(await bytes(item.request), Buffer.from(requestBytes.toString('utf8').replace('"status": "pending"', '"status": "accepted"')));
       assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
       assert.equal((await ready(item)).files[0]!.hunks[0]!.decision, 'accepted');
     } finally {
@@ -772,55 +814,193 @@ export async function run(): Promise<void> {
       await config.update('autoDeleteCompleted', previous, vscode.ConfigurationTarget.Workspace);
     }
   });
-  await check('Explanation metadata maps to original hunk lines with fallback and explicit empty suppression', async () => {
-    const item = await fixture('explanations',
-      'first\ncontext\nthird\ncontext\nfifth\n',
-      'FIRST\ncontext\nTHIRD\ncontext\nFIFTH\n');
+  await check('Batch completion asks by default, remembers Yes or No at the existing settings scope, and can ask again', async () => {
+    const config = vscode.workspace.getConfiguration('revisionRequest');
+    assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.defaultValue, false);
+    assert.equal(config.inspect<boolean>('skipCompletedDeleteConfirmation')?.defaultValue, false);
+    const previousAuto = config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue;
+    const previousSkip = config.inspect<boolean>('skipCompletedDeleteConfirmation')?.workspaceValue;
+    const globalAuto = config.inspect<boolean>('autoDeleteCompleted')?.globalValue;
+    try {
+      await config.update('autoDeleteCompleted', false, vscode.ConfigurationTarget.Workspace);
+      await config.update('skipCompletedDeleteConfirmation', false, vscode.ConfigurationTarget.Workspace);
+      const kept = await fixture('ask-keep-completed', 'old\n', 'new\n');
+      const state = await ready(kept);
+      const prompt = (await api.decide(kept.request, kept.relative, undefined, 'ignored', await latestRevision(kept.request)))?.completionPrompt;
+      assert.ok(prompt);
+      assert.equal(prompt.revision, await latestRevision(kept.request));
+      assert.equal((await fs.stat(kept.request.fsPath)).isFile(), true, 'The file remains until a deletion choice.');
+      assert.deepEqual(await bytes(kept.target), Buffer.from(kept.before));
+      await api.resolveCompletion(kept.request, prompt.completionId, prompt.revision, false, true);
+      assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue, false);
+      assert.equal(config.inspect<boolean>('skipCompletedDeleteConfirmation')?.workspaceValue, true);
+      assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.globalValue, globalAuto, 'Remembering a workspace override must not overwrite global preferences.');
+      const silentKeep = await fixture('remember-keep-completed', 'old\n', 'new\n');
+      const silentState = await ready(silentKeep);
+      assert.equal(await api.decide(silentKeep.request, silentKeep.relative, undefined, 'accepted', await latestRevision(silentKeep.request)), undefined);
+      assert.equal((await fs.stat(silentKeep.request.fsPath)).isFile(), true);
+      await config.update('skipCompletedDeleteConfirmation', false, vscode.ConfigurationTarget.Workspace);
+      const removed = await fixture('ask-delete-completed', 'old\n', 'new\n');
+      const removeState = await ready(removed);
+      const removePrompt = (await api.decide(removed.request, removed.relative, undefined, 'ignored', await latestRevision(removed.request)))?.completionPrompt;
+      assert.ok(removePrompt);
+      await api.resolveCompletion(removed.request, removePrompt.completionId, removePrompt.revision, true, true);
+      await assert.rejects(fs.stat(removed.request.fsPath), {code: 'ENOENT'});
+      assert.deepEqual(await bytes(removed.target), Buffer.from(removed.before));
+      assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue, true);
+      assert.equal(config.inspect<boolean>('skipCompletedDeleteConfirmation')?.workspaceValue, true);
+      const silentDelete = await fixture('remember-delete-completed', 'old\n', 'new\n');
+      const deleteState = await ready(silentDelete);
+      assert.equal(await api.decide(silentDelete.request, silentDelete.relative, undefined, 'ignored', await latestRevision(silentDelete.request)), undefined);
+      await assert.rejects(fs.stat(silentDelete.request.fsPath), {code: 'ENOENT'});
+    } finally {
+      await config.update('autoDeleteCompleted', previousAuto, vscode.ConfigurationTarget.Workspace);
+      await config.update('skipCompletedDeleteConfirmation', previousSkip, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+  await check('Deletion confirmation refuses pending or stale requests and No can always dismiss without deleting', async () => {
+    const config = vscode.workspace.getConfiguration('revisionRequest');
+    const previous = config.inspect<boolean>('skipCompletedDeleteConfirmation')?.workspaceValue;
+    try {
+      await config.update('skipCompletedDeleteConfirmation', false, vscode.ConfigurationTarget.Workspace);
+      const item = await fixture('stale-delete-prompt', 'old\n', 'new\n');
+      const state = await ready(item);
+      const prompt = (await api.decide(item.request, item.relative, undefined, 'ignored', await latestRevision(item.request)))?.completionPrompt;
+      assert.ok(prompt);
+      await api.undo(item.request, item.relative, state.files[0]!.hunks[0]!.id, await latestRevision(item.request));
+      await assert.rejects(api.resolveCompletion(item.request, prompt.completionId, prompt.revision, true, false), /pending|changed/i);
+      assert.equal((await fs.stat(item.request.fsPath)).isFile(), true);
+      await api.resolveCompletion(item.request, prompt.completionId, prompt.revision, false, false);
+      const again = (await api.decide(item.request, item.relative, undefined, 'ignored', await latestRevision(item.request)))?.completionPrompt;
+      assert.ok(again);
+      await vscode.workspace.fs.writeFile(item.request, Buffer.concat([await bytes(item.request), Buffer.from('\n')]));
+      await assert.rejects(api.resolveCompletion(item.request, again.completionId, again.revision, true, false), /changed|loading/i);
+      await api.resolveCompletion(item.request, again.completionId, again.revision, false, true);
+      assert.equal(config.get<boolean>('skipCompletedDeleteConfirmation'), false, 'A stale No does not persist a new remembered choice.');
+      assert.equal((await fs.stat(item.request.fsPath)).isFile(), true);
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    } finally { await config.update('skipCompletedDeleteConfirmation', previous, vscode.ConfigurationTarget.Workspace); }
+  });
+  await check('Explicit Delete this RR works for malformed requests, rejects unsaved edits and non-RR files, and never writes the target', async () => {
+    const item = await fixture('delete-invalid-request', 'original\n', 'proposal\n');
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from('{ not JSON }'));
+    assert.equal((await api.getState(item.request)).error, 'JSON syntax error in "delete-invalid-request.tex.rr".');
+    const document = await vscode.workspace.openTextDocument(item.request);
+    const edit = new vscode.WorkspaceEdit(); edit.insert(item.request, new vscode.Position(0, 0), 'unsaved ');
+    assert.equal(await vscode.workspace.applyEdit(edit), true);
+    try {
+      await assert.rejects(api.deleteRequest(item.request), /unsaved/i);
+      assert.equal((await fs.stat(item.request.fsPath)).isFile(), true);
+    } finally {
+      await vscode.window.showTextDocument(document);
+      await vscode.commands.executeCommand('workbench.action.files.revert');
+    }
+    await assert.rejects(api.deleteRequest(item.target), /local \.rr/i);
+    await api.deleteRequest(item.request);
+    await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+  });
+  await check('Unversioned request writes status/time into RR, keeps atomic entries, and preserves the original until Accept', async () => {
+    const item = await fixture('request-decisions', 'first\ncontext\nlast\n', 'FIRST\ncontext\nLAST\n');
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify({path: item.relative, request: [
+      {line: 1, before: 'first', after: 'FIRST', reason: 'First change', status: 'pending'},
+      {line: 3, before: 'last', after: 'LAST', status: 'pending'}
+    ]}, null, 2)));
+    let state = await ready(item);
+    assert.equal(state.verified, true); assert.equal(state.files[0]!.hunks.length, 2);
+    const stamped = JSON.parse((await bytes(item.request)).toString('utf8'));
+    assert.ok(Number.isFinite(Date.parse(stamped.time)));
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    const identity = state.requestIdentity; const oldRevision = state.revision;
+    await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'accepted', await latestRevision(item.request));
+    state = await ready(item);
+    assert.notEqual(state.revision, oldRevision); assert.equal(state.requestIdentity, identity);
+    assert.deepEqual(JSON.parse((await bytes(item.request)).toString('utf8')).request.map((entry: {status: string}) => entry.status), ['accepted', 'pending']);
+    assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext\nlast\n'));
+    await assert.rejects(api.decide(item.request, item.relative, state.files[0]!.hunks[1]!.id, 'ignored', oldRevision), /request changed/i);
+    await api.decide(item.request, item.relative, state.files[0]!.hunks[1]!.id, 'ignored', await latestRevision(item.request));
+    state = await ready(item); assert.equal(state.closed, true); assert.equal(state.verified, true);
+    assert.equal(state.files[0]!.currentText, 'FIRST\ncontext\nlast\n');
+    await api.undo(item.request, item.relative, state.files[0]!.hunks[0]!.id, await latestRevision(item.request));
+    state = await ready(item); assert.equal(state.closed, false);
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    assert.equal(JSON.parse((await bytes(item.request)).toString('utf8')).time, stamped.time);
+  });
+  await check('Unversioned request accepted deletion retains its baseline through pending edits and committed-then-rejected RR writes', async () => {
+    const item = await fixture('request-delete-edit', 'remove\ncontext\nold\n', 'context\nnew\n');
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify({path: item.relative, request: [
+      {line: 1, before: 'remove', after: null, status: 'pending'}, {line: 3, before: 'old', after: 'new', status: 'pending'}
+    ]})));
+    let state = await ready(item);
+    api.testFailNextRequestWriteAfterSave();
+    await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'accepted', await latestRevision(item.request));
+    state = await ready(item); assert.deepEqual(await bytes(item.target), Buffer.from('context\nold\n'));
+    const pending = state.files[0]!.hunks.find(hunk => hunk.decision === 'pending')!;
+    await api.editPending(item.request, item.relative, pending.id, 'edited\n', await latestRevision(item.request));
+    state = await ready(item); assert.equal(state.files[0]!.hunks[0]!.decision, 'accepted');
+    assert.equal(state.files[0]!.hunks.find(hunk => hunk.decision === 'pending')!.after, 'edited\n');
+    assert.deepEqual(await bytes(item.target), Buffer.from('context\nold\n'));
+    await api.undo(item.request, item.relative, state.files[0]!.hunks[0]!.id, await latestRevision(item.request));
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+  });
+  await check('Unversioned request closed summaries do not report unverified accepted imports as completed source changes', async () => {
+    const item = await fixture('request-unverified-closed', 'context\n', 'context\n');
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify({path: item.relative, request: [
+      {line: 1, before: 'missing deleted line', after: 'missing-after', status: 'accepted'}
+    ]})));
+    const state = await api.getState(item.request);
+    assert.equal(state.closed, true); assert.equal(state.error, undefined); assert.equal(state.verified, false);
+    assert.ok(state.verificationIssue); assert.equal(state.files.length, 0);
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+  });
+  await check('Per-entry reasons map to each atomic change, including blank and insertion reasons', async () => {
+    const item = await fixture('explanations', 'first\ncontext\nthird\ncontext\nfifth\n', 'FIRST\ncontext\nTHIRD\ncontext\nFIFTH\n');
     const request = JSON.parse((await bytes(item.request)).toString('utf8'));
-    request.files[0].reason = 'General reason.';
-    request.files[0].explanations = [
-      {line: 1, text: 'Specific first-block explanation.'},
-      {line: 5, text: ''},
-      {line: 99, text: 'Unmatched metadata must not attach to a different block.'},
-    ];
+    request.request[0].reason = 'Specific first-block explanation.';
+    request.request[1].reason = 'Third-block explanation.';
+    request.request[2].reason = '';
     await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify(request)));
     const state = await ready(item);
     assert.deepEqual(state.files[0]!.hunks.map(hunk => [hunk.oldStart, hunk.explanation]), [
-      [1, 'Specific first-block explanation.'], [3, 'General reason.'], [5, ''],
+      [1, 'Specific first-block explanation.'], [3, 'Third-block explanation.'], [5, ''],
     ]);
     const absent = await fixture('no-explanation', 'old\n', 'new\n');
-    assert.equal((await ready(absent)).files[0]!.hunks[0]!.explanation, undefined);
+    assert.equal((await ready(absent)).files[0]!.hunks[0]!.explanation ?? '', '');
     const insertion = await fixture('insertion-explanation', 'tail\n', 'inserted\ntail\n');
     const insertionRequest = JSON.parse((await bytes(insertion.request)).toString('utf8'));
-    insertionRequest.files[0].explanations = [{line: 1, text: 'An explanation for a pure insertion.'}];
+    insertionRequest.request[0].reason = 'An explanation for an insertion.';
     await vscode.workspace.fs.writeFile(insertion.request, Buffer.from(JSON.stringify(insertionRequest)));
-    const inserted = (await ready(insertion)).files[0]!.hunks[0]!;
-    assert.equal(inserted.oldLines, 0);
-    assert.equal(inserted.explanation, 'An explanation for a pure insertion.');
-    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
-    assert.deepEqual(await bytes(absent.target), Buffer.from(absent.before));
-    assert.deepEqual(await bytes(insertion.target), Buffer.from(insertion.before));
+    assert.equal((await ready(insertion)).files[0]!.hunks[0]!.explanation, 'An explanation for an insertion.');
+    for (const current of [item, absent, insertion]) assert.deepEqual(await bytes(current.target), Buffer.from(current.before));
   });
   await check('Undo restores only one accepted group and serializes with other approvals', async () => {
     const item = await fixture('undo-partial',
       'one\nmiddle-a\nthree\nmiddle-b\nfive\n',
-      'ONE\nextra\nmiddle-a\nTHREE\nmiddle-b\nFIVE\n');
+      'ONE\nmiddle-a\nTHREE\nmiddle-b\nFIVE\n');
     const state = await ready(item);
     const [first, middle, last] = state.files[0]!.hunks;
     assert.equal(state.files[0]!.hunks.length, 3);
-    await api.decide(item.request, item.relative, last!.id, 'accepted', state.revision);
-    await api.decide(item.request, item.relative, first!.id, 'accepted', state.revision);
-    await api.undo(item.request, item.relative, first!.id, state.revision);
+    await api.decide(item.request, item.relative, last!.id, 'accepted', await latestRevision(item.request));
+    await api.decide(item.request, item.relative, first!.id, 'accepted', await latestRevision(item.request));
+    await api.undo(item.request, item.relative, first!.id, await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from('one\nmiddle-a\nthree\nmiddle-b\nFIVE\n'));
     assert.deepEqual((await ready(item)).files[0]!.hunks.map(hunk => hunk.decision), ['pending', 'pending', 'accepted']);
-    await assert.rejects(api.undo(item.request, item.relative, first!.id, state.revision), /still pending/i);
-    await api.decide(item.request, item.relative, first!.id, 'accepted', state.revision);
-    await api.undo(item.request, item.relative, first!.id, state.revision);
-    await api.decide(item.request, item.relative, first!.id, 'ignored', state.revision);
-    await Promise.all([
-      api.undo(item.request, item.relative, last!.id, state.revision),
-      api.decide(item.request, item.relative, middle!.id, 'accepted', state.revision),
+    await assert.rejects(api.undo(item.request, item.relative, first!.id, await latestRevision(item.request)), /still pending/i);
+    await api.decide(item.request, item.relative, first!.id, 'accepted', await latestRevision(item.request));
+    await api.undo(item.request, item.relative, first!.id, await latestRevision(item.request));
+    await api.decide(item.request, item.relative, first!.id, 'ignored', await latestRevision(item.request));
+    const revision = await latestRevision(item.request);
+    const concurrent = await Promise.allSettled([
+      api.undo(item.request, item.relative, last!.id, revision),
+      api.decide(item.request, item.relative, middle!.id, 'accepted', revision),
     ]);
+    assert.equal(concurrent.filter(result => result.status === 'rejected').length, 1);
+    const refreshed = await ready(item);
+    if (refreshed.files[0]!.hunks.find(hunk => hunk.id === last!.id)?.decision === 'accepted') {
+      await api.undo(item.request, item.relative, last!.id, refreshed.revision);
+    } else {
+      await api.decide(item.request, item.relative, middle!.id, 'accepted', refreshed.revision);
+    }
     assert.deepEqual(await bytes(item.target), Buffer.from('one\nmiddle-a\nTHREE\nmiddle-b\nfive\n'));
     assert.deepEqual((await ready(item)).files[0]!.hunks.map(hunk => hunk.decision), ['ignored', 'accepted', 'pending']);
   });
@@ -830,21 +1010,21 @@ export async function run(): Promise<void> {
     const state = await ready(item);
     const hunk = state.files[0]!.hunks[0]!;
     const original = await bytes(item.target);
-    await api.decide(item.request, item.relative, hunk.id, 'ignored', state.revision);
-    await assert.rejects(api.undo(item.request, item.relative, '', state.revision), /specific change/i);
-    await assert.rejects(api.undo(item.request, item.relative, 'unknown-hunk', state.revision), /unknown change/i);
-    await api.undo(item.request, item.relative, hunk.id, state.revision);
+    await api.decide(item.request, item.relative, hunk.id, 'ignored', await latestRevision(item.request));
+    await assert.rejects(api.undo(item.request, item.relative, '', await latestRevision(item.request)), /specific change/i);
+    await assert.rejects(api.undo(item.request, item.relative, 'unknown-hunk', await latestRevision(item.request)), /unknown change/i);
+    await api.undo(item.request, item.relative, hunk.id, await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), original);
     assert.equal((await ready(item)).files[0]!.hunks[0]!.decision, 'pending');
-    await assert.rejects(api.undo(item.request, item.relative, hunk.id, state.revision), /still pending/i);
-    await api.decide(item.request, item.relative, hunk.id, 'accepted', state.revision);
+    await assert.rejects(api.undo(item.request, item.relative, hunk.id, await latestRevision(item.request)), /still pending/i);
+    await api.decide(item.request, item.relative, hunk.id, 'accepted', await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
     const insertion = await fixture('undo-ignored-insertion', '', 'inserted\n');
     const insertionState = await ready(insertion);
     const inserted = insertionState.files[0]!.hunks[0]!;
     assert.equal(inserted.oldLines, 0);
-    await api.decide(insertion.request, insertion.relative, inserted.id, 'ignored', insertionState.revision);
-    await api.undo(insertion.request, insertion.relative, inserted.id, insertionState.revision);
+    await api.decide(insertion.request, insertion.relative, inserted.id, 'ignored', await latestRevision(insertion.request));
+    await api.undo(insertion.request, insertion.relative, inserted.id, await latestRevision(insertion.request));
     assert.deepEqual(await bytes(insertion.target), Buffer.alloc(0));
     assert.equal((await ready(insertion)).files[0]!.hunks[0]!.decision, 'pending');
   });
@@ -853,23 +1033,23 @@ export async function run(): Promise<void> {
     const stale = await fixture('undo-stale-target', 'before\n', 'after\n');
     const staleState = await ready(stale);
     const staleHunk = staleState.files[0]!.hunks[0]!;
-    await api.decide(stale.request, stale.relative, staleHunk.id, 'accepted', staleState.revision);
+    await api.decide(stale.request, stale.relative, staleHunk.id, 'accepted', await latestRevision(stale.request));
     const userText = Buffer.from('independent user edit\n');
     await vscode.workspace.fs.writeFile(stale.target, userText);
-    await assert.rejects(api.undo(stale.request, stale.relative, staleHunk.id, staleState.revision), /original has changed/i);
+    await assert.rejects(api.undo(stale.request, stale.relative, staleHunk.id, await latestRevision(stale.request)), /original has changed/i);
     assert.deepEqual(await bytes(stale.target), userText);
     assert.equal((await api.getState(stale.request)).files[0]!.hunks[0]!.decision, 'accepted');
 
     const dirty = await fixture('undo-dirty-target', 'before\n', 'after\n');
     const dirtyState = await ready(dirty);
     const dirtyHunk = dirtyState.files[0]!.hunks[0]!;
-    await api.decide(dirty.request, dirty.relative, dirtyHunk.id, 'accepted', dirtyState.revision);
+    await api.decide(dirty.request, dirty.relative, dirtyHunk.id, 'accepted', await latestRevision(dirty.request));
     const document = await vscode.workspace.openTextDocument(dirty.target);
     const editor = await vscode.window.showTextDocument(document);
     try {
       assert.equal(await editor.edit(builder => builder.insert(new vscode.Position(0, 0), 'unsaved ')), true);
       assert.equal(document.isDirty, true);
-      await assert.rejects(api.undo(dirty.request, dirty.relative, dirtyHunk.id, dirtyState.revision), /unsaved edits/i);
+      await assert.rejects(api.undo(dirty.request, dirty.relative, dirtyHunk.id, await latestRevision(dirty.request)), /unsaved edits/i);
       assert.equal(document.getText(), 'unsaved after\n');
       assert.deepEqual(await bytes(dirty.target), Buffer.from(dirty.after));
       assert.equal((await api.getState(dirty.request)).files[0]!.hunks[0]!.decision, 'accepted');
@@ -881,10 +1061,10 @@ export async function run(): Promise<void> {
     const changed = await fixture('undo-stale-request', 'before\n', 'after\n');
     const changedState = await ready(changed);
     const changedHunk = changedState.files[0]!.hunks[0]!;
-    await api.decide(changed.request, changed.relative, changedHunk.id, 'accepted', changedState.revision);
+    await api.decide(changed.request, changed.relative, changedHunk.id, 'accepted', await latestRevision(changed.request));
     const requestDocument = await vscode.workspace.openTextDocument(changed.request);
     const request = JSON.parse(requestDocument.getText());
-    request.title = 'A changed request after approval';
+    request.note = 'A changed request after approval';
     const edit = new vscode.WorkspaceEdit();
     edit.replace(changed.request, new vscode.Range(new vscode.Position(0, 0),
       requestDocument.positionAt(requestDocument.getText().length)), JSON.stringify(request));
@@ -901,10 +1081,10 @@ export async function run(): Promise<void> {
     const state = await ready(item);
     const [first, last] = state.files[0]!.hunks;
     assert.equal(state.files[0]!.hunks.length, 2);
-    await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
-    await api.undo(item.request, item.relative, first!.id, state.revision);
+    await api.decide(item.request, item.relative, undefined, 'accepted', await latestRevision(item.request));
+    await api.undo(item.request, item.relative, first!.id, await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from('\uFEFF첫째 😀\r\nold  \r\ncontext\r\nLAST'));
-    await api.undo(item.request, item.relative, last!.id, state.revision);
+    await api.undo(item.request, item.relative, last!.id, await latestRevision(item.request));
     assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
     assert.deepEqual((await bytes(item.target)).subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]));
     assert.ok((await ready(item)).files[0]!.hunks.every(hunk => hunk.decision === 'pending'));
@@ -912,9 +1092,9 @@ export async function run(): Promise<void> {
     const deletionState = await ready(deletion);
     const deleted = deletionState.files[0]!.hunks[0]!;
     assert.equal(deleted.newLines, 0);
-    await api.decide(deletion.request, deletion.relative, deleted.id, 'accepted', deletionState.revision);
+    await api.decide(deletion.request, deletion.relative, deleted.id, 'accepted', await latestRevision(deletion.request));
     assert.deepEqual(await bytes(deletion.target), Buffer.alloc(0));
-    await api.undo(deletion.request, deletion.relative, deleted.id, deletionState.revision);
+    await api.undo(deletion.request, deletion.relative, deleted.id, await latestRevision(deletion.request));
     assert.deepEqual(await bytes(deletion.target), Buffer.from(deletion.before));
     assert.equal((await ready(deletion)).files[0]!.hunks[0]!.decision, 'pending');
   });
@@ -954,7 +1134,8 @@ export async function run(): Promise<void> {
   async function propose(client: Client, item: Awaited<ReturnType<typeof mcpTarget>>, after = 'FIRST\ncontext\nLAST\n') {
     const read = await tool<{path: string; content: string; hash: string}>(client, 'rr_read_target', {path: item.relative});
     assert.equal(read.content, item.before); assert.equal(read.hash, createHash('sha256').update(Buffer.from(item.before)).digest('hex'));
-    const args = {path: item.relative, expectedHash: read.hash, after, clientRequestId: randomUUID(), title: 'MCP fixture'};
+    const proposed = createRequestFromSnapshots(item.relative, item.before, after);
+    const args = {path: item.relative, expectedHash: read.hash, request: proposed.request.map(({line, before, after, reason}) => ({line, before, after, reason})), clientRequestId: randomUUID()};
     const status = await tool<McpStatus>(client, 'rr_create_request', args);
     return {status, args, request: vscode.Uri.joinPath(workspace!, status.requestPath)};
   }
@@ -979,8 +1160,8 @@ export async function run(): Promise<void> {
         const names = (await client.listTools()).tools.map(item => item.name);
         for (const name of ['rr_read_target', 'rr_create_request', 'rr_get_request_status', 'rr_open_preview', 'rr_get_format']) assert.ok(names.includes(name));
         assert.equal(names.includes('rr_decide'), false); assert.equal(names.includes('rr_undo'), false);
-        const format = await client.callTool({name: 'rr_get_format', arguments: {language: 'ko'}});
-        assert.notEqual(format.isError, true); assert.match(JSON.stringify(format.content), /[가-힣]/);
+        const format = await client.callTool({name: 'rr_get_format', arguments: {}});
+        assert.notEqual(format.isError, true); assert.equal((format.structuredContent as {language: string}).language, 'en');
         const item = await mcpTarget('mcp-default'); const made = await propose(client, item);
         const args = {requestId: made.status.requestId, revision: made.status.revision, hunkId: made.status.hunks[0]!.id};
         for (const decision of ['accepted', 'ignored']) {
@@ -998,6 +1179,59 @@ export async function run(): Promise<void> {
     }
   });
 
+  await check('MCP creation always starts pending and its requestId survives human status changes and Undo', async () => {
+    await withMcpClient(async client => {
+      const item = await mcpTarget('mcp-request-status');
+      const read = await tool<{hash: string}>(client, 'rr_read_target', {path: item.relative});
+      const entries = [{line: 1, before: 'first', after: 'FIRST', reason: 'First proposal'}, {line: 3, before: 'last', after: 'LAST'}];
+      const args = {path: item.relative, expectedHash: read.hash, clientRequestId: randomUUID(), request: entries};
+      const created = await tool<McpStatus>(client, 'rr_create_request', args);
+      const request = vscode.Uri.joinPath(workspace!, created.requestPath);
+      const json = JSON.parse((await bytes(request)).toString('utf8'));
+      assert.equal('version' in json, false); assert.ok(Number.isFinite(Date.parse(json.time)));
+      assert.deepEqual(json.request.map((entry: {status: string}) => entry.status), ['pending', 'pending']);
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+      assert.equal((await tool<McpStatus>(client, 'rr_create_request', args)).requestId, created.requestId);
+      await api.decide(request, item.relative, created.hunks[0]!.id, 'accepted', await latestRevision(request));
+      let status = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      assert.equal(status.requestId, created.requestId); assert.equal(status.accepted, 1); assert.equal(status.pending, 1);
+      assert.notEqual(status.revision, created.revision);
+      await api.undo(request, item.relative, status.hunks[0]!.id, await latestRevision(request));
+      status = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      assert.equal(status.requestId, created.requestId); assert.equal(status.pending, 2); assert.equal(status.accepted, 0);
+      await api.decide(request, item.relative, status.hunks[0]!.id, 'ignored', await latestRevision(request));
+      status = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      await api.decide(request, item.relative, status.hunks[1]!.id, 'accepted', await latestRevision(request));
+      status = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      assert.equal(status.requestId, created.requestId); assert.equal(status.status, 'completed');
+      assert.equal(status.ignored, 1); assert.equal(status.accepted, 1); assert.equal(status.cleanup, 'retained');
+      assert.deepEqual(await bytes(item.target), Buffer.from('first\ncontext\nLAST\n'));
+      const injected = await mcpTarget('mcp-request-status-injection');
+      const injectedRead = await tool<{hash: string}>(client, 'rr_read_target', {path: injected.relative});
+      const injection = {path: injected.relative, expectedHash: injectedRead.hash, clientRequestId: randomUUID(), request: [{...entries[0], status: 'accepted'}]};
+      await toolRefused(client, 'rr_create_request', injection, /status|propert|argument|pending/i);
+      await assert.rejects(api.mcpHandler('create_request', injection, workspace!.toString()), /status|pending/i);
+      assert.deepEqual(await bytes(injected.target), Buffer.from(injected.before));
+      await assert.rejects(fs.stat(vscode.Uri.joinPath(workspace!, injected.relative + '.rr').fsPath), {code: 'ENOENT'});
+    });
+  });
+  await check('MCP never treats manually missing or externally falsified status as verified completion', async () => {
+    await withMcpClient(async client => {
+      const item = await mcpTarget('mcp-request-unverified');
+      const read = await tool<{hash: string}>(client, 'rr_read_target', {path: item.relative});
+      const created = await tool<McpStatus>(client, 'rr_create_request', {path: item.relative, expectedHash: read.hash, clientRequestId: randomUUID(),
+        request: [{line: 1, before: 'first', after: 'FIRST'}]});
+      const request = vscode.Uri.joinPath(workspace!, created.requestPath);
+      const json = JSON.parse((await bytes(request)).toString('utf8')); json.request[0].status = 'accepted';
+      await vscode.workspace.fs.writeFile(request, Buffer.from(JSON.stringify(json)));
+      const stale = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      assert.equal(stale.status, 'stale'); assert.notEqual(stale.cleanup, 'deleted');
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+      await api.deleteRequest(request);
+      const missing = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
+      assert.equal(missing.status, 'unavailable'); assert.notEqual(missing.cleanup, 'deleted');
+    });
+  });
   await check('MCP creation is byte-safe and retry-idempotent while stale hashes, existing requests, paths and dirty sources are refused', async () => {
     await withMcpClient(async client => {
       const item = await mcpTarget('mcp-create', '\uFEFFfirst\r\ncontext\r\nlast');
@@ -1006,7 +1240,7 @@ export async function run(): Promise<void> {
       const again = await tool<McpStatus>(client, 'rr_create_request', made.args);
       assert.equal(again.requestId, made.status.requestId); assert.deepEqual(await bytes(made.request), originalRequest);
       await toolRefused(client, 'rr_create_request', {...made.args, clientRequestId: randomUUID()}, /exist|request/i);
-      await toolRefused(client, 'rr_create_request', {...made.args, after: 'A different retry'}, /id|retry|request/i);
+      await toolRefused(client, 'rr_create_request', {...made.args, request: [{line: 1, before: 'first', after: 'A different retry'}]}, /id|retry|request/i);
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before)); assert.deepEqual(await bytes(made.request), originalRequest);
       for (const invalidPath of ['../escape.tex', '/absolute.tex', 'nested/../escape.tex']) {
         await toolRefused(client, 'rr_read_target', {path: invalidPath}, /path|relative|workspace|travers/i);
@@ -1015,7 +1249,7 @@ export async function run(): Promise<void> {
       const stale = await mcpTarget('mcp-stale');
       const read = await tool<{hash: string}>(client, 'rr_read_target', {path: stale.relative});
       const manual = 'Manually changed since reading\n'; await vscode.workspace.fs.writeFile(stale.target, Buffer.from(manual));
-      await toolRefused(client, 'rr_create_request', {path: stale.relative, expectedHash: read.hash, after: 'new', clientRequestId: randomUUID()}, /changed|hash|stale/i);
+      await toolRefused(client, 'rr_create_request', {path: stale.relative, expectedHash: read.hash, request: [{line: 1, before: 'first', after: 'new'}], clientRequestId: randomUUID()}, /changed|hash|stale/i);
       assert.deepEqual(await bytes(stale.target), Buffer.from(manual));
       await assert.rejects(async () => vscode.workspace.fs.stat(vscode.Uri.joinPath(workspace!, stale.relative + '.rr')));
       const dirty = await mcpTarget('mcp-dirty');
@@ -1026,7 +1260,7 @@ export async function run(): Promise<void> {
       assert.equal(await vscode.workspace.applyEdit(edit), true); assert.equal(document.isDirty, true);
       try {
         await toolRefused(client, 'rr_read_target', {path: dirty.relative}, /unsaved|dirty/i);
-        await toolRefused(client, 'rr_create_request', {path: dirty.relative, expectedHash: clean.hash, after: 'new', clientRequestId: randomUUID()}, /unsaved|dirty/i);
+        await toolRefused(client, 'rr_create_request', {path: dirty.relative, expectedHash: clean.hash, request: [{line: 1, before: 'first', after: 'new'}], clientRequestId: randomUUID()}, /unsaved|dirty/i);
         assert.deepEqual(await bytes(dirty.target), Buffer.from(dirty.before));
         assert.ok(document.getText().startsWith('Unsaved'));
       } finally { await vscode.commands.executeCommand('workbench.action.files.revert'); }
@@ -1047,11 +1281,11 @@ export async function run(): Promise<void> {
         const deadline = Date.now() + 10000;
         while (api.getReadyCount() <= readyBefore && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
         assert.ok(api.getReadyCount() > readyBefore, 'MCP open_preview must open the actual webview');
-        await api.decide(made.request, item.relative, made.status.hunks[0]!.id, 'accepted', made.status.revision);
+        await api.decide(made.request, item.relative, made.status.hunks[0]!.id, 'accepted', await latestRevision(made.request));
         const afterAccepted = Buffer.from('FIRST\ncontext\nlast\n'); assert.deepEqual(await bytes(item.target), afterAccepted);
         const partial = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
         assert.equal(partial.accepted, 1); assert.equal(partial.pending, 1);
-        await api.decide(made.request, item.relative, made.status.hunks[1]!.id, 'ignored', made.status.revision);
+        await api.decide(made.request, item.relative, made.status.hunks[1]!.id, 'ignored', await latestRevision(made.request));
         const complete = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
         assert.equal(complete.status, 'completed'); assert.equal(complete.cleanup, 'deleted');
         assert.equal(complete.accepted, 1); assert.equal(complete.ignored, 1); assert.equal(complete.pending, 0);
@@ -1068,7 +1302,7 @@ export async function run(): Promise<void> {
   await check('MCP distinguishes a manually missing request from completed review receipts', async () => {
     await withMcpClient(async client => {
       const item = await mcpTarget('mcp-missing'); const made = await propose(client, item);
-      await vscode.workspace.fs.delete(made.request, {useTrash: false});
+      await api.deleteRequest(made.request);
       const missing = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
       assert.equal(missing.status, 'unavailable'); assert.notEqual(missing.cleanup, 'deleted');
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
@@ -1086,18 +1320,18 @@ export async function run(): Promise<void> {
         await agentConfig.update('mcp.allowAgentDecisions', true, vscode.ConfigurationTarget.Global);
         const names = (await client.listTools()).tools.map(tool => tool.name);
         assert.ok(names.includes('rr_decide')); assert.ok(names.includes('rr_undo'));
-        await tool<McpStatus>(client, 'rr_decide', {...args, decision: 'accepted'});
+        await tool<McpStatus>(client, 'rr_decide', {...args, revision: await latestRevision(made.request), decision: 'accepted'});
         assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext\nlast\n'));
-        await tool<McpStatus>(client, 'rr_undo', args); assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
-        await tool<McpStatus>(client, 'rr_decide', {...args, decision: 'ignored'});
-        assert.deepEqual(await bytes(item.target), Buffer.from(item.before)); await tool<McpStatus>(client, 'rr_undo', args);
+        await tool<McpStatus>(client, 'rr_undo', {...args, revision: await latestRevision(made.request)}); assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+        await tool<McpStatus>(client, 'rr_decide', {...args, revision: await latestRevision(made.request), decision: 'ignored'});
+        assert.deepEqual(await bytes(item.target), Buffer.from(item.before)); await tool<McpStatus>(client, 'rr_undo', {...args, revision: await latestRevision(made.request)});
         await agentConfig.update('mcp.allowAgentDecisions', false, vscode.ConfigurationTarget.Global);
         await toolRefused(client, 'rr_decide', {...args, decision: 'accepted'}, agentDenied);
         await toolRefused(client, 'rr_undo', args, agentDenied);
         await assert.rejects(api.mcpHandler('decide', {...args, decision: 'ignored'}, workspace!.toString()), agentDenied);
-        await api.decide(made.request, item.relative, made.status.hunks[0]!.id, 'ignored', made.status.revision);
+        await api.decide(made.request, item.relative, made.status.hunks[0]!.id, 'ignored', await latestRevision(made.request));
         assert.equal((await api.getState(made.request)).files[0]!.hunks[0]!.decision, 'ignored');
-        await api.undo(made.request, item.relative, made.status.hunks[0]!.id, made.status.revision);
+        await api.undo(made.request, item.relative, made.status.hunks[0]!.id, await latestRevision(made.request));
         assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
         assert.equal((await api.getState(made.request)).files[0]!.hunks[0]!.decision, 'pending');
       });
@@ -1150,14 +1384,12 @@ export async function run(): Promise<void> {
     const demo = await fixture('visual-preview', demoBefore, demoAfter);
     const requestDocument = await vscode.workspace.openTextDocument(demo.request);
     const proposal = JSON.parse(requestDocument.getText());
-    proposal.title = 'Review the estimate and its boundary case';
-    proposal.description = 'A demonstration request. Accept only the changes you agree with; Ignore leaves the original text untouched.';
-    proposal.files[0].reason = 'Keep the conclusion consistent with the revised domain.';
-    proposal.files[0].explanations = [
-      {line: 2, text: 'The boundary value x = 0 satisfies the same assumptions, so include it in the domain.'},
-      {line: 5, text: 'The sharper estimate uses coefficient 1. This comment belongs only to this change.'},
-      {line: 8, text: ''},
+    const reasons = [
+      'The boundary value x = 0 satisfies the same assumptions, so include it in the domain.',
+      'The sharper estimate uses coefficient 1. This comment belongs only to this change.', '',
+      'Keep the conclusion consistent with the revised domain.',
     ];
+    proposal.request.forEach((entry: {reason?: string}, index: number) => {entry.reason = reasons[index];});
     const requestEdit = new vscode.WorkspaceEdit();
     requestEdit.replace(demo.request, new vscode.Range(new vscode.Position(0, 0),
       requestDocument.positionAt(requestDocument.getText().length)), JSON.stringify(proposal, null, 2));

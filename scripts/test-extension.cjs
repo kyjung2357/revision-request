@@ -49,7 +49,7 @@ async function main() {
   console.log('Results: ' + report);
   const exitCode = await runTests({
     vscodeExecutablePath: executable,
-    extensionDevelopmentPath: root,
+    extensionDevelopmentPath: process.env.RR_TEST_EXTENSION || root,
     extensionTestsPath: testBundle,
     extensionTestsEnv: { RR_TEST_REPORT: report, RR_PREVIEW: process.env.RR_PREVIEW },
     launchArgs: [

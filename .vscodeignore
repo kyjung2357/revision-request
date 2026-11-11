@@ -1,15 +1,15 @@
 **/*
 !package.json
 !README.md
-!.codex-build/extension.js
+!dist/extension.js
 !media/**
 !schemas/**
 !docs/**
 !language-configuration.json
 !syntaxes/**
-!.codex-build/mcp-server.cjs
+!dist/mcp-server.cjs
 !LICENSE
-!.codex-build/THIRD_PARTY_NOTICES.txt
-!.codex-build/bundled-dependencies.json
+!THIRD_PARTY_NOTICES.txt
+!bundled-dependencies.json
 # Local Korean editorial copy; not distributed.
 README.ko.md

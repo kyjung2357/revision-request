@@ -2,8 +2,8 @@
   "name": "revision-request",
   "displayName": "Revision Request",
   "icon": "media/logo.png",
-  "description": "Review .rr proposals and accept individual changes before they touch your files.",
-  "version": "0.1.1",
+  "description": "Review revision requests before modifying your files, and choose whether to accept them.",
+  "version": "0.1.2",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -64,6 +64,11 @@
     ],
     "commands": [
       {
+        "command": "revisionRequest.createRequest",
+        "title": "Revision Request: Create Revision Request",
+        "icon": "$(add)"
+      },
+      {
         "command": "revisionRequest.refresh",
         "title": "Revision Request: Refresh Requests",
         "icon": "$(refresh)"
@@ -116,15 +121,20 @@
     "viewsWelcome": [
       {
         "view": "revisionRequest.requests",
-        "contents": "No .rr requests in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
+        "contents": "[Create Revision Request](command:revisionRequest.createRequest)\nNo revision request in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "revisionRequest.createRequest",
+          "when": "view == revisionRequest.requests",
+          "group": "navigation@1"
+        },
+        {
           "command": "revisionRequest.refresh",
           "when": "view == revisionRequest.requests",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "editor/title": [
@@ -174,8 +184,15 @@
         },
         "revisionRequest.autoDeleteCompleted": {
           "type": "boolean",
-          "default": true,
-          "description": "Automatically delete the .rr request after its last pending change is accepted or ignored. Uses the system trash when available. Turn off to keep completed requests."
+          "default": false,
+          "description": "Delete completed .rr requests when no confirmation is shown. Turn off to keep them. Accept all and Ignore all ask first unless Skip Completed Delete Confirmation is enabled. Uses the system trash when available.",
+          "scope": "resource"
+        },
+        "revisionRequest.skipCompletedDeleteConfirmation": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not ask whether to delete the .rr file after Accept all or Ignore all. Use Auto Delete Completed to choose deletion or preservation. Turn off to ask again.",
+          "scope": "resource"
         },
         "revisionRequest.highlightChangedLines": {
           "type": "boolean",
@@ -212,12 +229,14 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/proposalEditing.test.ts",
+    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts && node --test test/request-host.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",
     "test:ui": "node test/review-browser.cjs",
     "test:mcp": "npm run build && tsx --test test/mcp.test.ts",
+    "test:plugin": "node --test test/plugin.test.cjs",
+    "package:plugin": "node scripts/package-plugin.cjs",
     "vscode:prepublish": "npm run check && npm run build"
   },
   "devDependencies": {
@@ -229,7 +248,8 @@
     "diff": "^9.0.0",
     "esbuild": "^0.27.0",
     "tsx": "^4.0.0",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "yazl": "2.5.1"
   },
   "extensionDependencies": [
     "vscode.json-language-features"

@@ -1,13 +1,13 @@
 import { readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { parseRequest } from '../src/core';
+import { createRequestFromSnapshots } from '../src/createRequest';
 
 const help = `Create a .rr revision request without modifying the original file.
 
 Usage:
   npm run request -- --workspace <folder> --original <relative-file>
-    --proposed <modified-copy> --title <title>
+    --proposed <modified-copy>
     [--output <original.ext.rr>]
     [--reason <reason>]
 
@@ -18,6 +18,7 @@ Paths are resolved from --workspace (defaults to the current directory).
 An explicit output must keep the name <complete-original-filename>.rr,
 remain inside the workspace, and not already exist.
 The output directory must already exist. Existing files are never overwritten.
+Writes snippets with a creation time and pending statuses.
 `;
 
 function contained(root: string, candidate: string): boolean {
@@ -48,7 +49,6 @@ async function main(): Promise<void> {
       original: { type: 'string' },
       proposed: { type: 'string' },
       output: { type: 'string' },
-      title: { type: 'string' },
       reason: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
     process.stdout.write(help);
     return;
   }
-  for (const key of ['original', 'proposed', 'title'] as const) {
+  for (const key of ['original', 'proposed'] as const) {
     if (!values[key]?.trim()) {
       throw new Error(`Missing --${key}. Run with --help for usage.`);
     }
@@ -109,15 +109,8 @@ async function main(): Promise<void> {
   if (before === after) {
     throw new Error('The proposed file is identical to the original; there are no changes to review.');
   }
-  const file = {
-    path: originalArg,
-    before,
-    after,
-    ...(values.reason ? { reason: values.reason } : {}),
-  };
-  const request = { version: 1, title: values.title!, files: [file] };
+  const request = createRequestFromSnapshots(originalArg, before, after, {reason: values.reason});
   const serialized = JSON.stringify(request, null, 2) + '\n';
-  parseRequest(serialized);
   // wx is an exclusive create: do not silently replace an existing proposal.
   await writeFile(output, serialized, { encoding: 'utf8', flag: 'wx' });
   process.stdout.write(`Created ${output}\nOriginal file unchanged: ${original}\n`);

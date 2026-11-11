@@ -120,9 +120,10 @@ test('workspace publication changes are honored instead of falling back to anoth
 });
 
 test('bundled stdio adapter speaks real SDK protocol, validates tools and revokes cached decision calls', async t => {
-  const directory = await registry(t); let allowed = false, decisions = 0, reads = 0;
+  const directory = await registry(t); let allowed = false, decisions = 0, reads = 0, creates = 0;
   const { server } = await bridge(t, directory, async (method, args, uri) => {
     if (method === 'capabilities') return {workspaceUri: uri, allowAgentDecisions: allowed};
+    if (method === 'create_request') { creates++; return {status: 'pending', input: args}; }
     if (method === 'read_target') { reads++; return {path: args.path, content: '한글 😀\r\nsource', hash: 'a'.repeat(64)}; }
     if (method === 'decide' || method === 'undo') { assert.equal(allowed, true); decisions++; return {status: 'pending'}; }
     throw new Error('Unexpected fake-host operation: ' + method);
@@ -145,6 +146,31 @@ test('bundled stdio adapter speaks real SDK protocol, validates tools and revoke
       assert.equal(invalid.isError, true, 'Missing required or additional routing fields must be rejected before dispatch');
     }
     assert.equal(reads, 1);
+    const create = {path: 'source.tex', expectedHash: 'a'.repeat(64), clientRequestId: 'snippet-fixture', request: [{line: 1, before: 'old', after: 'new', reason: 'Reason'}]};
+    assert.notEqual((await client.callTool({name: 'rr_create_request', arguments: create})).isError, true);
+    assert.equal(creates, 1);
+    for (const entry of [{line: 2, before: null, after: ''}, {line: 1, before: 'old', after: null}]) {
+      assert.notEqual((await client.callTool({name: 'rr_create_request', arguments: {...create, request: [entry]}})).isError, true);
+    }
+    assert.equal(creates, 3);
+    for (const invalid of [
+      {...create, request: [{...create.request[0], status: 'accepted'}]},
+      {...create, request: [{...create.request[0], status: 'pending'}]},
+      {...create, time: '2026-11-10T00:00:00Z'},
+      {...create, request: [{before: 'old', after: 'new'}]},
+      {...create, request: [{line: 0, before: 'old', after: 'new'}]},
+      {...create, request: [{line: 1.5, before: 'old', after: 'new'}]},
+      {...create, request: [{line: 1, before: 'old\nline', after: 'new'}]},
+      {...create, request: [{line: 1, before: 'old\n', after: 'new'}]},
+      {...create, request: [{line: 1, before: 'old', after: 'new\r\n'}]},
+      {...create, request: [{line: 1, before: 'old', after: 'new\rline'}]},
+      {...create, request: [{line: 1, before: null, after: null}]},
+      {...create, after: 'legacy full file'},
+      {...create, title: 'Legacy title'},
+    ]) assert.equal((await client.callTool({name: 'rr_create_request', arguments: invalid})).isError, true);
+    assert.equal(creates, 3, 'Invalid line edits, status/time injection and unsupported fields never reach the host');
+    assert.equal((await client.callTool({name: 'rr_create_request', arguments: {path: 'source.tex', expectedHash: 'a'.repeat(64), clientRequestId: 'unsupported-shape', after: 'full replacement', title: 'Unsupported'}})).isError, true);
+    assert.equal(creates, 3);
     const args = {requestId: 'fixture-id', revision: 'a'.repeat(64), hunkId: 'fixture-hunk'};
     assert.equal((await client.callTool({name: 'rr_decide', arguments: {...args, decision: 'accepted'}})).isError, true);
     assert.equal((await client.callTool({name: 'rr_undo', arguments: args})).isError, true);
@@ -159,13 +185,28 @@ test('bundled stdio adapter speaks real SDK protocol, validates tools and revoke
     assert.equal((await client.callTool({name: 'rr_decide', arguments: {...args, decision: 'ignored'}})).isError, true);
     assert.equal((await client.callTool({name: 'rr_undo', arguments: args})).isError, true);
     assert.equal(decisions, 2, 'Cached tools must recheck current permission before dispatch');
-    const resources = await client.listResources(); assert.ok(resources.resources.length >= 3);
+    const resources = await client.listResources();
+    assert.deepEqual(resources.resources.map(item => item.uri), ['rr://format', 'rr://schema']);
     for (const resource of resources.resources) {
       const content = await client.readResource({uri: resource.uri}); assert.ok(content.contents.length > 0);
     }
     server.dispose();
-    const guide = await client.callTool({name: 'rr_get_format', arguments: {language: 'ko'}});
-    assert.notEqual(guide.isError, true); assert.match(JSON.stringify(guide.structuredContent), /[가-힣]/);
+    const guide = await client.callTool({name: 'rr_get_format', arguments: {}});
+    assert.notEqual(guide.isError, true);
+    assert.equal((guide.structuredContent as {language: string}).language, 'en');
+    assert.equal((await client.callTool({name: 'rr_get_format', arguments: {language: 'ko'}})).isError, true);
+    const format = guide.structuredContent as {example: Record<string, unknown>; schema: {properties: Record<string, unknown>; required: string[]}};
+    assert.equal('formatVersion' in format, false);
+    assert.equal('version' in format.example, false);
+    assert.equal('version' in format.schema.properties, false);
+    assert.deepEqual(format.schema.required, ['path', 'request']);
+    assert.equal((await client.callTool({name: 'rr_get_format', arguments: {version: 1}})).isError, true);
+    const schemaResource = await client.readResource({uri: 'rr://schema'});
+    const content = schemaResource.contents[0]!;
+    assert.ok('text' in content);
+    assert.deepEqual(JSON.parse(String(content.text)), format.schema);
+    await assert.rejects(client.readResource({uri: 'rr://format/v1'}), /Unknown Revision Request resource/);
+    await assert.rejects(client.readResource({uri: 'rr://format/ko'}), /Unknown Revision Request resource/);
     assert.equal((await client.callTool({name: 'rr_read_target', arguments: {path: 'source.tex'}})).isError, true,
       'Source operations fail closed when the owning VS Code instance disappears');
   } catch (error) {
