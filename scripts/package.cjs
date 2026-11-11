@@ -39,6 +39,17 @@ async function main() {
   for (const name of ['README.md', 'LICENSE', '.vscodeignore', 'language-configuration.json', 'media', 'docs', 'schemas', 'syntaxes']) {
     await fs.cp(path.join(root, name), path.join(stage, name), {recursive: true});
   }
+  // GitHub displays the GIF; the Marketplace README embeds the MP4 directly.
+  // Only rewrite the staging copy so the repository README stays GitHub-compatible.
+  const readmePath = path.join(stage, 'README.md');
+  const readme = await fs.readFile(readmePath, 'utf8');
+  const demoBlock = /<!-- demo:start -->[\s\S]*?<!-- demo:end -->/g;
+  if ([...readme.matchAll(demoBlock)].length !== 1) {
+    throw new Error('README.md must contain one demo:start/demo:end block.');
+  }
+  await fs.access(path.join(stage, 'media', 'intro.mp4'));
+  await fs.writeFile(readmePath, readme.replace(demoBlock,
+    '<video src="media/intro.mp4" autoplay loop muted playsinline controls width="100%"></video>'));
   for (const name of ['extension.js', 'mcp-server.cjs']) {
     await fs.copyFile(path.join(root, '.codex-build', name), path.join(stage, 'dist', name));
   }

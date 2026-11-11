@@ -6,7 +6,9 @@ Each `.rr` file contains a revision request for one existing UTF-8 text file (fo
 
 **Accept** applies the change, **Ignore** leaves the original unchanged.
 
-<video src="media/intro.mp4" autoplay loop muted playsinline controls width="100%"></video>
+<!-- demo:start -->
+![Revision Request demo](media/intro.gif)
+<!-- demo:end -->
 
 ## Installation 
 
