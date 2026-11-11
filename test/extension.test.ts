@@ -13,10 +13,12 @@ interface ExtensionApi {
   getMcpConfiguration(workspaceUri?: vscode.Uri): Promise<{json: {mcpServers: {revision_request: {command: string; args: string[]; env: Record<string, string>}}}; instanceId: string}>;
   mcpHandler(method: BridgeMethod, args: Record<string, unknown>, workspaceUri: string): Promise<unknown>;
   testRunExclusive<T>(action: () => Promise<T>): Promise<T>;
+  testFailNextRequestWriteAfterSave(): void;
   getState(uri: vscode.Uri): Promise<ReviewState>;
   decide(uri: vscode.Uri, file: string, hunk: string | undefined,
     decision: 'accepted' | 'ignored', revision: string): Promise<void>;
   undo(uri: vscode.Uri, file: string, hunk: string, revision: string): Promise<void>;
+  editPending(uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string): Promise<{changed: boolean; revision: string}>;
 }
 
 interface Fixture {
@@ -274,6 +276,175 @@ export async function run(): Promise<void> {
     await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
     assert.deepEqual(await bytes(item.target), Buffer.from(item.after, 'utf8'));
     assert.equal((await ready(item)).files[0]!.hunks[0]!.decision, 'accepted');
+  });
+
+  await check('Saved RR fingerprints tolerate editor EOL normalization while retaining decisions, dirty guards and completion cleanup', async () => {
+    const config = vscode.workspace.getConfiguration('revisionRequest');
+    const previousCleanup = config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue;
+    await config.update('autoDeleteCompleted', false, vscode.ConfigurationTarget.Workspace);
+    try {
+      for (const style of ['lf', 'crlf', 'mixed'] as const) {
+        const item = await fixture('request-eol-' + style, '\uFEFFold\r\ncontext\r\nlast', '\uFEFFNEW\r\ncontext\r\nLAST');
+        const json = (await bytes(item.request)).toString('utf8');
+        const savedText = style === 'lf' ? json : style === 'crlf' ? json.replace(/\n/g, '\r\n') :
+          '\uFEFF' + json.replace(/\n/g, '\r\n') + '\n';
+        const originalRequest = Buffer.from(savedText);
+        await vscode.workspace.fs.writeFile(item.request, originalRequest);
+        const document = await vscode.workspace.openTextDocument(item.request);
+        let state = await ready(item);
+        const savedHash = createHash('sha256').update(savedText.replace(/^\uFEFF/, '')).digest('hex');
+        assert.equal(state.revision, savedHash, 'Revision must hash saved JSON, excluding only its optional BOM.');
+        if (style === 'mixed') {
+          assert.notEqual(createHash('sha256').update(document.getText()).digest('hex'), savedHash,
+            'This fixture must reproduce the actual mixed-EOL text-model mismatch.');
+          const edit = new vscode.WorkspaceEdit(); edit.insert(item.request, new vscode.Position(0, 0), ' ');
+          assert.equal(await vscode.workspace.applyEdit(edit), true);
+          try {
+            assert.equal(document.isDirty, true);
+            await assert.rejects(api.decide(item.request, item.relative, undefined, 'ignored', state.revision), /save the \.rr|request changed/i);
+            assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+          } finally {
+            await vscode.window.showTextDocument(document);
+            await vscode.commands.executeCommand('workbench.action.files.revert');
+          }
+        } else {
+          assert.equal(createHash('sha256').update(document.getText()).digest('hex'), savedHash,
+            'Uniform LF/CRLF requests retain their existing fingerprint convention.');
+        }
+        const [first, last] = state.files[0]!.hunks;
+        assert.ok(first && last);
+        await api.decide(item.request, item.relative, first.id, 'ignored', state.revision);
+        state = await ready(item);
+        assert.equal(state.files[0]!.hunks[0]!.decision, 'ignored');
+        assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+        await api.undo(item.request, item.relative, first.id, state.revision);
+        await api.decide(item.request, item.relative, last.id, 'accepted', state.revision);
+        state = await ready(item);
+        assert.equal(state.files[0]!.hunks[1]!.decision, 'accepted');
+        assert.deepEqual(await bytes(item.target), Buffer.from('\uFEFFold\r\ncontext\r\nLAST'));
+        await api.undo(item.request, item.relative, last.id, state.revision);
+        assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+        assert.deepEqual(await bytes(item.request), originalRequest, 'Review must not rewrite request whitespace or its BOM.');
+        if (style === 'mixed') {
+          await config.update('autoDeleteCompleted', true, vscode.ConfigurationTarget.Workspace);
+          await api.decide(item.request, item.relative, undefined, 'accepted', state.revision);
+          assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
+          await assert.rejects(async () => vscode.workspace.fs.stat(item.request), 'A completed mixed-EOL request must still be cleaned up.');
+        }
+      }
+    } finally { await config.update('autoDeleteCompleted', previousCleanup, vscode.ConfigurationTarget.Workspace); }
+  });
+
+  await check('Editing a pending block changes only its RR token and preserves resolved decisions, source bytes and Undo', async () => {
+    assert.equal(typeof api.editPending, 'function');
+    const config = vscode.workspace.getConfiguration('revisionRequest');
+    const previousCleanup = config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue;
+    await config.update('autoDeleteCompleted', false, vscode.ConfigurationTarget.Workspace);
+    try {
+      const item = await fixture('pending-draft', 'first\ncontext 1\nmiddle\ncontext 2\nlast\n', 'FIRST\ncontext 1\nMIDDLE\ncontext 2\nLAST\n');
+      const base = (await bytes(item.request)).toString('utf8');
+      const raw = '\uFEFF' + base.replace('{\n', '{\r\n  "opaque":{"huge":900719925474099312345,"keep":"exact"},\n');
+      await vscode.workspace.fs.writeFile(item.request, Buffer.from(raw));
+      let state = await ready(item);
+      const [first, middle, last] = state.files[0]!.hunks;
+      assert.ok(first && middle && last);
+      await api.decide(item.request, item.relative, first.id, 'accepted', state.revision);
+      await api.decide(item.request, item.relative, last.id, 'ignored', state.revision);
+      state = await ready(item);
+      const original = await bytes(item.target);
+      const pendingDraft = 'EDITED MIDDLE\nnew pending line\n';
+      const expectedAfter = 'FIRST\ncontext 1\nEDITED MIDDLE\nnew pending line\ncontext 2\nLAST\n';
+      const edited = await api.editPending(item.request, item.relative, middle.id, pendingDraft, state.revision);
+      assert.equal(edited.changed, true); assert.notEqual(edited.revision, state.revision);
+      assert.deepEqual(await bytes(item.target), original);
+      assert.deepEqual(await bytes(item.request), Buffer.from(raw.replace(JSON.stringify(item.after), JSON.stringify(expectedAfter))),
+        'All bytes outside the after token, including unknown numeric metadata and BOM, must survive.');
+      const oldRevision = state.revision;
+      state = await ready(item);
+      assert.equal(state.revision, edited.revision);
+      assert.equal(state.files[0]!.hunks.find(hunk => hunk.id === first.id)?.decision, 'accepted');
+      assert.equal(state.files[0]!.hunks.find(hunk => hunk.id === last.id)?.decision, 'ignored');
+      const pending = state.files[0]!.hunks.find(hunk => hunk.decision === 'pending');
+      assert.ok(pending);
+      await assert.rejects(api.editPending(item.request, item.relative, pending.id, 'stale\n', oldRevision), /request changed/i);
+      await assert.rejects(api.editPending(item.request, item.relative, first.id, 'resolved\n', state.revision), /pending|resolved/i);
+      await assert.rejects(api.editPending(item.request, item.relative, last.id, 'resolved\n', state.revision), /pending|resolved/i);
+      const beforeNoop = await bytes(item.request);
+      assert.deepEqual(await api.editPending(item.request, item.relative, pending.id, pending.after, state.revision),
+        {changed: false, revision: state.revision});
+      assert.deepEqual(await bytes(item.request), beforeNoop);
+      await api.decide(item.request, item.relative, pending.id, 'accepted', state.revision);
+      assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext 1\nEDITED MIDDLE\nnew pending line\ncontext 2\nlast\n'));
+      await api.undo(item.request, item.relative, pending.id, state.revision);
+      assert.deepEqual(await bytes(item.target), original, 'Undo restores only the edited block and keeps the prior acceptance.');
+      await config.update('autoDeleteCompleted', true, vscode.ConfigurationTarget.Workspace);
+      await api.editPending(item.request, item.relative, pending.id, pending.before, state.revision);
+      state = await ready(item);
+      assert.ok(state.files[0]!.hunks.every(hunk => hunk.decision !== 'pending'));
+      await vscode.workspace.fs.stat(item.request); // Editing away the last pending change does not auto-delete.
+      assert.deepEqual(await bytes(item.target), original);
+    } finally { await config.update('autoDeleteCompleted', previousCleanup, vscode.ConfigurationTarget.Workspace); }
+  });
+
+  await check('Pending draft saves reject dirty editors and independently changed originals or request revisions', async () => {
+    const item = await fixture('pending-edit-guards', 'old\n', 'proposed\n');
+    const state = await ready(item);
+    const hunk = state.files[0]!.hunks[0]!;
+    const requestBytes = await bytes(item.request);
+    for (const uri of [item.target, item.request]) {
+      const document = await vscode.workspace.openTextDocument(uri);
+      const editor = await vscode.window.showTextDocument(document);
+      assert.equal(await editor.edit(builder => builder.insert(new vscode.Position(0, 0), ' ')), true);
+      try {
+        assert.equal(document.isDirty, true);
+        await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', state.revision), /unsaved|save the \.rr|request changed/i);
+        assert.deepEqual(await bytes(item.request), requestBytes);
+        assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+      } finally {
+        await vscode.window.showTextDocument(document);
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      }
+    }
+    await vscode.workspace.fs.writeFile(item.target, Buffer.from('external edit\n'));
+    await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', state.revision), /original has changed/i);
+    assert.deepEqual(await bytes(item.request), requestBytes);
+    assert.deepEqual(await bytes(item.target), Buffer.from('external edit\n'));
+    await vscode.workspace.fs.writeFile(item.target, Buffer.from(item.before));
+    const document = await vscode.workspace.openTextDocument(item.request);
+    const editor = await vscode.window.showTextDocument(document);
+    assert.equal(await editor.edit(builder => builder.insert(new vscode.Position(0, 0), ' ')), true);
+    assert.equal(await document.save(), true);
+    const changedRequest = await bytes(item.request);
+    await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', state.revision), /request changed/i);
+    assert.deepEqual(await bytes(item.request), changedRequest);
+    assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+  });
+
+  await check('A proposal write that commits then rejects retains resolved decisions through its recovery fingerprints', async () => {
+    assert.equal(typeof api.testFailNextRequestWriteAfterSave, 'function');
+    const item = await fixture('pending-edit-write-failure', 'first\ncontext\nlast\n', 'FIRST\ncontext\nLAST\n');
+    let state = await ready(item);
+    const [first, last] = state.files[0]!.hunks;
+    assert.ok(first && last);
+    await api.decide(item.request, item.relative, first.id, 'accepted', state.revision);
+    const original = await bytes(item.target);
+    api.testFailNextRequestWriteAfterSave();
+    await assert.rejects(api.editPending(item.request, item.relative, last.id, 'EDITED\n', state.revision), /Injected request-write failure after saving bytes/);
+    assert.equal(JSON.parse((await bytes(item.request)).toString('utf8')).files[0].after, 'FIRST\ncontext\nEDITED\n');
+    const deadline = Date.now() + 5000;
+    do {
+      state = await api.getState(item.request);
+      if (!state.error) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+    assert.equal(state.error, undefined, state.error);
+    assert.equal(state.files[0]!.issue, undefined, state.files[0]!.issue);
+    assert.equal(state.files[0]!.hunks.find(hunk => hunk.id === first.id)?.decision, 'accepted');
+    assert.deepEqual(await bytes(item.target), original);
+    const pending = state.files[0]!.hunks.find(hunk => hunk.decision === 'pending');
+    assert.ok(pending);
+    await api.decide(item.request, item.relative, pending.id, 'accepted', state.revision);
+    assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\ncontext\nEDITED\n'));
   });
 
   await check('Approval bypasses save-time formatting, trimming and final-newline insertion', async () => {

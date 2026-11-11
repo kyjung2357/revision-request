@@ -1,3 +1,6 @@
 node_modules/
 .codex-*/
 *.vsix
+
+# Local Korean editorial copy; not published.
+/README.ko.md

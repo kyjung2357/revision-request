@@ -11,3 +11,5 @@
 !LICENSE
 !.codex-build/THIRD_PARTY_NOTICES.txt
 !.codex-build/bundled-dependencies.json
+# Local Korean editorial copy; not distributed.
+README.ko.md

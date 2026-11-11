@@ -162,7 +162,7 @@ npm test
 
 Press **F5** to launch an Extension Development Host, then open the repository folder and `examples/manuscript.tex.rr` there. Its preview opens by default; use **Open Preview** if automatic preview is disabled. Use a disposable copy of the demo when testing Accept, since it intentionally changes the selected target.
 
-Run `npm run test:extension` for the Extension Development Host checks. Run `npm run test:mcp` for authenticated bridge and bundled stdio adapter protocol checks. Run `npm run test:ui` for real browser layout checks using an installed Edge or Chrome, without additional downloads. Run `npm run package` to build `.codex-artifacts/revision-request-0.1.0.vsix`. Install that package from the Extensions view with **Install from VSIX...**, then open a `.rr` file. Its preview opens by default; **Open Preview** is available when automatic preview is disabled.
+Run `npm run test:extension` for the Extension Development Host checks. Run `npm run test:mcp` for authenticated bridge and bundled stdio adapter protocol checks. Run `npm run test:ui` for real browser layout checks using an installed Edge or Chrome, without additional downloads. Run `npm run package` to build `.codex-artifacts/revision-request-0.1.1.vsix`. Install that package from the Extensions view with **Install from VSIX...**, then open a `.rr` file. Its preview opens by default; **Open Preview** is available when automatic preview is disabled.
 
 Temporary build, test, and packaged artifacts live under ignored `.codex-*` directories. See the [한국어 수동 배포 안내](docs/PUBLISHING.ko.md) for local packaging and Marketplace upload steps.
 

@@ -3,13 +3,14 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review .rr proposals and accept individual changes before they touch your files.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
     "vscode": "^1.96.0"
   },
   "categories": [
+    "Visualization",
     "Other"
   ],
   "keywords": [
@@ -17,7 +18,10 @@
     "diff",
     "approval",
     "revision",
-    "rr"
+    "rr",
+    "code review",
+    "mcp",
+    "ai"
   ],
   "repository": {
     "type": "git",
@@ -208,7 +212,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts",
+    "test": "tsx --test test/core.test.ts test/proposalEditing.test.ts",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",
