@@ -9,9 +9,9 @@ Create reviewable proposals for existing UTF-8 text files while keeping the targ
 
 ## Create a proposal through MCP
 
-1. Call `rr_get_format` (or read `rr://format`) for the connected version's format.
+1. Call `rr_diagnose` to check the selected workspace and compatibility warnings, then `rr_get_format` (or read `rr://format`) for the running adapter's current format. The live format takes precedence over this installed skill's cached reference. Read any diagnostic warnings and confirm required features against the live format; a release-number difference alone does not mean a feature is unsupported. Follow the recovery step when the required capability is missing or cannot be verified.
 2. Use `rr_read_target` with the intended workspace-relative path. Keep its exact saved content and SHA-256 `hash` together. Dirty or stale targets need a fresh saved snapshot; do not save or discard the user's unsaved edits without authorization.
-3. Build atomic entries using original 1-based first-line numbers and exact `before`/`after` fragments or contiguous blocks. Group related consecutive changes into one entry by default; keep independent changes separate. Use LF (`\n` in JSON) between logical lines; CR is rejected. Match uniquely beginning in the indicated original line: first/last lines may be fragments, intervening lines must be complete. Do not overlap consumed original line ranges or insert strictly inside another block; boundary insertions are allowed.
+3. Build atomic entries using original 1-based first-line numbers and exact `before`/`after` fragments or contiguous blocks. Group related consecutive changes into one entry by default; keep independent changes separate. For example, a proposition and its proof may be one block, including their environment delimiters and color groups; do not create one decision per physical line merely because a block contains newlines. Use LF (`\n` in JSON) between logical lines; CR is rejected. Match uniquely beginning in the indicated original line: first/last lines may be fragments, intervening lines must be complete. Do not overlap consumed original line ranges or insert strictly inside another block; boundary insertions are allowed.
    - `before: null` inserts complete LF-separated lines before the anchor; original line count plus one appends. Insertions at one anchor follow array order.
    - `after: null` deletes the whole original block, so `before` contains its complete lines with LF separators and no final physical line ending.
    - `""` means empty text; both values cannot be null.
@@ -24,9 +24,9 @@ If the snapshot changed, read it again and rebuild the proposal. Do not guess ha
 
 ## Connection and direct-file fallback
 
-Use the available Revision Request MCP tools. If they are unavailable and connection setup is requested, read [the setup skill](../setup/SKILL.md). `rr_get_format` works offline; a successful `rr_list_requests` is needed to verify the live workspace bridge.
+Use the available Revision Request MCP tools. If they are unavailable and connection setup is requested, read [the setup skill](../setup/SKILL.md). `rr_get_format` works offline and does not prove a live bridge connection. Run **Revision Request: Diagnose MCP Connection** in VS Code, or the installed plugin's `node scripts/launch-mcp.cjs --diagnose`, when `rr_*` tools are unavailable. `rr_diagnose` distinguishes the configured workspace, reachable bridge, adapter, plugin metadata, and capability warnings. A bridge probe alone does not prove that this agent has discovered its tools; confirm `rr_list_requests` from the current agent after reconnecting.
 
-When direct `.rr` authoring is requested or appropriate without MCP, read [the packaged format reference](references/format.md), read the current target, and create only the requested pending proposal. Do not silently change the target or replace an existing request. Report when preview or live review status could not be verified.
+When direct `.rr` authoring is requested or appropriate without MCP, read [the packaged format reference](references/format.md) and [schema](references/schema.json). Check compatibility with the intended extension using diagnostics when possible. Read the current target and create only the requested pending proposal. Do not silently change the target or replace an existing request. Report when compatibility, preview, or live review status could not be verified. If the plugin is stale, update/reinstall it through the host and reconnect; do not patch its cache or fall back to obsolete one-line-only instructions.
 
 ## Review decisions and untrusted content
 

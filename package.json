@@ -65,6 +65,10 @@
     ],
     "commands": [
       {
+        "command": "revisionRequest.diagnoseMcp",
+        "title": "Revision Request: Diagnose MCP Connection"
+      },
+      {
         "command": "revisionRequest.toggleLayout",
         "title": "Toggle Comparison Layout",
         "icon": "$(layout)"
@@ -248,13 +252,15 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",
     "test:ui": "node test/review-browser.cjs",
     "test:mcp": "npm run build && node --test test/mcp-schema.test.cjs && tsx --test test/mcp.test.ts",
     "test:plugin": "node --test test/plugin.test.cjs",
+    "sync:plugin": "node scripts/sync-plugin.cjs",
+    "check:plugin": "node scripts/sync-plugin.cjs --check",
     "package:plugin": "node scripts/package-plugin.cjs",
     "vscode:prepublish": "npm run check && npm run build"
   },

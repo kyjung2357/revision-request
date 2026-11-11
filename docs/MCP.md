@@ -18,6 +18,18 @@ The extension keeps a stable adapter copy in its global storage and refreshes it
 
 The bundled format guide, schema, and examples remain available through MCP even when the VS Code bridge is unavailable. File and review tools require the live bridge and a trusted local workspace. Remote and virtual workspaces are not supported by this adapter.
 
+## Diagnose a connection
+
+Run **Revision Request: Diagnose MCP Connection** in VS Code, even when the agent has no `rr_*` tools. The read-only report shows the selected workspace, adapter installation, an authenticated bridge probe, extension version, supported format features, and the last reported agent/plugin versions. Each failed stage includes a next step. It does not change configuration or review decisions, and does not print bridge credentials.
+
+A running bridge does not prove that the agent has loaded its tools. The report distinguishes a last observed initialization, tool-list request, or tool call from current tool exposure, which VS Code cannot inspect. No plugin metadata means **unknown**: a direct MCP setup may not use a plugin, and an older launcher cannot report its version.
+
+When tools are available, call `rr_diagnose`, then `rr_get_format`. Both remain available when the bridge is offline; diagnostics reports the unavailable bridge and the format tool still returns its bundled guide. The current guide takes precedence over cached plugin instructions. Version differences, missing supported features, and different guide fingerprints appear as warnings. `.rr` files remain unversioned.
+
+For a terminal check without starting a client session, append `--diagnose` to the generated adapter command. Plugin users can run `node scripts/launch-mcp.cjs --diagnose` from their plugin directory. This prints a JSON report once; it does not prove that the agent has discovered the tools. Missing configuration is reported by the launcher before the adapter can start.
+
+The release build synchronizes the plugin manifests, format guide, schema, and capability metadata from the extension sources. `npm run package` produces both the VSIX and matching plugin ZIP. Update both installed components and reconnect the MCP client; replacing the VSIX alone does not refresh a cached plugin or an already-running adapter. Do not edit plugin cache directories by hand.
+
 ## The agent cannot approve by default
 
 The VS Code User setting `revisionRequest.mcp.allowAgentDecisions` defaults to **false**. In this mode:

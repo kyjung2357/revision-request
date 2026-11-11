@@ -29,7 +29,7 @@ async function main() {
   if (values.check) {
     if (values.from || values.stdin || values.replace) throw new Error('--check cannot be combined with input or replacement options.');
     const entry = await readConfiguration(filename);
-    process.stdout.write('Connection settings are valid for ' + entry.args[4] + '\nThis does not verify a live VS Code bridge; call rr_list_requests after reconnecting.\n');
+    process.stdout.write('Connection settings are valid for ' + entry.args[4] + '\nThis does not verify a live VS Code bridge. Run launch-mcp.cjs --diagnose, or call rr_diagnose after reconnecting.\n');
     return;
   }
   if (Boolean(values.from) === Boolean(values.stdin)) throw new Error('Provide exactly one of --from <json-file> or --stdin.');

@@ -189,11 +189,11 @@ export class BridgeClient {
     }
     return results;
   }
-  async call(method: BridgeMethod, args: Record<string, unknown> = {}): Promise<unknown> {
+  async call(method: BridgeMethod, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
     const candidates = await this.candidates();
     const probes = await Promise.all(candidates.map(async manifest => {
       try {
-        const capabilities = await callBridge(manifest, this.options.workspaceUri, 'capabilities', {}, 2500);
+        const capabilities = await callBridge(manifest, this.options.workspaceUri, 'capabilities', {}, Math.min(2500, timeoutMs));
         return {manifest, capabilities};
       } catch { return undefined; }
     }));
@@ -201,6 +201,6 @@ export class BridgeClient {
     if (!live.length) throw new McpBridgeError('WORKSPACE_UNAVAILABLE', 'Open the configured local workspace in VS Code with Revision Request enabled and trusted.');
     if (live.length !== 1) throw new McpBridgeError('AMBIGUOUS_WORKSPACE', 'This workspace is open in multiple VS Code windows. Close the duplicate window or configure --instance-id explicitly.');
     if (method === 'capabilities') return live[0].capabilities;
-    return callBridge(live[0].manifest, this.options.workspaceUri, method, args);
+    return callBridge(live[0].manifest, this.options.workspaceUri, method, args, timeoutMs);
   }
 }

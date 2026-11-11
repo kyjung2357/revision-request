@@ -3,6 +3,7 @@ const path = require('node:path');
 const { createVSIX } = require('@vscode/vsce');
 const { execFileSync } = require('node:child_process');
 const { buildAll } = require('./build.cjs');
+const { packagePlugin } = require('./package-plugin.cjs');
 
 function validatePngIcon(bytes, label = 'Extension icon') {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -70,6 +71,7 @@ async function main() {
   console.log('Release staging: ' + stage);
   await createVSIX({ cwd: stage, dependencies: false,
     packagePath: path.join(output, `${manifest.name}-${manifest.version}.vsix`) });
+  await packagePlugin();
 }
 module.exports = { validatePngIcon };
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1,0 +1,9 @@
+{
+  "features": [
+    "multiline-blocks",
+    "optional-reasons",
+    "null-insert-delete"
+  ],
+  "formatGuideSha256": "5bd5d99ec90315f35599b9913153ce7f34f6e547885af60effd1b6974b4b350b",
+  "extensionVersion": "0.1.3"
+}

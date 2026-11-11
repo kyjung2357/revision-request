@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/kyjung2357/revision-request/blob/main/schemas/revision-request.schema.json",
+  "title": "Revision Request",
+  "description": "Atomic revision entries for text fragments or contiguous blocks, named <complete-original-filename>.rr. Opening or changing status metadata never applies a source edit.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "path",
+    "request"
+  ],
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Forward-slash path relative to the VS Code workspace folder containing this .rr file. Must remain inside that folder. Use nonempty segments; . and .., Windows reserved device names, colons, backslashes, and trailing dots or spaces are rejected.",
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\u0000<>\"|?*])(?!.*[. ](?:/|$))(?!.*\\/$).+$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "description": "Creation time in ISO 8601 with timezone. Generators add it automatically. Missing time in hand-written requests is filled from file creation time when reviewed."
+    },
+    "request": {
+      "type": "array",
+      "maxItems": 10000,
+      "description": "Each entry is one atomic review decision. Group related contiguous changes in one entry; independent changes may remain separate. Consumed original line ranges cannot overlap. Empty arrays have no pending requests.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "line",
+          "before",
+          "after",
+          "status"
+        ],
+        "anyOf": [
+          {
+            "properties": {
+              "before": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "properties": {
+              "after": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "properties": {
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991,
+            "description": "1-based first original line of the fragment or block. Insertions occur before this line; original line count + 1 appends. Numbers stay fixed after other entries are accepted."
+          },
+          "before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact fragment beginning in the indicated original line, with LF separators for consecutive lines, or null to insert. Match uniquely; intervening lines are complete. Deletion requires the complete original block. CR is not allowed.",
+            "pattern": "^[^\\r]*$(?![\\s\\S])"
+          },
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Replacement text or LF-separated block, or null to delete the complete original block. Insertion supplies complete new lines. Empty string is text/a blank line. LF is logical; saved line endings are preserved. CR is not allowed.",
+            "pattern": "^[^\\r]*$(?![\\s\\S])"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Optional explanation; omit it or use an empty string when none is needed. Blank or absent keeps Why disabled with its label hidden. At most 50000 UTF-8 bytes."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "ignored",
+              "accepted"
+            ],
+            "default": "pending",
+            "description": "New requests start pending. Accept/Ignore/Undo update this metadata; manually changing it never applies a source edit."
+          }
+        }
+      }
+    }
+  },
+  "defaultSnippets": [
+    {
+      "label": "Revision Request",
+      "description": "Create a pending fragment or block change; creation time is filled automatically when reviewed.",
+      "body": {
+        "path": "${1:src/main.py}",
+        "request": [
+          {
+            "line": 1,
+            "before": "${2:original fragment}",
+            "after": "${3:proposed fragment}",
+            "status": "pending"
+          }
+        ]
+      }
+    }
+  ]
+}

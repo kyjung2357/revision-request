@@ -681,6 +681,32 @@ async function runEditorTests(width) {
   });
 }
 
+async function runEditorButtonTests(width) {
+  await runTest(width+'px: Save and Cancel reuse the same button slots and text metrics as Accept and Ignore',async()=>{
+    for(const unified of [false,true])for(const direct of [false,true]) {
+      await resetFixture(width);if((await unifiedSnapshot()).unified!==unified)await toggleLayout();
+      if(direct){await cdp.evaluate('window.__setReview('+JSON.stringify(singleLineFixture())+')');await settle();}
+      const id=direct?'direct':'grow';
+      const metrics=()=>cdp.evaluate(`(() => {const block=Array.from(document.querySelectorAll('[data-overview-hunk]')).find(node=>node.dataset.overviewHunk===${JSON.stringify(id)}),group=block.querySelector('.inline-actions'),gutter=group.parentElement;return {origin:group.getBoundingClientRect().x,gutterRight:gutter.getBoundingClientRect().right,buttons:Array.from(group.querySelectorAll('button'),button=>{const css=getComputedStyle(button),r=button.getBoundingClientRect();return {label:button.textContent,x:r.x,width:r.width,height:r.height,fontFamily:css.fontFamily,fontSize:css.fontSize,fontWeight:css.fontWeight,lineHeight:css.lineHeight,padding:css.padding,color:css.color,background:css.backgroundColor};})};})()`);
+      const before=await metrics();await openEdit(id);const editing=await metrics();
+      assert.equal(editing.origin,before.origin,'Editing preserves the action group origin');assert.equal(editing.gutterRight,before.gutterRight,'The reserved Why slot keeps the whole action rail unchanged');
+      for(let index=0;index<2;index++) {
+        assert.equal(editing.buttons[index].label,index?'Cancel':'Save');
+        const {label:oldLabel,...oldMetrics}=before.buttons[index],{label:newLabel,...newMetrics}=editing.buttons[index];
+        assert.deepEqual(newMetrics,oldMetrics,'Editor and decision buttons share exact width, position, height, text metrics, padding, and colors');
+        assert.equal(newMetrics.width,width<=650?41:43);assert.equal(newMetrics.height,18);
+      }
+      await editorKey('Enter',{ctrlKey:true});const saving=await metrics();
+      assert.equal(saving.buttons[0].label,'Saving…');assert.equal(saving.buttons[0].width,before.buttons[0].width,'The saving label cannot resize its action slot');
+      assert.equal(saving.buttons[1].x,before.buttons[1].x);
+      const sent=await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
+      await editAck(sent,{success:false,error:'Test host leaves the draft open.'});await editorKey('Escape');
+      if(unified)await toggleLayout();
+    }
+    await resetFixture(width);
+  });
+}
+
 async function completionSnapshot() {
   return cdp.evaluate(`(() => {
     const dialog=document.querySelector('.completion-dialog'); if(!dialog)return null;
@@ -1243,6 +1269,7 @@ async function runLayoutTests() {
       }
     });
     await runEditorTests(width);
+    await runEditorButtonTests(width);
     await runGroupedRequestTests(width);
     await runUnterminatedAppendTests(width);
     await runNavigationTests(width);

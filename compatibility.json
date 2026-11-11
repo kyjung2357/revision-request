@@ -1,0 +1,7 @@
+{
+  "features": [
+    "multiline-blocks",
+    "optional-reasons",
+    "null-insert-delete"
+  ]
+}

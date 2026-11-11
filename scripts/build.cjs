@@ -1,9 +1,11 @@
 const path = require('node:path');
 const { build } = require('esbuild');
+const { syncPlugin } = require('./sync-plugin.cjs');
 const { writeThirdPartyNotices } = require('./third-party-notices.cjs');
 
 async function buildAll() {
   const root = path.resolve(__dirname, '..');
+  await syncPlugin({root});
   const common = { absWorkingDir: root, bundle: true, platform: 'node', format: 'cjs', logLevel: 'info', metafile: true };
   const results = await Promise.all([
     build({ ...common, entryPoints: [path.join(root, 'src/extension.ts')],

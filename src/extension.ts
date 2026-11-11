@@ -10,6 +10,7 @@ import { McpHost } from './mcpHost';
 import { startMcpBridge } from './mcpBridge';
 import { installMcpAdapter, createMcpConfiguration } from './mcpSetup';
 import { createRequestFromFiles } from './createRequestCommand';
+import { collectMcpDiagnostics, formatMcpDiagnostics } from './mcpDiagnostics';
 
 const VIEW = 'revisionRequest.review';
 type Decisions = Record<string, Decision>;
@@ -920,6 +921,8 @@ export async function activate(context: vscode.ExtensionContext) {
   let installation: Awaited<ReturnType<typeof installMcpAdapter>> | undefined;
   let bridge: Awaited<ReturnType<typeof startMcpBridge>> | undefined;
   let startingBridge: Promise<void> | undefined;
+  let bridgeStartFailed = false;
+  let diagnosticOutput: vscode.OutputChannel | undefined;
   let disposed = false;
   const localWorkspaces = () => vscode.workspace.isTrusted ? (vscode.workspace.workspaceFolders ?? [])
     .filter(folder => folder.uri.scheme === 'file').map(folder => ({uri: folder.uri.toString(), name: folder.name})) : [];
@@ -929,8 +932,9 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!startingBridge) startingBridge = (async () => {
       installation = await installMcpAdapter(context.extensionPath, context.globalStorageUri.fsPath);
       bridge = await startMcpBridge({registryDir: installation.registryDir, workspaces: localWorkspaces, handler: mcpHost.handler});
+      bridgeStartFailed = false;
       if (disposed) bridge.dispose();
-    })().finally(() => { startingBridge = undefined; });
+    })().catch(error => { bridgeStartFailed = true; throw error; }).finally(() => { startingBridge = undefined; });
     await startingBridge;
   };
   const getMcpConfiguration = async (workspaceUri?: vscode.Uri) => {
@@ -939,6 +943,19 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!selected) throw new Error('Choose one explicitly opened local workspace for the MCP configuration.');
     await ensureBridge();
     return {...createMcpConfiguration({runtime: process.execPath, ...installation!, workspaceUri: selected.uri}), instanceId: bridge!.instanceId};
+  };
+  const getMcpDiagnostics = async (workspaceUri?: vscode.Uri) => {
+    // Include untrusted folders: diagnostics must explain why the bridge is unavailable.
+    const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file');
+    const selected = workspaceUri ? folders.find(folder => folder.uri.toString() === workspaceUri.toString()) : folders.length === 1 ? folders[0] : undefined;
+    const manifest = context.extension.packageJSON as {version: string; main: string};
+    const directory = path.join(context.globalStorageUri.fsPath, 'mcp');
+    return collectMcpDiagnostics({extensionVersion: manifest.version,
+      workspace: selected ? {name: selected.name, uri: selected.uri.toString()} : undefined,
+      trusted: vscode.workspace.isTrusted, adapterPath: path.join(directory, 'rr-mcp.cjs'),
+      bundledAdapterPath: path.join(context.extensionPath, path.dirname(manifest.main), 'mcp-server.cjs'),
+      registryDir: path.join(directory, 'instances'), bridgeInstanceId: bridge?.instanceId,
+      bridgeStarting: !!startingBridge, bridgeStartFailed});
   };
   const publishWorkspaces = () => {
     if (bridge) void bridge.publish().catch(error => console.error('Revision Request MCP:', error));
@@ -952,7 +969,7 @@ export async function activate(context: vscode.ExtensionContext) {
   };
   context.subscriptions.push(
     service, tree, requests, targets, editor,
-    {dispose: () => {disposed = true; bridge?.dispose();}},
+    {dispose: () => {disposed = true; bridge?.dispose(); diagnosticOutput?.dispose();}},
     vscode.window.registerWebviewPanelSerializer(VIEW, editor),
     vscode.window.onDidChangeActiveTextEditor(active => editor.autoPreview(active)),
     vscode.workspace.registerTextDocumentContentProvider('rr-snapshot', snapshots),
@@ -969,6 +986,21 @@ export async function activate(context: vscode.ExtensionContext) {
           event.affectsConfiguration('revisionRequest.defaultLayout')) service.changed();
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {tree.refresh(); service.changed(); publishWorkspaces();}),
+    vscode.commands.registerCommand('revisionRequest.diagnoseMcp', async (workspaceUri?: vscode.Uri) => {
+      const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file');
+      if (!workspaceUri && folders.length > 1) {
+        const selected = await vscode.window.showQuickPick(folders.map(folder => ({label: folder.name,
+          description: folder.uri.fsPath, uri: folder.uri})), {placeHolder: 'Choose the workspace to diagnose'});
+        if (!selected) return;
+        workspaceUri = selected.uri;
+      }
+      const report = await getMcpDiagnostics(workspaceUri);
+      diagnosticOutput ??= vscode.window.createOutputChannel('Revision Request MCP');
+      diagnosticOutput.clear();
+      diagnosticOutput.appendLine(formatMcpDiagnostics(report));
+      diagnosticOutput.show(true);
+      return report;
+    }),
     vscode.commands.registerCommand('revisionRequest.copyMcpConfiguration', async () => {
       try {
         const folders = localWorkspaces();
@@ -1018,6 +1050,7 @@ export async function activate(context: vscode.ExtensionContext) {
   return {
     getReadyCount: () => editor.readyCount,
     getMcpConfiguration,
+    getMcpDiagnostics,
     mcpHandler: mcpHost.handler,
     ...(context.extensionMode === vscode.ExtensionMode.Test ? {
       testRunExclusive: <T>(action: () => Promise<T>) => service.runExclusive(action),

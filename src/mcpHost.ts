@@ -6,7 +6,9 @@ import { TextDecoder } from 'node:util';
 import { validateRequestPath, requestFingerprint } from './core';
 import { parseRequestDocument, proposalIdentity, resolveRequest } from './request';
 import type { ReviewService } from './extension';
-import { McpBridgeError, type McpHandler, type McpStatus } from './mcpTypes';
+import { McpBridgeError, type McpHandler, type McpStatus, type McpClientStatus } from './mcpTypes';
+
+import { CURRENT_COMPATIBILITY, parsePluginMetadata } from './mcpCompatibility';
 
 const REGISTRY_KEY = 'mcp.requestRegistry.v1';
 const MAX_RECEIPTS = 256;
@@ -45,6 +47,7 @@ function validatePath(value: unknown): string {
 
 /** Business operations stay in the VS Code host, alongside authoritative review state. */
 export class McpHost {
+  private readonly lastClients = new Map<string, McpClientStatus>();
   private registryQueue: Promise<unknown> = Promise.resolve();
   readonly handler: McpHandler;
   constructor(
@@ -314,7 +317,24 @@ export class McpHost {
   private async handle(method: Parameters<McpHandler>[0], args: Record<string, unknown>, workspaceUri: string): Promise<unknown> {
     const folder = this.workspace(workspaceUri);
     switch (method) {
-      case 'capabilities': return {workspaceUri, allowAgentDecisions: this.agentDecisionsAllowed()};
+      case 'capabilities': return {workspaceUri, allowAgentDecisions: this.agentDecisionsAllowed(),
+        extensionVersion: CURRENT_COMPATIBILITY.version, features: CURRENT_COMPATIBILITY.features,
+        formatGuideSha256: CURRENT_COMPATIBILITY.formatGuideSha256, lastClient: this.lastClients.get(workspaceUri)};
+      case 'client_status': {
+        const clean = (value: unknown) => typeof value === 'string' && /^[a-zA-Z0-9._ +/@()-]{1,100}$/.test(value) ? value : undefined;
+        if (!['initialized', 'tools_listed', 'tool_called'].includes(String(args.stage)) || !clean(args.adapterVersion)) {
+          throw new McpBridgeError('INVALID_ARGUMENT', 'Invalid MCP client status.');
+        }
+        const previous = this.lastClients.get(workspaceUri);
+        const status: McpClientStatus = {name: clean(args.name) ?? 'MCP client', version: clean(args.version),
+          adapterVersion: clean(args.adapterVersion)!, plugin: parsePluginMetadata(args.plugin),
+          stage: args.stage as McpClientStatus['stage'], lastSeenAt: new Date().toISOString()};
+        // A late initialization report must not erase a later discovery event.
+        if (!(status.stage === 'initialized' && previous && previous.name === status.name && previous.stage !== 'initialized')) {
+          this.lastClients.set(workspaceUri, status);
+        }
+        return {recorded: true};
+      }
       case 'read_target': return this.readTarget(folder, validatePath(args.path));
       case 'create_request': return this.createRequest(folder, args);
       case 'list_requests': {

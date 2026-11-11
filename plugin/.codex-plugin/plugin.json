@@ -1,6 +1,6 @@
 {
   "name": "revision-request",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Prepare revision requests for human review in VS Code before changing source files.",
   "author": {
     "name": "Kiyuob Jung",
@@ -22,7 +22,7 @@
   "onboardingSkill": "./skills/setup/SKILL.md",
   "interface": {
     "displayName": "Revision Request",
-    "shortDescription": "Propose file changes for review in VS Code.",
+    "shortDescription": "Review changes in VS Code.",
     "longDescription": "Create .rr proposals from the current source, open the VS Code review preview, and check review results. Source changes stay pending until reviewed. Requires the Revision Request VS Code extension, a trusted local workspace, and Node.js 22 or newer.",
     "developerName": "Kiyuob Jung",
     "category": "Productivity",

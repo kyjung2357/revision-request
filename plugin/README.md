@@ -50,6 +50,20 @@ A custom absolute config path can be supplied with `--config` to either script o
 
 The configuration helper does not install extensions or modify Codex settings. `--check` validates local configuration; `rr_get_format` checks only the adapter and works offline. Neither proves the VS Code bridge is connected.
 
+## Diagnose and update
+
+Run **Revision Request: Diagnose MCP Connection** in VS Code, or check the configured workspace from the plugin without needing MCP tools:
+
+```text
+node "<plugin-root>/scripts/launch-mcp.cjs" --diagnose
+```
+
+After connecting, the same workflow is available through `rr_diagnose`. It reports the bridge, selected workspace, versions, supported features, and a recovery step for failures. A successful local bridge check does not prove that the agent has discovered `rr_*` tools; call `rr_list_requests` from that agent to verify access.
+
+The release process synchronizes this plugin's version, format guide, schema, and capability metadata with the extension. Installers keep cached copies, so updating the extension does not itself replace an installed plugin. If diagnostics reports a stale version or guide, update/reinstall the plugin through its host and reconnect; do not edit the cache. Keep the existing workspace configuration unless intentionally switching workspaces.
+
+For repository development, run `npm run sync:plugin` to regenerate release files or `npm run check:plugin-sync` to detect drift. Both VSIX builds and plugin packaging synchronize these files automatically. `docs/FORMAT.md`, `schemas/revision-request.schema.json`, `compatibility.json`, and the root `package.json` are the owning sources.
+
 ## Use it
 
 > Use Revision Request to propose these changes and open the preview for my review.
@@ -60,7 +74,7 @@ Accept, Ignore, and Undo belong to the user by default. Agent decision tools req
 
 If connection setup is needed, run the plugin's setup workflow. It uses the configuration generated for the workspace you select. If the generated paths become obsolete, copy and import fresh Generic JSON. If two VS Code windows have the same workspace open, close the duplicate window.
 
-For direct `.rr` authoring without a live connection, the skill includes a short format reference. Live previews and review-status checks still require VS Code.
+For direct `.rr` authoring without a live connection, the skill includes the same format guide and JSON schema shipped with the extension. Live previews and review-status checks still require VS Code.
 
 See the [MCP guide](https://github.com/kyjung2357/revision-request/blob/main/docs/MCP.md) and [format reference](https://github.com/kyjung2357/revision-request/blob/main/docs/FORMAT.md) for full extension details.
 

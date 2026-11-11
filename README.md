@@ -48,7 +48,7 @@ MCP lets the agent read the original, create requests, open previews, and check 
 
 The agent may need you to run **Revision Request: Copy MCP Configuration** or reconnect your AI client. **Agent Accept, Ignore, and Undo through MCP are disabled by default.** See the [MCP guide](docs/MCP.md) for setup and tool details. MCP is optional when an agent writes a `.rr` file directly.
 
-For the desktop plugin with bundled skills and an MCP launcher, see [plugin setup](plugin/README.md).
+For the desktop plugin with bundled skills and an MCP launcher, see [plugin setup](plugin/README.md). If tools are missing or instructions seem outdated, run **Revision Request: Diagnose MCP Connection**; see [connection diagnostics](docs/MCP.md#diagnose-a-connection).
 
 ## Create a request from your own edits
 

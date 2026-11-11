@@ -13,7 +13,7 @@ The plugin launcher needs **Node.js 22 or newer** available as `node`. The VS Co
 
 The user needs the [Revision Request extension](https://marketplace.visualstudio.com/items?itemName=kyjung2357.revision-request) enabled in an open, trusted **local** VS Code workspace. Remote and virtual workspaces are unsupported. Help with installation or trust only within the user's requested setup scope; do not silently grant workspace trust.
 
-If already configured, run `node "<plugin-root>/scripts/configure.cjs" --check` to validate the saved configuration and paths without starting its command. Use `rr_list_requests` to check a live connection. Do not claim connection success from `--check` or `rr_get_format` alone.
+If already configured, run `node "<plugin-root>/scripts/configure.cjs" --check` to validate the saved configuration and paths without starting its command. Then run `node "<plugin-root>/scripts/launch-mcp.cjs" --diagnose` to check the selected bridge, versions, capabilities, and suggested recovery steps without needing exposed MCP tools. The same report is available through **Revision Request: Diagnose MCP Connection** in VS Code or `rr_diagnose` after connecting. Use `rr_list_requests` from the current agent to confirm tool discovery and live access; do not claim connection success from `--check`, `rr_get_format`, or a local bridge probe alone.
 
 ## Store the generated configuration
 
@@ -38,6 +38,7 @@ For a custom config location, the helpers accept `--config <absolute-file>`; the
 
 ## Repair a failed connection
 
+- Version or format mismatch: update the extension and reload/reinstall the plugin through the host, then reconnect the MCP server and rerun diagnostics. The guide and schema are generated from the same source in each release. Do not edit cached skill files. Version differences are reported separately from missing capabilities.
 - Missing Node: explain the launcher prerequisite and help install it only if requested.
 - Missing/obsolete generated paths: copy fresh Generic JSON from the intended active extension and import it. Do not substitute guessed paths.
 - Offline bridge: open/trust the selected local workspace and reconnect. If two VS Code windows have the same workspace open, have the user close the duplicate; do not select an arbitrary instance.

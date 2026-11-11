@@ -5,10 +5,12 @@ const path = require('node:path');
 const {randomUUID} = require('node:crypto');
 const {pipeline} = require('node:stream/promises');
 const {ZipFile} = require('yazl');
+const {syncPlugin} = require('./sync-plugin.cjs');
 const root = path.resolve(__dirname, '..');
 async function packagePlugin() {
   const ignore = await fs.readFile(path.join(root, '.gitignore'), 'utf8');
   if (!/(^|\n)\.codex-\*\//.test(ignore)) throw new Error('Ignore .codex-* artifacts before packaging.');
+  await syncPlugin({root});
   const source = path.join(root, 'plugin');
   const manifest = JSON.parse(await fs.readFile(path.join(source, 'plugin.json'), 'utf8'));
   const version = require('../package.json').version;
@@ -23,7 +25,7 @@ async function packagePlugin() {
     } else if (info.isFile()) files.push(relative);
     else throw new Error('Only regular plugin files can be packaged: ' + relative);
   }
-  for (const name of ['plugin.json', 'mcp.json', '.codex-plugin', '.mcp.json', 'skills', 'scripts', 'assets', 'README.md', 'LICENSE']) await visit(name);
+  for (const name of ['plugin.json', 'compatibility.json', 'mcp.json', '.codex-plugin', '.mcp.json', 'skills', 'scripts', 'assets', 'README.md', 'LICENSE']) await visit(name);
   const directory = path.join(root, '.codex-artifacts');
   await fs.mkdir(directory, {recursive: true});
   const output = path.join(directory, `revision-request-plugin-${version}.zip`);

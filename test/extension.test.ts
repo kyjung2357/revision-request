@@ -8,9 +8,11 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { BridgeMethod, McpStatus } from '../src/mcpTypes';
 import { createRequestFromSnapshots } from '../src/createRequest';
+import type { McpDiagnosticReport } from '../src/mcpDiagnostics';
 
 interface ExtensionApi {
   getReadyCount(): number;
+  getMcpDiagnostics(workspaceUri?: vscode.Uri): Promise<McpDiagnosticReport>;
   getMcpConfiguration(workspaceUri?: vscode.Uri): Promise<{json: {mcpServers: {revision_request: {command: string; args: string[]; env: Record<string, string>}}}; instanceId: string}>;
   mcpHandler(method: BridgeMethod, args: Record<string, unknown>, workspaceUri: string): Promise<unknown>;
   testRunExclusive<T>(action: () => Promise<T>): Promise<T>;
@@ -77,6 +79,27 @@ export async function run(): Promise<void> {
       console.error('FAIL ' + name + '\n' + detail);
     }
   }
+
+  await check('MCP diagnostics command authenticates this workspace without changing source, proposals, or decision permissions', async () => {
+    const item = await fixture('mcp-diagnostics-readonly', 'unchanged source\n', 'proposal only\n');
+    const targetBefore = await bytes(item.target);
+    const requestBefore = await bytes(item.request);
+    const permissionBefore = vscode.workspace.getConfiguration('revisionRequest').inspect('mcp.allowAgentDecisions');
+    assert.ok(extension.packageJSON.contributes.commands.some((command: {command: string}) => command.command === 'revisionRequest.diagnoseMcp'));
+    const report = await vscode.commands.executeCommand<McpDiagnosticReport>('revisionRequest.diagnoseMcp', workspace);
+    assert.ok(report);
+    assert.equal(report.workspaceUri, workspace!.toString());
+    assert.equal(report.extensionVersion, extension.packageJSON.version);
+    assert.equal(report.checks.find(check => check.stage === 'Adapter')?.status, 'ok');
+    assert.equal(report.checks.find(check => check.stage === 'Bridge')?.status, 'ok');
+    assert.equal(report.checks.find(check => check.stage === 'Agent tool discovery')?.status, 'unknown');
+    assert.deepEqual(await bytes(item.target), targetBefore);
+    assert.deepEqual(await bytes(item.request), requestBefore);
+    assert.deepEqual(vscode.workspace.getConfiguration('revisionRequest').inspect('mcp.allowAgentDecisions'), permissionBefore);
+    const unavailable = await api.getMcpDiagnostics(vscode.Uri.joinPath(workspace!, 'not-a-workspace-folder'));
+    assert.equal(unavailable.workspaceUri, undefined);
+    assert.equal(unavailable.checks.find(check => check.stage === 'Workspace')?.status, 'blocked');
+  });
 
   await check('RR language keeps JSON schema, completion and formatting without changing ordinary JSON or icon theme', async () => {
     const iconThemeBefore = vscode.workspace.getConfiguration('workbench').get<string | null>('iconTheme');
