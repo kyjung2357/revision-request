@@ -15,6 +15,7 @@ interface ExtensionApi {
   mcpHandler(method: BridgeMethod, args: Record<string, unknown>, workspaceUri: string): Promise<unknown>;
   testRunExclusive<T>(action: () => Promise<T>): Promise<T>;
   testFailNextRequestWriteAfterSave(): void;
+  testRestorePreview(panel: vscode.WebviewPanel, state: unknown): Promise<void>;
   getState(uri: vscode.Uri): Promise<ReviewState>;
   decide(uri: vscode.Uri, file: string, hunk: string | undefined,
     decision: 'accepted' | 'ignored', revision: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
@@ -169,6 +170,12 @@ export async function run(): Promise<void> {
     assert.equal(vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
       tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === item.target.toString())), false,
       'The comparison displays both texts inside its panel; it must not automatically open the native target.');
+    const layoutMenu = extension.packageJSON.contributes.menus['editor/title'].find((item: {command: string}) => item.command === 'revisionRequest.toggleLayout');
+    assert.equal(layoutMenu.when, 'activeWebviewPanelId == revisionRequest.review');
+    assert.match(layoutMenu.group, /^navigation/);
+    await vscode.commands.executeCommand('revisionRequest.toggleLayout', vscode.Uri.parse('webview-panel:webview-panel/webview-revisionRequest.review-layout'));
+    await vscode.commands.executeCommand('revisionRequest.toggleLayout', vscode.Uri.parse('webview-panel:webview-panel/webview-revisionRequest.review-layout'));
+    assert.deepEqual(await bytes(item.target), original, 'Changing the comparison layout never writes the original.');
     let state = await ready(item);
     assert.equal(state.files[0]!.hunks.length, 2);
     assert.deepEqual(await bytes(item.target), original);
@@ -359,8 +366,8 @@ export async function run(): Promise<void> {
       await api.decide(item.request, item.relative, last.id, 'ignored', await latestRevision(item.request));
       state = await ready(item);
       const original = await bytes(item.target);
-      const pendingDraft = 'EDITED MIDDLE\n';
-      await assert.rejects(api.editPending(item.request, item.relative, middle.id, 'two\nlines\n', state.revision), /one line|single.line|line break/i);
+      const pendingDraft = 'EDITED MIDDLE';
+      await assert.rejects(api.editPending(item.request, item.relative, middle.id, 'invalid\0text', state.revision), /NUL/i);
       const beforeDraft = (await bytes(item.request)).toString('utf8');
       const edited = await api.editPending(item.request, item.relative, middle.id, pendingDraft, await latestRevision(item.request));
       assert.equal(edited.changed, true); assert.notEqual(edited.revision, state.revision);
@@ -378,7 +385,7 @@ export async function run(): Promise<void> {
       await assert.rejects(api.editPending(item.request, item.relative, first.id, 'resolved\n', state.revision), /pending|resolved/i);
       await assert.rejects(api.editPending(item.request, item.relative, last.id, 'resolved\n', state.revision), /pending|resolved/i);
       const beforeNoop = await bytes(item.request);
-      assert.deepEqual(await api.editPending(item.request, item.relative, pending.id, pending.after, await latestRevision(item.request)),
+      assert.deepEqual(await api.editPending(item.request, item.relative, pending.id, pending.draftAfter ?? pending.after.replace(/\n$/, ''), await latestRevision(item.request)),
         {changed: false, revision: state.revision});
       assert.deepEqual(await bytes(item.request), beforeNoop);
       await api.decide(item.request, item.relative, pending.id, 'accepted', await latestRevision(item.request));
@@ -386,12 +393,47 @@ export async function run(): Promise<void> {
       await api.undo(item.request, item.relative, pending.id, await latestRevision(item.request));
       assert.deepEqual(await bytes(item.target), original, 'Undo restores only the edited block and keeps the prior acceptance.');
       await config.update('autoDeleteCompleted', true, vscode.ConfigurationTarget.Workspace);
-      await api.editPending(item.request, item.relative, pending.id, pending.before, await latestRevision(item.request));
+      await api.editPending(item.request, item.relative, pending.id, pending.before.replace(/\r\n|\r/g, '\n').replace(/\n$/, ''), await latestRevision(item.request));
       state = await ready(item);
       assert.ok(state.files[0]!.hunks.every(hunk => hunk.decision !== 'pending'));
       await vscode.workspace.fs.stat(item.request); // Editing away the last pending change does not auto-delete.
       assert.deepEqual(await bytes(item.target), original);
     } finally { await config.update('autoDeleteCompleted', previousCleanup, vscode.ConfigurationTarget.Workspace); }
+  });
+
+  await check('Multiline groups remain atomic through exact draft editing, partial decisions and Undo with CRLF and BOM', async () => {
+    const before = '\uFEFFheading\r\nold A\r\nold B\r\nanchor\r\nobsolete A\r\nobsolete B\r\nlast';
+    const item = await fixture('multiline-blocks', before, before, '.py');
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify({path: item.relative, request: [
+      {line: 2, before: 'old A\nold B', after: 'new A\nnew B', status: 'pending'},
+      {line: 4, before: null, after: 'inserted A\ninserted B', reason: '', status: 'pending'},
+      {line: 5, before: 'obsolete A\nobsolete B', after: null, status: 'pending'}
+    ]})));
+    let state = await ready(item);
+    assert.equal(state.files[0]!.hunks.length, 3, 'One request entry produces one review group, regardless of line count.');
+    assert.ok(state.files[0]!.hunks.every(hunk => !hunk.explanation));
+    const replacement = state.files[0]!.hunks[0]!;
+    const draft = 'edited A\nedited B\nedited C\n';
+    await api.editPending(item.request, item.relative, replacement.id, draft, state.revision);
+    assert.deepEqual(await bytes(item.target), Buffer.from(before), 'Saving the grouped draft cannot modify source.');
+    state = await ready(item);
+    const [changed, inserted, removed] = state.files[0]!.hunks;
+    assert.ok(changed && inserted && removed);
+    assert.equal(changed.draftAfter, draft, 'The displayed trailing blank line is preserved exactly.');
+    await api.decide(item.request, item.relative, inserted.id, 'accepted', state.revision);
+    assert.deepEqual(await bytes(item.target), Buffer.from(before.replace('anchor', 'inserted A\r\ninserted B\r\nanchor')));
+    await api.decide(item.request, item.relative, changed.id, 'accepted', await latestRevision(item.request));
+    const replacementText = 'edited A\r\nedited B\r\nedited C\r\n\r\n';
+    const replaced = before.replace('old A\r\nold B\r\n', replacementText);
+    assert.deepEqual(await bytes(item.target), Buffer.from(replaced.replace('anchor', 'inserted A\r\ninserted B\r\nanchor')));
+    await api.undo(item.request, item.relative, inserted.id, await latestRevision(item.request));
+    assert.deepEqual(await bytes(item.target), Buffer.from(replaced));
+    await api.decide(item.request, item.relative, removed.id, 'accepted', await latestRevision(item.request));
+    assert.deepEqual(await bytes(item.target), Buffer.from(replaced.replace('obsolete A\r\nobsolete B\r\n', '')));
+    await api.undo(item.request, item.relative, changed.id, await latestRevision(item.request));
+    assert.deepEqual(await bytes(item.target), Buffer.from(before.replace('obsolete A\r\nobsolete B\r\n', '')));
+    await api.undo(item.request, item.relative, removed.id, await latestRevision(item.request));
+    assert.deepEqual(await bytes(item.target), Buffer.from(before), 'Undo restores exact bytes without disturbing other decisions.');
   });
 
   await check('Pending draft saves reject dirty editors and independently changed originals or request revisions', async () => {
@@ -437,7 +479,7 @@ export async function run(): Promise<void> {
     await api.decide(item.request, item.relative, first.id, 'accepted', await latestRevision(item.request));
     const original = await bytes(item.target);
     api.testFailNextRequestWriteAfterSave();
-    await api.editPending(item.request, item.relative, last.id, 'EDITED\n', await latestRevision(item.request));
+    await api.editPending(item.request, item.relative, last.id, 'EDITED', await latestRevision(item.request));
     assert.equal(JSON.parse((await bytes(item.request)).toString('utf8')).request[1].after, 'EDITED');
     const deadline = Date.now() + 5000;
     do {
@@ -585,7 +627,7 @@ export async function run(): Promise<void> {
     assert.equal((await ready(tex)).files[0]!.hunks[0]!.decision, 'accepted');
   });
   await check('Explorer-style opening can auto-preview, while View Source keeps raw JSON accessible', async () => {
-    const item = await fixture('auto-preview', 'original\n', 'proposal\n');
+    const item = await fixture('auto-preview', 'original\n', 'proposal\n', '.py');
     const config = vscode.workspace.getConfiguration('revisionRequest', item.request);
     const previous = config.inspect<boolean>('previewOnOpen')?.workspaceValue;
     try {
@@ -644,33 +686,96 @@ export async function run(): Promise<void> {
       await config.update('previewOnOpen', previous, vscode.ConfigurationTarget.Workspace);
     }
   });
+  await check('Restored Python previews bind the saved request and editor-title source commands avoid virtual resources', async () => {
+    const item = await fixture('restored-preview', 'print("original")\n', 'print("proposal")\n', '.py');
+    const source = await vscode.workspace.openTextDocument(item.request);
+    const config = vscode.workspace.getConfiguration('revisionRequest', item.request);
+    const previous = config.inspect<boolean>('previewOnOpen')?.workspaceValue;
+    const beforeReady = api.getReadyCount();
+    const panel = vscode.window.createWebviewPanel('revisionRequest.review', 'Restoring preview', vscode.ViewColumn.Active, {retainContextWhenHidden: true});
+    try {
+      await config.update('previewOnOpen', true, vscode.ConfigurationTarget.Workspace);
+      await api.testRestorePreview(panel, {requestUri: item.request.toString(), splitRatio: 0.4});
+      const deadline = Date.now() + 10000;
+      while (api.getReadyCount() <= beforeReady && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(api.getReadyCount() > beforeReady, 'The restored real webview must load and send its ready handshake.');
+      assert.equal(panel.title, path.basename(item.request.fsPath) + ' — Preview');
+      assert.ok(panel.webview.html.includes('data-request-uri="' + item.request.toString() + '"'));
+      const count = api.getReadyCount();
+      const duplicate = vscode.window.createWebviewPanel('revisionRequest.review', 'Duplicate restore', vscode.ViewColumn.Active, {retainContextWhenHidden: true});
+      let duplicateDisposed = false;
+      duplicate.onDidDispose(() => {duplicateDisposed = true;});
+      await api.testRestorePreview(duplicate, {requestUri: item.request.toString()});
+      assert.equal(duplicateDisposed, true, 'Restoration must reuse an already-bound request panel.');
+      panel.reveal();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      await vscode.commands.executeCommand('revisionRequest.openSource',
+        vscode.Uri.parse('webview-panel:webview-panel/webview-revisionRequest.review-test'));
+      assert.equal(vscode.window.activeTextEditor?.document, source,
+        "The title action must open the bound RR source, not VS Code's internal panel resource.");
+      panel.dispose();
+      await vscode.window.showTextDocument(item.target);
+      await vscode.window.showTextDocument(source);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      assert.equal(vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
+        tab.input instanceof vscode.TabInputWebview && tab.label === path.basename(item.request.fsPath) + ' — Preview')), false);
+      assert.equal(api.getReadyCount(), count, 'Closing a restored preview must not auto-reopen it from the existing source.');
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    } finally {
+      panel.dispose();
+      await config.update('previewOnOpen', previous, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+  await check('A restored preview with legacy state asks to reopen the RR without guessing a source', async () => {
+    const panel = vscode.window.createWebviewPanel('revisionRequest.review', 'Legacy preview', vscode.ViewColumn.Active, {retainContextWhenHidden: true});
+    try {
+      await api.testRestorePreview(panel, {splitRatio: 0.5});
+      panel.reveal();
+      const activeDeadline = Date.now() + 5000;
+      while ((!panel.active || vscode.window.activeTextEditor) && Date.now() < activeDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.equal(panel.webview.options.enableScripts, false);
+      assert.match(panel.webview.html, /Reopen the revision request/);
+      assert.doesNotMatch(panel.webview.html, /data-request-uri|<script/);
+      await vscode.commands.executeCommand('revisionRequest.openSource',
+        vscode.Uri.parse('webview-panel:webview-panel/webview-revisionRequest.review-legacy'));
+      assert.equal(vscode.window.activeTextEditor, undefined);
+    } finally { panel.dispose(); }
+  });
   await check('Display settings update opacity and intraline options without changing source or decisions', async () => {
     const item = await fixture('opacity-setting', 'unchanged\nx = 2; y = 3;\n', 'unchanged\nx = 1; y = 4;\n');
     const config = vscode.workspace.getConfiguration('revisionRequest', item.request);
     const previous = config.inspect<number>('unchangedOpacity')?.workspaceValue;
     const previousHighlight = config.inspect<boolean>('highlightChangedLines')?.workspaceValue;
     const previousOnly = config.inspect<boolean>('showOnlyChangedText')?.workspaceValue;
+    const previousLayout = config.inspect<string>('defaultLayout')?.workspaceValue;
     try {
       await config.update('unchangedOpacity', undefined, vscode.ConfigurationTarget.Workspace);
       await config.update('highlightChangedLines', undefined, vscode.ConfigurationTarget.Workspace);
       await config.update('showOnlyChangedText', undefined, vscode.ConfigurationTarget.Workspace);
+      await config.update('defaultLayout', undefined, vscode.ConfigurationTarget.Workspace);
       const defaults = await ready(item);
       assert.equal(defaults.unchangedOpacity, 20);
       assert.equal(defaults.highlightChangedLines, true);
       assert.equal(defaults.showOnlyChangedText, false);
+      assert.equal(defaults.defaultLayout, 'unified');
+      assert.equal(config.inspect<string>('defaultLayout')?.defaultValue, 'unified');
       assert.equal(config.inspect<boolean>('highlightChangedLines')?.defaultValue, true);
       assert.equal(config.inspect<boolean>('showOnlyChangedText')?.defaultValue, false);
       const hunk = defaults.files[0]!.hunks[0]!;
-      assert.deepEqual(hunk.inlineChanges![0]!.before.filter(segment => segment.changed).map(segment => segment.text), ['2', '3']);
-      assert.deepEqual(hunk.inlineChanges![0]!.after.filter(segment => segment.changed).map(segment => segment.text), ['1', '4']);
-      assert.ok(hunk.inlineChanges![0]!.before.some(segment => !segment.changed && segment.text === '; y = '));
+      assert.deepEqual(hunk.inlineChanges![0]!.before.filter(segment => segment.changed).map(segment => segment.text), ['2;', '3;']);
+      assert.deepEqual(hunk.inlineChanges![0]!.after.filter(segment => segment.changed).map(segment => segment.text), ['1;', '4;']);
+      assert.ok(hunk.inlineChanges![0]!.before.some(segment => !segment.changed && segment.text === ' y = '));
       await config.update('unchangedOpacity', 0, vscode.ConfigurationTarget.Workspace);
       await config.update('highlightChangedLines', false, vscode.ConfigurationTarget.Workspace);
       await config.update('showOnlyChangedText', true, vscode.ConfigurationTarget.Workspace);
+      await config.update('defaultLayout', 'sideBySide', vscode.ConfigurationTarget.Workspace);
       const changed = await ready(item);
       assert.equal(changed.unchangedOpacity, 0);
       assert.equal(changed.highlightChangedLines, false);
       assert.equal(changed.showOnlyChangedText, true);
+      assert.equal(changed.defaultLayout, 'sideBySide');
       assert.equal(changed.files[0]!.hunks[0]!.id, hunk.id);
       assert.equal(changed.files[0]!.hunks[0]!.decision, 'pending');
       assert.deepEqual(changed.files[0]!.hunks[0]!.inlineChanges, hunk.inlineChanges);
@@ -687,6 +792,7 @@ export async function run(): Promise<void> {
       await config.update('unchangedOpacity', previous, vscode.ConfigurationTarget.Workspace);
       await config.update('highlightChangedLines', previousHighlight, vscode.ConfigurationTarget.Workspace);
       await config.update('showOnlyChangedText', previousOnly, vscode.ConfigurationTarget.Workspace);
+      await config.update('defaultLayout', previousLayout, vscode.ConfigurationTarget.Workspace);
     }
   });
   await check('Automatic deletion defaults off, and opting in preserves partial requests but removes final accepted requests', async () => {
@@ -936,7 +1042,7 @@ export async function run(): Promise<void> {
     await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'accepted', await latestRevision(item.request));
     state = await ready(item); assert.deepEqual(await bytes(item.target), Buffer.from('context\nold\n'));
     const pending = state.files[0]!.hunks.find(hunk => hunk.decision === 'pending')!;
-    await api.editPending(item.request, item.relative, pending.id, 'edited\n', await latestRevision(item.request));
+    await api.editPending(item.request, item.relative, pending.id, 'edited', await latestRevision(item.request));
     state = await ready(item); assert.equal(state.files[0]!.hunks[0]!.decision, 'accepted');
     assert.equal(state.files[0]!.hunks.find(hunk => hunk.decision === 'pending')!.after, 'edited\n');
     assert.deepEqual(await bytes(item.target), Buffer.from('context\nold\n'));
@@ -1179,6 +1285,28 @@ export async function run(): Promise<void> {
     }
   });
 
+  await check('Bundled MCP creates one multiline decision without a reason or source mutation', async () => {
+    await withMcpClient(async client => {
+      const item = await mcpTarget('mcp-multiline', '\uFEFFheader\r\ntail');
+      const read = await tool<{hash: string}>(client, 'rr_read_target', {path: item.relative});
+      const after = 'First inserted line.\nSecond inserted line.\n';
+      const status = await tool<McpStatus>(client, 'rr_create_request', {
+        path: item.relative, expectedHash: read.hash, clientRequestId: randomUUID(),
+        request: [{line: 2, before: null, after}]
+      });
+      const request = vscode.Uri.joinPath(workspace!, status.requestPath);
+      const stored = JSON.parse((await bytes(request)).toString('utf8'));
+      assert.equal(stored.request.length, 1); assert.equal(stored.request[0].after, after);
+      assert.equal('reason' in stored.request[0], false);
+      assert.equal(status.hunks.length, 1); assert.equal(status.pending, 1);
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+      await api.decide(request, item.relative, status.hunks[0]!.id, 'accepted', await latestRevision(request));
+      assert.deepEqual(await bytes(item.target), Buffer.from('\uFEFFheader\r\nFirst inserted line.\r\nSecond inserted line.\r\n\r\ntail'));
+      await api.undo(request, item.relative, status.hunks[0]!.id, await latestRevision(request));
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    });
+  });
+
   await check('MCP creation always starts pending and its requestId survives human status changes and Undo', async () => {
     await withMcpClient(async client => {
       const item = await mcpTarget('mcp-request-status');
@@ -1190,8 +1318,10 @@ export async function run(): Promise<void> {
       const json = JSON.parse((await bytes(request)).toString('utf8'));
       assert.equal('version' in json, false); assert.ok(Number.isFinite(Date.parse(json.time)));
       assert.deepEqual(json.request.map((entry: {status: string}) => entry.status), ['pending', 'pending']);
+      assert.equal('reason' in json.request[1], false, 'MCP does not invent an omitted explanation.');
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
       assert.equal((await tool<McpStatus>(client, 'rr_create_request', args)).requestId, created.requestId);
+      assert.equal((await tool<McpStatus>(client, 'rr_create_request', {...args, request: entries.map(entry => ({...entry, reason: entry.reason ?? ''}))})).requestId, created.requestId, 'Omitted and empty reasons are equivalent for an identical retry.');
       await api.decide(request, item.relative, created.hunks[0]!.id, 'accepted', await latestRevision(request));
       let status = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: created.requestId});
       assert.equal(status.requestId, created.requestId); assert.equal(status.accepted, 1); assert.equal(status.pending, 1);

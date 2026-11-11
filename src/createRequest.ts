@@ -1,8 +1,8 @@
 import { diffArrays } from 'diff';
 import { validateRequestFile, type RequestExplanation } from './core';
-import { parseRequestDocument, resolveRequest, sourceLines, minimalLineReplacement, type RevisionRequest, type RequestEntry } from './request';
+import { parseRequestDocument, resolveRequest, sourceLines, minimalBlockReplacement, type RevisionRequest, type RequestEntry } from './request';
 export interface SnapshotRequestOptions { reason?: string; explanations?: RequestExplanation[]; time?: string }
-/** Generate one minimal fragment per changed original line, plus explicit line additions/deletions. */
+/** Generate one atomic entry per contiguous changed block, keeping boundary context minimal. */
 export function createRequestFromSnapshots(path: string, before: string, after: string, options: SnapshotRequestOptions = {}): RevisionRequest {
   const validated = validateRequestFile({path, before, after, reason: options.reason, explanations: options.explanations});
   if (Buffer.from(before, 'utf8').toString('utf8') !== before || Buffer.from(after, 'utf8').toString('utf8') !== after) throw new Error('Snapshots must contain valid Unicode.');
@@ -19,19 +19,26 @@ export function createRequestFromSnapshots(path: string, before: string, after: 
     while (index < parts.length && (parts[index]!.added || parts[index]!.removed)) {
       const change = parts[index++]!; if (change.removed) removed += change.value.length; else added += change.value.length;
     }
-    const paired = Math.min(removed, added);
-    for (let item = 0; item < paired; item++) {
-      const line = oldIndex + item + 1, replacement = minimalLineReplacement(original[oldIndex + item]!.content, proposed[newIndex + item]!.content);
-      entries.push({line, ...replacement, reason: reason(line), status: 'pending'});
-    }
-    for (let item = paired; item < removed; item++) {
-      const line = oldIndex + item + 1;
-      entries.push({line, before: original[oldIndex + item]!.content, after: null, reason: reason(line), status: 'pending'});
-    }
-    for (let item = paired; item < added; item++) {
-      const line = oldIndex + removed + 1;
-      entries.push({line, before: null, after: proposed[newIndex + item]!.content, reason: reason(line), status: 'pending'});
-    }
+    const addBlock = (oldOffset: number, newOffset: number, oldCount: number, newCount: number) => {
+      const line = oldOffset + 1;
+      const previous = original.slice(oldOffset, oldOffset + oldCount).map(item => item.content).join('\n');
+      const next = proposed.slice(newOffset, newOffset + newCount).map(item => item.content).join('\n');
+      const replacement = oldCount && newCount ? minimalBlockReplacement(previous, next)
+        : {before: oldCount ? previous : null, after: newCount ? next : null};
+      const reasons = [...new Set(Array.from({length: Math.max(1, oldCount)}, (_, offset) => reason(line + offset)))];
+      const hasReason = options.reason !== undefined || validated.explanations?.some(item =>
+        item.line >= line && item.line < line + Math.max(1, oldCount));
+      entries.push({line, ...replacement, ...(hasReason ? {reason: reasons.filter(Boolean).join('\n\n')} : {}), status: 'pending'});
+    };
+    if (removed > 1 && (removed === added || added === 0)) {
+      // Explicitly different explanations identify separate review intentions.
+      let start = 0;
+      for (let end = 1; end <= removed; end++) {
+        if (end < removed && reason(oldIndex + end + 1) === reason(oldIndex + start + 1)) continue;
+        addBlock(oldIndex + start, newIndex + (added ? start : 0), end - start, added ? end - start : 0);
+        start = end;
+      }
+    } else addBlock(oldIndex, newIndex, removed, added);
     oldIndex += removed; newIndex += added;
   }
   const request = parseRequestDocument(JSON.stringify({path: validated.path, time: options.time ?? new Date().toISOString(), request: entries}));

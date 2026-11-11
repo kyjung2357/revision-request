@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -29,7 +29,8 @@
   },
   "main": "./.codex-build/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onWebviewPanel:revisionRequest.review"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -63,6 +64,11 @@
       }
     ],
     "commands": [
+      {
+        "command": "revisionRequest.toggleLayout",
+        "title": "Toggle Comparison Layout",
+        "icon": "$(layout)"
+      },
       {
         "command": "revisionRequest.createRequest",
         "title": "Revision Request: Create Revision Request",
@@ -139,6 +145,11 @@
       ],
       "editor/title": [
         {
+          "command": "revisionRequest.toggleLayout",
+          "when": "activeWebviewPanelId == revisionRequest.review",
+          "group": "navigation@1"
+        },
+        {
           "command": "revisionRequest.openPreview",
           "when": "resourceExtname == .rr",
           "group": "navigation"
@@ -175,6 +186,14 @@
           "default": true,
           "description": "Open the comparison preview automatically when you open a .rr file. Turn off to open JSON first. Open RR as JSON always opens the source."
         },
+        "revisionRequest.defaultLayout": {
+          "type": "string",
+          "enum": ["unified", "sideBySide"],
+          "enumDescriptions": ["Removed and added lines in one column.", "Original and proposed text in separate columns."],
+          "default": "unified",
+          "scope": "resource",
+          "description": "Initial layout for new previews. Each preview keeps its restored or toggled layout until it is closed."
+        },
         "revisionRequest.unchangedOpacity": {
           "type": "number",
           "default": 20,
@@ -202,7 +221,7 @@
         "revisionRequest.showOnlyChangedText": {
           "type": "boolean",
           "default": false,
-          "description": "Hide unchanged characters within pending changed lines, keeping their space for alignment. Only the changed characters remain visible. Other context lines are unaffected."
+          "description": "Hide unchanged words within pending changed lines, keeping their space for alignment. Only the changed words remain visible. Other context lines are unaffected."
         },
         "revisionRequest.mcp.allowAgentDecisions": {
           "type": "boolean",
@@ -229,12 +248,12 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts && node --test test/request-host.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",
     "test:ui": "node test/review-browser.cjs",
-    "test:mcp": "npm run build && tsx --test test/mcp.test.ts",
+    "test:mcp": "npm run build && node --test test/mcp-schema.test.cjs && tsx --test test/mcp.test.ts",
     "test:plugin": "node --test test/plugin.test.cjs",
     "package:plugin": "node scripts/package-plugin.cjs",
     "vscode:prepublish": "npm run check && npm run build"

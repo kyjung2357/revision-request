@@ -149,10 +149,12 @@ test('bundled stdio adapter speaks real SDK protocol, validates tools and revoke
     const create = {path: 'source.tex', expectedHash: 'a'.repeat(64), clientRequestId: 'snippet-fixture', request: [{line: 1, before: 'old', after: 'new', reason: 'Reason'}]};
     assert.notEqual((await client.callTool({name: 'rr_create_request', arguments: create})).isError, true);
     assert.equal(creates, 1);
-    for (const entry of [{line: 2, before: null, after: ''}, {line: 1, before: 'old', after: null}]) {
+    for (const entry of [{line: 2, before: null, after: ''}, {line: 1, before: 'old', after: null},
+      {line: 1, before: 'old\nline', after: 'new\nblock'}, {line: 2, before: null, after: 'first\nsecond', reason: ''},
+      {line: 1, before: 'old\nline', after: null}, {line: 1, before: 'old\n', after: 'new'}]) {
       assert.notEqual((await client.callTool({name: 'rr_create_request', arguments: {...create, request: [entry]}})).isError, true);
     }
-    assert.equal(creates, 3);
+    assert.equal(creates, 7);
     for (const invalid of [
       {...create, request: [{...create.request[0], status: 'accepted'}]},
       {...create, request: [{...create.request[0], status: 'pending'}]},
@@ -160,17 +162,17 @@ test('bundled stdio adapter speaks real SDK protocol, validates tools and revoke
       {...create, request: [{before: 'old', after: 'new'}]},
       {...create, request: [{line: 0, before: 'old', after: 'new'}]},
       {...create, request: [{line: 1.5, before: 'old', after: 'new'}]},
-      {...create, request: [{line: 1, before: 'old\nline', after: 'new'}]},
-      {...create, request: [{line: 1, before: 'old\n', after: 'new'}]},
+      {...create, request: [{line: 1, before: 'old\rline', after: 'new'}]},
+      {...create, request: [{line: 1, before: 'old\r\nline', after: 'new'}]},
       {...create, request: [{line: 1, before: 'old', after: 'new\r\n'}]},
       {...create, request: [{line: 1, before: 'old', after: 'new\rline'}]},
       {...create, request: [{line: 1, before: null, after: null}]},
       {...create, after: 'legacy full file'},
       {...create, title: 'Legacy title'},
     ]) assert.equal((await client.callTool({name: 'rr_create_request', arguments: invalid})).isError, true);
-    assert.equal(creates, 3, 'Invalid line edits, status/time injection and unsupported fields never reach the host');
+    assert.equal(creates, 7, 'Invalid line edits, status/time injection and unsupported fields never reach the host');
     assert.equal((await client.callTool({name: 'rr_create_request', arguments: {path: 'source.tex', expectedHash: 'a'.repeat(64), clientRequestId: 'unsupported-shape', after: 'full replacement', title: 'Unsupported'}})).isError, true);
-    assert.equal(creates, 3);
+    assert.equal(creates, 7);
     const args = {requestId: 'fixture-id', revision: 'a'.repeat(64), hunkId: 'fixture-hunk'};
     assert.equal((await client.callTool({name: 'rr_decide', arguments: {...args, decision: 'accepted'}})).isError, true);
     assert.equal((await client.callTool({name: 'rr_undo', arguments: args})).isError, true);

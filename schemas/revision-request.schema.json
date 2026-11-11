@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/kyjung2357/revision-request/blob/main/schemas/revision-request.schema.json",
   "title": "Revision Request",
-  "description": "Line-based requests named <complete-original-filename>.rr. Opening or changing status metadata never applies a source edit.",
+  "description": "Atomic revision entries for text fragments or contiguous blocks, named <complete-original-filename>.rr. Opening or changing status metadata never applies a source edit.",
   "type": "object",
   "additionalProperties": true,
   "required": [
@@ -25,7 +25,7 @@
     "request": {
       "type": "array",
       "maxItems": 10000,
-      "description": "Each entry is one atomic review decision. Empty arrays have no pending requests.",
+      "description": "Each entry is one atomic review decision. Group related contiguous changes in one entry; independent changes may remain separate. Consumed original line ranges cannot overlap. Empty arrays have no pending requests.",
       "items": {
         "type": "object",
         "additionalProperties": true,
@@ -56,27 +56,27 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 9007199254740991,
-            "description": "1-based line in the original request baseline. Insertions occur before this line; original line count + 1 appends. Line numbers do not shift when other entries are accepted."
+            "description": "1-based first original line of the fragment or block. Insertions occur before this line; original line count + 1 appends. Numbers stay fixed after other entries are accepted."
           },
           "before": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Exact single-line fragment that occurs once in the indicated original line, or null to insert a complete new line. For deletion, provide the full original line content. No CR or LF.",
-            "pattern": "^[^\\r\\n]*$(?![\\s\\S])"
+            "description": "Exact fragment beginning in the indicated original line, with LF separators for consecutive lines, or null to insert. Match uniquely; intervening lines are complete. Deletion requires the complete original block. CR is not allowed.",
+            "pattern": "^[^\\r]*$(?![\\s\\S])"
           },
           "after": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Single-line replacement fragment, or null to delete the indicated original line. For insertion, provide the complete new line. Empty string is text/a blank line, not null. No CR or LF.",
-            "pattern": "^[^\\r\\n]*$(?![\\s\\S])"
+            "description": "Replacement text or LF-separated block, or null to delete the complete original block. Insertion supplies complete new lines. Empty string is text/a blank line. LF is logical; saved line endings are preserved. CR is not allowed.",
+            "pattern": "^[^\\r]*$(?![\\s\\S])"
           },
           "reason": {
             "type": "string",
-            "description": "Optional explanation for this entry; blank or absent disables Why. At most 50000 UTF-8 bytes."
+            "description": "Optional explanation; omit it or use an empty string when none is needed. Blank or absent keeps Why disabled with its label hidden. At most 50000 UTF-8 bytes."
           },
           "status": {
             "type": "string",
@@ -95,7 +95,7 @@
   "defaultSnippets": [
     {
       "label": "Revision Request",
-      "description": "Create a pending line change; creation time is filled automatically when reviewed.",
+      "description": "Create a pending fragment or block change; creation time is filled automatically when reviewed.",
       "body": {
         "path": "${1:src/main.py}",
         "request": [
@@ -103,7 +103,6 @@
             "line": 1,
             "before": "${2:original fragment}",
             "after": "${3:proposed fragment}",
-            "reason": "${4:explanation}",
             "status": "pending"
           }
         ]

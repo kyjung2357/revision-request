@@ -254,10 +254,14 @@ export class McpHost {
       if (Object.keys(item).some(key => !['line', 'before', 'after', 'reason'].includes(key))) {
         throw new McpBridgeError('INVALID_ARGUMENT', 'MCP proposal entries accept only line, before, after, and reason. The server sets status to pending.');
       }
-      return {line: item.line, before: item.before, after: item.after, reason: item.reason === undefined ? '' : item.reason, status: 'pending'};
+      return {line: item.line, before: item.before, after: item.after,
+        ...(item.reason === undefined ? {} : {reason: item.reason}), status: 'pending'};
     });
     const proposal = parseRequestDocument(JSON.stringify({path: filePath, request: entries}));
-    const inputHash = hash(JSON.stringify({path: filePath, expectedHash, request: proposal.request}));
+    // Keep existing retry hashes stable while preserving omitted reasons in JSON.
+    const normalizedEntries = proposal.request.map(entry => ({line: entry.line, before: entry.before, after: entry.after,
+      reason: entry.reason ?? '', status: entry.status}));
+    const inputHash = hash(JSON.stringify({path: filePath, expectedHash, request: normalizedEntries}));
     return this.service.runExclusive(async () => {
       this.workspace(folder.uri.toString());
       const retry = this.records().find(item => item.workspaceUri === folder.uri.toString() && item.clientRequestId === clientRequestId);

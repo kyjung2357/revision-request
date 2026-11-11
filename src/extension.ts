@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import { computeHunks, computeInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
-import { getReviewHtml } from './webview';
+import { getReviewHtml, getReviewRestoreErrorHtml } from './webview';
 import { parseRequestDocument, proposalIdentity, resolveRequest, patchRequestStatuses, editPendingRequest, ensureRequestTime, type RevisionRequest } from './request';
 import { McpHost } from './mcpHost';
 import { startMcpBridge } from './mcpBridge';
@@ -41,7 +41,7 @@ interface ReviewFile {
 export interface ReviewState {
   type: 'state'; revision: string; title: string; description?: string;
   requestName: string; files: ReviewFile[]; trusted: boolean; busy: boolean; unchangedOpacity: number;
-  highlightChangedLines: boolean; showOnlyChangedText: boolean; error?: string;
+  highlightChangedLines: boolean; showOnlyChangedText: boolean; defaultLayout: 'unified' | 'sideBySide'; error?: string;
   requestIdentity?: string; verified: boolean;
   verificationIssue?: string; verifiedTargetHash?: string; closed?: boolean;
 }
@@ -306,7 +306,8 @@ export class ReviewService implements vscode.Disposable {
       files: [], trusted: vscode.workspace.isTrusted, busy: this.busy, verified: false,
       unchangedOpacity: Math.max(0, Math.min(100, vscode.workspace.getConfiguration('revisionRequest', uri).get<number>('unchangedOpacity', 20))),
       highlightChangedLines: vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('highlightChangedLines', true),
-      showOnlyChangedText: vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('showOnlyChangedText', false)
+      showOnlyChangedText: vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('showOnlyChangedText', false),
+      defaultLayout: vscode.workspace.getConfiguration('revisionRequest', uri).get<unknown>('defaultLayout', 'unified') === 'sideBySide' ? 'sideBySide' : 'unified'
     };
     try {
       const raw = await this.readRequest(uri);
@@ -616,20 +617,72 @@ class SnapshotProvider implements vscode.TextDocumentContentProvider {
   }
 }
 
-class ReviewEditor implements vscode.Disposable {
+export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSerializer {
   readyCount = 0;
   activeUri: vscode.Uri | undefined;
   private sourceOnlyUri: string | undefined;
   private readonly seenSourceDocuments = new WeakSet<vscode.TextDocument>();
   private readonly panels = new Map<string, vscode.WebviewPanel>();
+  private readonly unboundPanels = new Set<vscode.WebviewPanel>();
   private readonly opening = new Map<string, Promise<void>>();
   constructor(private readonly context: vscode.ExtensionContext, private readonly service: ReviewService, private readonly snapshots: SnapshotProvider) {}
   dispose() {
     for (const panel of this.panels.values()) panel.dispose();
+    for (const panel of this.unboundPanels) panel.dispose();
+  }
+  private webviewOptions(): vscode.WebviewOptions {
+    return {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]};
+  }
+  async deserializeWebviewPanel(panel: vscode.WebviewPanel, state: unknown): Promise<void> {
+    let uri: vscode.Uri | undefined;
+    if (state && typeof state === 'object' && typeof (state as Record<string, unknown>).requestUri === 'string') {
+      try {
+        const candidate = vscode.Uri.parse((state as {requestUri: string}).requestUri, true);
+        const folder = vscode.workspace.getWorkspaceFolder(candidate);
+        if (candidate.scheme === 'file' && candidate.path.endsWith('.rr') && !candidate.query && !candidate.fragment &&
+            folder?.uri.scheme === 'file') uri = candidate;
+      } catch { /* Legacy or malformed state must never guess a request from its title. */ }
+    }
+    if (!uri) {
+      panel.webview.options = {enableScripts: false, localResourceRoots: []};
+      panel.webview.html = getReviewRestoreErrorHtml();
+      this.unboundPanels.add(panel);
+      if (panel.active) this.activeUri = undefined;
+      const viewListener = panel.onDidChangeViewState(event => {
+        if (event.webviewPanel.active) this.activeUri = undefined;
+      });
+      panel.onDidDispose(() => { this.unboundPanels.delete(panel); viewListener.dispose(); });
+      return;
+    }
+    const existing = this.panels.get(uri.toString());
+    if (existing && existing !== panel) {
+      if (panel.active) existing.reveal(panel.viewColumn, false);
+      panel.dispose();
+      return;
+    }
+    panel.title = path.basename(uri.fsPath) + ' — Preview';
+    panel.webview.options = this.webviewOptions();
+    this.panels.set(uri.toString(), panel);
+    if (panel.active) this.activeUri = uri;
+    this.connect(uri, panel);
+  }
+  private activeReviewPanel(): [string, vscode.WebviewPanel] | undefined {
+    if ([...this.unboundPanels].some(panel => panel.active)) return undefined;
+    return [...this.panels].find(([, panel]) => panel.active);
+  }
+  async toggleLayout(uri?: vscode.Uri): Promise<void> {
+    const active = this.activeReviewPanel();
+    if (!active || (uri && uri.scheme !== 'file' && uri.scheme !== 'webview-panel') ||
+        (uri?.scheme === 'file' && uri.toString() !== active[0])) return;
+    await active[1].webview.postMessage({type: 'toggleLayout'});
   }
   async openSource(uri?: vscode.Uri) {
-    const target = uri ?? this.activeUri;
+    // Editor-title commands receive VS Code's virtual panel resource. The
+    // active panel's bound request is the source, never that synthetic URI.
+    const activePanel = uri?.scheme === 'webview-panel' ? this.activeReviewPanel() : undefined;
+    const target = uri?.scheme === 'webview-panel' ? (activePanel ? vscode.Uri.parse(activePanel[0]) : undefined) : uri ?? this.activeUri;
     if (!target) return;
+    if (target.scheme !== 'file' || !target.path.endsWith('.rr')) throw new Error('Choose a local .rr request.');
     this.sourceOnlyUri = target.toString();
     await vscode.window.showTextDocument(target, {viewColumn: vscode.ViewColumn.Active, preserveFocus: false, preview: false});
   }
@@ -656,10 +709,17 @@ class ReviewEditor implements vscode.Disposable {
     // Auto-preview only the first activation of this opened document. Closing a
     // preview or returning to its JSON source must not open another preview.
     if (this.seenSourceDocuments.has(editor.document)) return;
-    this.seenSourceDocuments.add(editor.document);
-    if (this.sourceOnlyUri === uri.toString()) return;
+    if (this.sourceOnlyUri === uri.toString()) {
+      this.seenSourceDocuments.add(editor.document);
+      return;
+    }
     if (!vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('previewOnOpen', true)) return;
-    void this.openPreview(uri).catch(error => vscode.window.showErrorMessage(failure(error)));
+    this.seenSourceDocuments.add(editor.document);
+    void this.openPreview(uri).catch(error => {
+      // A failed opening did not consume this document's one automatic preview.
+      this.seenSourceDocuments.delete(editor.document);
+      void vscode.window.showErrorMessage(failure(error));
+    });
   }
   async openPreview(uri: vscode.Uri): Promise<void> {
     const key = uri.toString();
@@ -673,29 +733,72 @@ class ReviewEditor implements vscode.Disposable {
     if (uri.scheme !== 'file' || !uri.path.endsWith('.rr')) throw new Error('Choose a local .rr request.');
     this.activeUri = uri;
     this.sourceOnlyUri = undefined;
-    let panel = this.panels.get(uri.toString());
-    if (!panel) {
-      panel = vscode.window.createWebviewPanel(
-        VIEW, path.basename(uri.fsPath) + ' — Preview',
-        {viewColumn: vscode.ViewColumn.Active, preserveFocus: false},
-        {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]}
-      );
-      this.panels.set(uri.toString(), panel);
-      this.connect(uri, panel);
+    const key = uri.toString();
+    let panel = this.panels.get(key);
+    try {
+      if (!panel) {
+        panel = vscode.window.createWebviewPanel(
+          VIEW, path.basename(uri.fsPath) + ' — Preview',
+          {viewColumn: vscode.ViewColumn.Active, preserveFocus: false},
+          {...this.webviewOptions(), retainContextWhenHidden: true}
+        );
+        this.panels.set(key, panel);
+        this.connect(uri, panel);
+      }
+      panel.reveal(panel.viewColumn, false);
+    } catch (error) {
+      if (panel && this.panels.get(key) === panel) this.panels.delete(key);
+      panel?.dispose();
+      if (this.activeUri?.toString() === key) this.activeUri = undefined;
+      throw error;
     }
-    panel.reveal(panel.viewColumn, false);
+  }
+  private rememberSourceDocument(uri: vscode.Uri) {
+    for (const document of vscode.workspace.textDocuments) {
+      if (document.uri.toString() === uri.toString()) this.seenSourceDocuments.add(document);
+    }
   }
   private connect(uri: vscode.Uri, panel: vscode.WebviewPanel) {
+    this.rememberSourceDocument(uri);
     let generation = 0;
     let disposed = false;
     let actionError: string | undefined;
-    const update = async () => {
-      if (disposed) return;
-      const requested = ++generation;
-      const state = await this.service.getState(uri);
-      if (disposed || requested !== generation) return;
-      if (actionError) state.error = actionError;
-      await panel.webview.postMessage(state);
+    let refreshRequested = false;
+    let refreshTask: Promise<void> | undefined;
+    let notifiedBusy = false;
+    const update = (invalidate = true): Promise<void> => {
+      if (disposed) return Promise.resolve();
+      if (invalidate) ++generation;
+      if (this.service.busy) {
+        refreshRequested = true;
+        // Writes can emit several document and filesystem events. Keep the
+        // verified rows visible until the transaction has finished.
+        if (!notifiedBusy) {
+          notifiedBusy = true;
+          void panel.webview.postMessage({type: 'busy', busy: true});
+        }
+        return refreshTask ?? Promise.resolve();
+      }
+      if (refreshTask) {
+        if (invalidate) refreshRequested = true;
+        return refreshTask;
+      }
+      refreshRequested = true;
+      refreshTask = Promise.resolve().then(async () => {
+        try {
+          while (refreshRequested && !disposed && !this.service.busy) {
+            refreshRequested = false;
+            const requested = generation;
+            const state = await this.service.getState(uri);
+            if (disposed || this.service.busy || requested !== generation) continue;
+            this.rememberSourceDocument(uri);
+            if (actionError) state.error = actionError;
+            notifiedBusy = false;
+            await panel.webview.postMessage(state);
+          }
+        } finally { refreshTask = undefined; }
+      });
+      return refreshTask;
     };
     const disposables = [
       this.service.onDidChange(() => { void update(); }),
@@ -755,20 +858,24 @@ class ReviewEditor implements vscode.Disposable {
             success: completionSucceeded, error: actionError});
           actionError = undefined;
         }
-        await update();
+        // Actions join their final refresh; readiness and errors need a new delivery.
+        await update(message.type === 'ready' || actionError !== undefined);
         if (decisionResult?.completionPrompt && !disposed) {
           await panel.webview.postMessage({type: 'completionPrompt', ...decisionResult.completionPrompt});
         }
       })
     ];
     panel.onDidDispose(() => {
+      this.rememberSourceDocument(uri);
       disposed = true;
       ++generation;
-      if (this.activeUri?.toString() === uri.toString()) this.activeUri = undefined;
+      if (this.panels.get(uri.toString()) === panel) {
+        if (this.activeUri?.toString() === uri.toString()) this.activeUri = undefined;
+        this.panels.delete(uri.toString());
+      }
       disposables.forEach(item => item.dispose());
-      this.panels.delete(uri.toString());
     });
-    panel.webview.html = getReviewHtml(panel.webview, this.context.extensionUri);
+    panel.webview.html = getReviewHtml(panel.webview, this.context.extensionUri, uri);
     void update();
   }
 }
@@ -846,6 +953,7 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     service, tree, requests, targets, editor,
     {dispose: () => {disposed = true; bridge?.dispose();}},
+    vscode.window.registerWebviewPanelSerializer(VIEW, editor),
     vscode.window.onDidChangeActiveTextEditor(active => editor.autoPreview(active)),
     vscode.workspace.registerTextDocumentContentProvider('rr-snapshot', snapshots),
     vscode.window.createTreeView('revisionRequest.requests', {treeDataProvider: tree}),
@@ -857,7 +965,8 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('revisionRequest.unchangedOpacity') ||
           event.affectsConfiguration('revisionRequest.highlightChangedLines') ||
-          event.affectsConfiguration('revisionRequest.showOnlyChangedText')) service.changed();
+          event.affectsConfiguration('revisionRequest.showOnlyChangedText') ||
+          event.affectsConfiguration('revisionRequest.defaultLayout')) service.changed();
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {tree.refresh(); service.changed(); publishWorkspaces();}),
     vscode.commands.registerCommand('revisionRequest.copyMcpConfiguration', async () => {
@@ -894,6 +1003,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (target) await editor.openPreview(target);
     }),
     vscode.commands.registerCommand('revisionRequest.openSource', (uri?: vscode.Uri) => editor.openSource(uri)),
+    vscode.commands.registerCommand('revisionRequest.toggleLayout', (uri?: vscode.Uri) => editor.toggleLayout(uri)),
     vscode.commands.registerCommand('revisionRequest.openDiff', async (uri?: vscode.Uri) => {
       const active = vscode.window.activeTextEditor?.document.uri;
       const target = uri ?? (active?.path.endsWith('.rr') ? active : editor.activeUri);
@@ -912,6 +1022,7 @@ export async function activate(context: vscode.ExtensionContext) {
     ...(context.extensionMode === vscode.ExtensionMode.Test ? {
       testRunExclusive: <T>(action: () => Promise<T>) => service.runExclusive(action),
       testFailNextRequestWriteAfterSave: () => {failNextRequestWriteAfterSave = true;},
+      testRestorePreview: (panel: vscode.WebviewPanel, state: unknown) => editor.deserializeWebviewPanel(panel, state),
       resolveCompletion: (uri: vscode.Uri, completionId: string, revision: string, deleteRequest: boolean, rememberChoice: boolean) =>
         service.resolveCompletion(uri, completionId, revision, deleteRequest, rememberChoice),
       deleteRequest: (uri: vscode.Uri) => service.deleteRequest(uri),

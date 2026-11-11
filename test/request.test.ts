@@ -7,17 +7,19 @@ const entry = (line: number, before: string | null, after: string | null, status
 const request = (...entries: RequestEntry[]): RevisionRequest => ({path: 'src/sample.tex', request: entries});
 const raw = (doc: RevisionRequest) => JSON.stringify(doc, null, 2) + '\n';
 
-test('one unversioned format requires original line and newline-free fragments or null', () => {
+test('one unversioned format accepts LF-delimited blocks or null and rejects CR', () => {
   const doc = request(entry(2, '\\n', '\\geq', 'pending', 'Reason'));
   assert.deepEqual(parseRequestDocument(raw(doc)), doc);
   assert.deepEqual(parseRequestDocument('\uFEFF' + raw(doc)), doc);
   for (const line of [undefined, null, 0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => parseRequestDocument(JSON.stringify({path: 'x.tex', request: [{...doc.request[0], line}]})), /line/);
   }
-  for (const invalid of ['before\nafter', 'before\rafter', '\r\n']) {
-    assert.throws(() => parseRequestDocument(raw(request(entry(1, invalid, 'new')))), /single line/);
-    assert.throws(() => parseRequestDocument(raw(request(entry(1, 'old', invalid)))), /single line/);
+  for (const invalid of ['before\rafter', '\r\n']) {
+    assert.throws(() => parseRequestDocument(raw(request(entry(1, invalid, 'new')))), /LF.*CR/);
+    assert.throws(() => parseRequestDocument(raw(request(entry(1, 'old', invalid)))), /LF.*CR/);
   }
+  const multiline = request(entry(1, 'before\nsecond', 'after\nthird'));
+  assert.deepEqual(parseRequestDocument(raw(multiline)), multiline);
   assert.throws(() => parseRequestDocument(raw(request(entry(1, null, null)))), /both/);
   assert.throws(() => parseRequestDocument('{'), /Invalid .rr JSON/);
   assert.throws(() => parseRequestDocument('null'), /object/);
@@ -96,11 +98,13 @@ test('nonterminated EOF additions preserve exact physical separators and display
   }
   assert.throws(() => resolveRequest(request(entry(1, 'old', null), entry(2, null, 'B')), baseline), /Replace the final line/);
 });
-test('blank append and emptied final line reconstruct only after exact forward verification', () => {
+test('blank append bootstraps while an emptied final line requires the exact saved baseline', () => {
   const append = request(entry(2, null, '', 'accepted'));
   assert.equal(resolveRequest(append, 'A\n').baseline, 'A');
   const empty = request(entry(2, 'B', '', 'accepted'));
-  assert.equal(resolveRequest(empty, 'A\n').baseline, 'A\nB');
+  assert.throws(() => resolveRequest(empty, 'A\n'), /saved baseline/);
+  assert.equal(resolveRequest(empty, 'A\n', 'A\nB').expectedTarget, 'A\n');
+  assert.equal(resolveRequest(request(entry(2, 'B', '')), 'A\n', 'A\nB').expectedTarget, 'A\nB');
 });
 test('empty-file additions infer LF, fixed BOM stays outside every editable line', () => {
   assert.equal(resolveRequest(request(entry(1, null, 'A'), entry(1, null, 'B')), '').file.after, 'A\nB\n');
@@ -130,17 +134,19 @@ test('surgical status and timestamp writes preserve raw JSON metadata and format
   assert.equal(ensureRequestTime(stamped, 'unused'), stamped);
   assert.equal(proposalIdentity(parseRequestDocument(stamped)), proposalIdentity(parseRequestDocument(text)));
 });
-test('inline editing stores minimal fragments, preserves decisions and rejects multiline drafts', () => {
+test('inline editing stores minimal fragments and supports exact multiline drafts', () => {
   const baseline = 'old one\r\nold two\r\nold three';
   const doc = request(entry(1, 'old', 'new', 'accepted'), entry(2, 'old', 'new'), entry(3, 'old', 'new', 'ignored'));
   const review = resolveRequest(doc, baseline, baseline), selected = review.hunks[1]!;
-  const result = editPendingRequest(raw(doc), baseline, selected.id, 'edited two\n');
+  const result = editPendingRequest(raw(doc), baseline, selected.id, 'edited two');
   assert.deepEqual(result.request.request[1], entry(2, 'ol', 'edite'));
   assert.equal(result.review.expectedTarget, review.expectedTarget);
   assert.equal(result.review.file.after, 'new one\r\nedited two\r\nnew three');
-  assert.throws(() => editPendingRequest(raw(doc), baseline, selected.id, 'one\ntwo\n'), /one line/);
+  const multiline = editPendingRequest(raw(doc), baseline, selected.id, 'one\ntwo');
+  assert.equal(multiline.review.file.after, 'new one\r\none\r\ntwo\r\nnew three');
+  assert.equal(multiline.review.expectedTarget, review.expectedTarget);
   assert.throws(() => editPendingRequest(raw(doc), baseline, review.hunks[0]!.id, 'no\n'), /Only pending/);
-  assert.equal(editPendingRequest(raw(doc), baseline, selected.id, 'new two\n').text, raw(doc));
+  assert.equal(editPendingRequest(raw(doc), baseline, selected.id, 'new two').text, raw(doc));
 });
 test('restoring a pending line removes only that entry; append editing keeps separator physical', () => {
   const baseline = 'one\nlast';
@@ -169,4 +175,160 @@ test('partial approvals commute for independent entries including repeated inser
       assert.equal(current, expected);
     }
   }
+});
+
+
+test('multiline replacement anchors its boundary fragments on the specified consecutive original lines', () => {
+  const baseline = '\uFEFFprefix old\r\nmiddle\rlast suffix\nuntouched\r\n';
+  const doc = request(entry(1, 'old\nmiddle\nlast', 'NEW\nCENTER\nEND'));
+  const review = resolveRequest(doc, baseline);
+  assert.equal(review.file.after, '\uFEFFprefix NEW\r\nCENTER\rEND suffix\nuntouched\r\n');
+  assert.equal(review.hunks.length, 1); assert.equal(review.hunks[0]!.oldLines, 3);
+  assert.equal(review.hunks[0]!.draftAfter, 'prefix NEW\nCENTER\nEND suffix');
+  assert.equal(review.hunks[0]!.before, 'prefix old\r\nmiddle\rlast suffix\n');
+  assert.equal(review.hunks[0]!.start, 1);
+  assert.throws(() => resolveRequest(request(entry(2, 'old\nmiddle\nlast', 'new')), baseline), /exactly once/);
+  assert.throws(() => resolveRequest(request(entry(3, 'last\nuntouched\nmissing', 'new')), baseline), /existing original/);
+  const decided = {...doc, request: doc.request.map(item => ({...item, status: 'accepted' as const}))};
+  assert.throws(() => resolveRequest(decided, review.file.after), /saved baseline/);
+  assert.equal(resolveRequest(decided, review.file.after, baseline).baseline, baseline);
+});
+
+test('multiline deletion requires complete lines and consumes their exact physical endings', () => {
+  const baseline = 'keep\r\nremove one\rremove two\nlast';
+  const doc = request(entry(2, 'remove one\nremove two', null));
+  const review = resolveRequest(doc, baseline);
+  assert.equal(review.file.after, 'keep\r\nlast');
+  assert.equal(review.hunks[0]!.oldLines, 2); assert.equal(review.hunks[0]!.newLines, 0);
+  assert.throws(() => resolveRequest(request(entry(2, 'one\nremove two', null)), baseline), /complete original/);
+  assert.throws(() => resolveRequest(request(entry(2, 'remove one\ntwo', null)), baseline), /complete original/);
+});
+
+test('overlapping consumed blocks and interior insertions are rejected, outer boundaries are independent', () => {
+  const baseline = 'a\nb\nc\nd\n';
+  for (const doc of [
+    request(entry(2, 'b\nc', 'B\nC'), entry(3, 'c', 'C')),
+    request(entry(2, 'b\nc', null), entry(1, 'a\nb', 'A\nB')),
+    request(entry(2, 'b\nc', 'B\nC'), entry(3, null, 'inside')),
+  ]) assert.throws(() => resolveRequest(doc, baseline), /overlap/);
+  const doc = request(entry(2, 'b\nc', 'B\nC'), entry(2, null, 'before\nblock'), entry(4, null, 'after\nblock'));
+  for (let mask = 0; mask < 8; mask++) {
+    const decided = {...doc, request: doc.request.map((item, index) => ({...item, status: mask & (1 << index) ? 'accepted' as const : 'ignored' as const}))};
+    const expected = 'a\n' + (mask & 2 ? 'before\nblock\n' : '') + (mask & 1 ? 'B\nC\n' : 'b\nc\n') + (mask & 4 ? 'after\nblock\n' : '') + 'd\n';
+    const review = resolveRequest(decided, expected, baseline);
+    assert.equal(review.expectedTarget, expected);
+    if (mask & 1) assert.throws(() => resolveRequest(decided, expected), /saved baseline/);
+    else assert.equal(resolveRequest(decided, expected).baseline, baseline);
+  }
+});
+
+test('multiline insertion keeps duplicate blocks independent and bootstraps nonterminated EOF exactly', () => {
+  const baseline = '\uFEFFkeep\r\nlast';
+  const doc = request(entry(3, null, 'paragraph\n\nequation'), entry(3, null, 'paragraph\n\nequation'));
+  const review = resolveRequest(doc, baseline);
+  assert.equal(new Set(review.hunks.map(item => item.id)).size, 2);
+  assert.equal(review.hunks[0]!.displayAfter, 'paragraph\r\n\r\nequation');
+  assert.equal(review.hunks[0]!.draftAfter, 'paragraph\n\nequation');
+  for (let mask = 0; mask < 4; mask++) {
+    const decided = {...doc, request: doc.request.map((item, index) => ({...item, status: mask & (1 << index) ? 'accepted' as const : 'ignored' as const}))};
+    const expected = baseline + (mask & 1 ? '\r\nparagraph\r\n\r\nequation' : '') + (mask & 2 ? '\r\nparagraph\r\n\r\nequation' : '');
+    assert.equal(resolveRequest(decided, expected, baseline).expectedTarget, expected);
+    assert.equal(resolveRequest(decided, expected).baseline, baseline);
+  }
+});
+
+test('multiline decisions and Undo preserve exact bytes across independent decision orders and cached reopen', () => {
+  const baseline = '\uFEFFfirst\r\nsecond\rkeep\nlast';
+  const doc = request(entry(1, 'first\nsecond', 'FIRST\nSECOND\nADDED'), entry(4, 'last', 'LAST'), entry(5, null, 'tail\nend'));
+  for (const order of [[0, 1, 2], [2, 1, 0]]) {
+    const decided = structuredClone(doc);
+    let current = baseline;
+    for (const index of order) {
+      decided.request[index]!.status = 'accepted';
+      const review = resolveRequest(decided, current, baseline);
+      current = review.expectedTarget;
+      assert.equal(resolveRequest(parseRequestDocument(raw(decided)), current, baseline).expectedTarget, current);
+    }
+    assert.equal(current, '\uFEFFFIRST\r\nSECOND\rADDED\rkeep\nLAST\ntail\nend');
+    assert.throws(() => resolveRequest(decided, current), /saved baseline/);
+    for (const index of order.reverse()) {
+      decided.request[index]!.status = 'pending';
+      current = resolveRequest(decided, current, baseline).expectedTarget;
+    }
+    assert.equal(current, baseline);
+  }
+});
+
+test('exact block drafts preserve intentional trailing blank lines and only rewrite the selected entry', () => {
+  const baseline = 'old first\r\nold second\r\nkeep';
+  const doc = request(entry(1, 'old first\nold second', 'new first\nnew second'), entry(3, 'keep', 'KEEP', 'accepted'));
+  const review = resolveRequest(doc, baseline, baseline);
+  const changed = editPendingRequest(raw(doc), baseline, review.hunks[0]!.id, 'revised\nblock\n');
+  assert.equal(changed.review.hunks[0]!.draftAfter, 'revised\nblock\n');
+  assert.equal(changed.review.file.after, 'revised\r\nblock\r\n\r\nKEEP');
+  assert.equal(changed.review.expectedTarget, review.expectedTarget);
+  assert.deepEqual(changed.request.request[1], doc.request[1]);
+  assert.equal(editPendingRequest(changed.text, baseline, changed.review.hunks[0]!.id, 'revised\nblock\n').changed, false);
+  const removed = editPendingRequest(raw(doc), baseline, review.hunks[0]!.id, 'old first\nold second');
+  assert.deepEqual(removed.request.request, [doc.request[1]]);
+  const eof = resolveRequest(request(entry(1, 'old', 'new\n')), 'old');
+  assert.equal(eof.file.after, 'new\n'); assert.equal(eof.hunks[0]!.draftAfter, 'new\n');
+});
+
+test('multiline reasons may be omitted or empty without affecting application', () => {
+  for (const reason of [undefined, '']) {
+    const doc = parseRequestDocument(raw(request(entry(1, 'one\ntwo', 'ONE\nTWO', 'pending', reason))));
+    assert.equal(resolveRequest(doc, 'one\ntwo\n').file.after, 'ONE\nTWO\n');
+    assert.equal(doc.request[0]!.reason, reason);
+  }
+});
+
+
+test('ambiguous accepted multiline imports require the saved baseline instead of inventing Undo text', () => {
+  const baseline = 'middle\rlast\ntail';
+  const unsafe = request(entry(1, 'middle\nlast', '\n'));
+  const acceptedUnsafe = {...unsafe, request: unsafe.request.map(item => ({...item, status: 'accepted' as const}))};
+  assert.throws(() => resolveRequest(acceptedUnsafe, '\r\ntail'), /saved baseline/);
+  assert.throws(() => resolveRequest(unsafe, baseline), /merge separate CR and LF/);
+  assert.throws(() => resolveRequest(acceptedUnsafe, '\r\ntail', baseline), /merge separate CR and LF/);
+  const valid = request(entry(1, 'middle\nlast', 'MIDDLE\nLAST'));
+  const target = resolveRequest(valid, baseline).file.after;
+  assert.equal(target, 'MIDDLE\rLAST\ntail');
+  const accepted = {...valid, request: valid.request.map(item => ({...item, status: 'accepted' as const}))};
+  assert.throws(() => resolveRequest(accepted, target), /saved baseline/);
+  assert.equal(resolveRequest(accepted, target, baseline).expectedTarget, target);
+  assert.equal(resolveRequest(valid, target, baseline).expectedTarget, baseline, 'Cached Undo restores exact original bytes');
+});
+
+test('logical separators cannot collapse across context, deletions, or independent decision subsets', () => {
+  for (const [baseline, entries] of [
+    ['a\rb\nc', [entry(2, 'b', '')]],
+    ['a\rb\n\nc', [entry(2, 'b', null)]],
+    ['a\rb\nc\n\nd', [entry(2, 'b', null), entry(3, 'c', null)]],
+    ['a\rb\nc', [entry(1, 'a', null), entry(2, 'b', '')]],
+  ] as [string, ReturnType<typeof entry>[]][]) {
+    assert.throws(() => resolveRequest(request(...entries), baseline), /merge separate CR and LF/);
+  }
+  const baseline = 'a\rb';
+  const doc = request(entry(2, null, 'first\n'), entry(2, null, '\nsecond'));
+  for (let mask = 0; mask < 4; mask++) {
+    const decided = {...doc, request: doc.request.map((item, index) => ({...item, status: mask & (1 << index) ? 'accepted' as const : 'ignored' as const}))};
+    const expected = 'a\r' + (mask & 1 ? 'first\r\r' : '') + (mask & 2 ? '\rsecond\r' : '') + 'b';
+    assert.equal(resolveRequest(decided, expected, baseline).expectedTarget, expected);
+    assert.equal(resolveRequest(decided, expected).baseline, baseline);
+  }
+});
+
+
+test('ambiguous accepted empty replacements require the saved baseline without changing blank insertions', () => {
+  const accepted = request(entry(2, 'word', '', 'accepted'));
+  const target = 'left\r\n';
+  assert.throws(() => resolveRequest(accepted, target), /saved baseline/);
+  assert.throws(() => resolveRequest(accepted, target, 'left\rword\n'), /merge separate CR and LF/);
+  const baseline = 'left\r\nword';
+  const resolved = resolveRequest(accepted, target, baseline);
+  assert.equal(resolved.baseline, baseline);
+  assert.equal(resolved.expectedTarget, target);
+  assert.equal(resolveRequest(request(entry(2, 'word', '')), target, baseline).expectedTarget, baseline);
+  assert.equal(resolveRequest(request(entry(2, null, '', 'accepted')), 'left\n').baseline, 'left');
 });

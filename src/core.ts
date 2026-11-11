@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { diffArrays, diffChars } from 'diff';
+import { diffArrays } from 'diff';
 
 /** A review decision never changes the proposal's base snapshot. */
 export type Decision = 'pending' | 'accepted' | 'ignored';
@@ -32,6 +32,8 @@ export interface Hunk {
   after: string;
   /** Display-only line text when a physical append includes its preceding separator. */
   displayAfter?: string;
+  /** Exact editable logical block, excluding only its physical final line ending. */
+  draftAfter?: string;
   /** One-based line positions. A pure insertion/deletion may have zero lines. */
   oldStart: number;
   oldLines: number;
@@ -142,8 +144,8 @@ export interface InlineChangeLine {
 }
 
 /**
- * Zip the displayed old/new lines and mark Unicode code-point edits within each
- * pair. This is presentation metadata only; it never changes hunk boundaries.
+ * Zip the displayed old/new lines and mark whole whitespace-delimited words.
+ * This is presentation metadata only; it never changes hunk boundaries.
  * Large or costly comparisons conservatively mark the entire paired line.
  */
 export function computeInlineChanges(
@@ -167,16 +169,57 @@ export function computeInlineChanges(
       result.push({before: whole(before, true), after: whole(after, true)});
       continue;
     }
-    const parts = diffChars(before, after, {timeout: Math.min(20, remaining), maxEditLength: 512});
+    // Match words independently of their separators so repeated spaces cannot
+    // displace an exact word match. Retain source offsets for exact projection.
+    const beforeWords = [...before.matchAll(/\S+/gu)];
+    const afterWords = [...after.matchAll(/\S+/gu)];
+    const parts = diffArrays(beforeWords.map(word => word[0]), afterWords.map(word => word[0]),
+      {timeout: Math.min(20, remaining), maxEditLength: 512});
     if (!parts) {
       result.push({before: whole(before, true), after: whole(after, true)});
       continue;
     }
     const pair: InlineChangeLine = {before: [], after: []};
+    const append = (segments: InlineSegment[], text: string, changed: boolean) => {
+      if (!text) return;
+      const previous = segments[segments.length - 1];
+      if (previous?.changed === changed) previous.text += text;
+      else segments.push({text, changed});
+    };
+    const appendGap = (oldText: string, newText: string) => {
+      // Only shared boundary whitespace stays normal. Whitespace inside a
+      // consecutive block of changed words belongs to the changed highlight.
+      let start = 0;
+      while (start < oldText.length && start < newText.length &&
+        oldText[start] === newText[start] && /\s/u.test(oldText[start]!)) start++;
+      let end = 0;
+      while (end < oldText.length - start && end < newText.length - start &&
+        oldText[oldText.length - end - 1] === newText[newText.length - end - 1] &&
+        /\s/u.test(oldText[oldText.length - end - 1]!)) end++;
+      for (const [segments, text] of [[pair.before, oldText], [pair.after, newText]] as const) {
+        append(segments, text.slice(0, start), false);
+        append(segments, text.slice(start, text.length - end), true);
+        append(segments, text.slice(text.length - end), false);
+      }
+    };
+    let oldWord = 0;
+    let newWord = 0;
+    let oldEnd = 0;
+    let newEnd = 0;
     for (const part of parts) {
-      if (!part.added) pair.before.push({text: part.value, changed: !!part.removed});
-      if (!part.removed) pair.after.push({text: part.value, changed: !!part.added});
+      if (part.removed) oldWord += part.value.length;
+      else if (part.added) newWord += part.value.length;
+      else for (const text of part.value) {
+        const oldMatch = beforeWords[oldWord++]!;
+        const newMatch = afterWords[newWord++]!;
+        appendGap(before.slice(oldEnd, oldMatch.index), after.slice(newEnd, newMatch.index));
+        append(pair.before, text, false);
+        append(pair.after, text, false);
+        oldEnd = oldMatch.index + text.length;
+        newEnd = newMatch.index + text.length;
+      }
     }
+    appendGap(before.slice(oldEnd), after.slice(newEnd));
     result.push(pair);
   }
   return result;

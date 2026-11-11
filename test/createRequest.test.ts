@@ -7,18 +7,20 @@ function verify(before: string, after: string) {
   const request = createRequestFromSnapshots('sample.tex', before, after, options);
   assert.deepEqual(Object.keys(request), ['path', 'time', 'request']);
   assert.ok(request.request.every(entry => entry.status === 'pending' && Number.isInteger(entry.line) && entry.line > 0));
-  assert.ok(request.request.every(entry => [entry.before, entry.after].every(text => text === null || !/[\r\n]/.test(text))));
+  assert.ok(request.request.every(entry => [entry.before, entry.after].every(text => text === null || !/\r/.test(text))));
   const review = resolveRequest(request, before); assert.equal(review.file.after, after); assert.equal(review.expectedTarget, before);
   const accepted = {...request, request: request.request.map(entry => ({...entry, status: 'accepted' as const}))};
   assert.equal(resolveRequest(accepted, after, before).expectedTarget, after);
-  if (!request.request.some(entry => entry.after === null)) assert.equal(resolveRequest(accepted, after).baseline, before);
+  if (!request.request.some(entry => entry.after === null || (entry.before !== null && (entry.before.includes('\n') || entry.after!.includes('\n'))))) {
+    assert.equal(resolveRequest(accepted, after).baseline, before);
+  }
   assert.deepEqual(parseRequestDocument(JSON.stringify(request)), request);
   return request;
 }
 test('generator emits line numbers and changed fragments instead of whole surrounding lines', () => {
   const result = verify('Let x > 0.\nkeep\ncoefficient = 2;\n', 'Let x >= 0.\nkeep\ncoefficient = 1;\n');
   assert.deepEqual(result.request.map(({line, before, after}) => ({line, before, after})), [{line: 1, before: '>', after: '>='}, {line: 3, before: '2', after: '1'}]);
-  assert.deepEqual(Object.keys(result.request[0]!), ['line', 'before', 'after', 'reason', 'status']);
+  assert.deepEqual(Object.keys(result.request[0]!), ['line', 'before', 'after', 'status']);
 });
 test('same-line changes combine the minimal spanning fragment with enough unique context', () => {
   const result = verify('prefix a + b suffix\n', 'prefix A + B suffix\n');
@@ -27,9 +29,9 @@ test('same-line changes combine the minimal spanning fragment with enough unique
 });
 test('line additions and deletions use null and original coordinates including append', () => {
   const added = verify('start\nend\n', 'start\nnew one\nnew two\nend\n');
-  assert.deepEqual(added.request.map(({line, before, after}) => ({line, before, after})), [{line: 2, before: null, after: 'new one'}, {line: 2, before: null, after: 'new two'}]);
+  assert.deepEqual(added.request.map(({line, before, after}) => ({line, before, after})), [{line: 2, before: null, after: 'new one\nnew two'}]);
   const deleted = verify('start\nobsolete\nend\n', 'start\nend\n');
-  assert.deepEqual(deleted.request[0], {line: 2, before: 'obsolete', after: null, reason: '', status: 'pending'});
+  assert.deepEqual(deleted.request[0], {line: 2, before: 'obsolete', after: null, status: 'pending'});
   verify('first', 'first\nsecond\nthird');
 });
 test('BOM, mixed existing endings, blank lines and nonterminated EOF remain byte exact', () => {
@@ -73,4 +75,55 @@ test('seeded generated changes preserve all and partial projections in both deci
     }
     assert.equal(forward, reverse);
   }
+});
+
+
+test('contiguous paragraph and equation changes produce one atomic LF-delimited entry', () => {
+  const before = 'heading\nold paragraph\nold equation\ntail\n';
+  const after = 'heading\nnew paragraph\nnew equation\nextra detail\ntail\n';
+  const doc = verify(before, after);
+  assert.equal(doc.request.length, 1);
+  assert.equal(doc.request[0]!.line, 2);
+  assert.ok(doc.request[0]!.before!.includes('\n'));
+  assert.ok(doc.request[0]!.after!.includes('\n'));
+  const review = resolveRequest(doc, before);
+  assert.equal(review.hunks.length, 1);
+  assert.equal(review.hunks[0]!.oldLines, 2); assert.equal(review.hunks[0]!.newLines, 3);
+  const deletion = verify('first\nremove one\nremove two\nlast\n', 'first\nlast\n');
+  assert.deepEqual(deletion.request.map(({line, before, after}) => ({line, before, after})),
+    [{line: 2, before: 'remove one\nremove two', after: null}]);
+});
+
+test('multiline generation preserves BOM, mixed original separators and unterminated EOF', () => {
+  const sameCount = verify('\uFEFFkeep\r\nleft old\rmiddle old\nright old', '\uFEFFkeep\r\nleft new\rmiddle new\nright new');
+  assert.equal(sameCount.request.length, 1);
+  assert.equal(sameCount.request[0]!.line, 2);
+  const grown = verify('keep\r\nold', 'keep\r\nnew\r\nsecond');
+  assert.equal(grown.request.length, 1);
+  assert.equal(grown.request[0]!.before, 'ol');
+  assert.equal(grown.request[0]!.after, 'new\nsecon');
+  const append = verify('keep\r\nlast', 'keep\r\nlast\r\nparagraph\r\n\r\nequation');
+  assert.equal(append.request.length, 1);
+  assert.equal(append.request[0]!.after, 'paragraph\n\nequation');
+});
+
+
+test('explicitly different reasons keep adjacent changes independently reviewable', () => {
+  const doc = createRequestFromSnapshots('sample.tex', 'first\nsecond\nthird\n', 'FIRST\nSECOND\nTHIRD\n',
+    {...options, explanations: [{line: 1, text: 'First reason'}, {line: 2, text: 'Other reason'}, {line: 3, text: 'Other reason'}]});
+  assert.equal(doc.request.length, 2);
+  assert.deepEqual(doc.request.map(item => [item.line, item.reason]), [[1, 'First reason'], [2, 'Other reason']]);
+  assert.ok(doc.request[1]!.before!.includes('\n'));
+  assert.equal(resolveRequest(doc, 'first\nsecond\nthird\n').file.after, 'FIRST\nSECOND\nTHIRD\n');
+});
+
+
+test('generator omits unsupplied reasons and preserves explicit empty reasons', () => {
+  const before = 'old first\nold second\n', after = 'new first\nnew second\n';
+  const omitted = createRequestFromSnapshots('sample.tex', before, after, options);
+  assert.equal(omitted.request.length, 1); assert.equal(Object.hasOwn(omitted.request[0]!, 'reason'), false);
+  const explicit = createRequestFromSnapshots('sample.tex', before, after, {...options, reason: ''});
+  assert.equal(Object.hasOwn(explicit.request[0]!, 'reason'), true); assert.equal(explicit.request[0]!.reason, '');
+  const local = createRequestFromSnapshots('sample.tex', before, after, {...options, explanations: [{line: 1, text: ''}]});
+  assert.equal(Object.hasOwn(local.request[0]!, 'reason'), true); assert.equal(local.request[0]!.reason, '');
 });

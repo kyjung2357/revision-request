@@ -16,10 +16,19 @@
   let completion = null;
   let splitRatio = typeof restored.splitRatio === 'number' && Number.isFinite(restored.splitRatio) ? Math.max(0.05, Math.min(0.95, restored.splitRatio)) : 0.5;
   let splitDrag = null;
+  let layout = restored.layout === 'unified' || restored.layout === 'sideBySide' ? restored.layout : null;
+  let pendingLayoutToggle = false;
   let state = null;
   let awaitingDecision = false;
+  let decisionFocus = null;
+  let viewport = restored.viewport && Number.isFinite(restored.viewport.top) ? restored.viewport : {top: 0};
+  let viewRows = [];
+  let overview = null;
+  let scrollFrame = 0;
+  let fontMetricKey = null;
+  let contextRowCache = {path: null, before: null, rows: new Map()};
 
-  function saveViewState() { vscode.setState({ openWhy, splitRatio, dismissedErrors: [...dismissedErrors], editing: editing ? { ...editing, saving: false, editId: null } : null }); }
+  function saveViewState() { vscode.setState({ requestUri: root.dataset.requestUri || restored.requestUri, openWhy, splitRatio, ...(layout ? {layout} : {}), viewport, dismissedErrors: [...dismissedErrors], editing: editing ? { ...editing, saving: false, editId: null } : null }); }
   function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -45,7 +54,7 @@
     dismissedErrors.clear();
     if (message.type === 'decideFile' || message.hunkId === openWhy) openWhy = null;
     saveViewState();
-    render();
+    lockReviewControls();
     post(message);
   }
   function decisionOf(hunk) {
@@ -89,7 +98,13 @@
         && inlineChanges.every(segment => segment && typeof segment.text === 'string' && typeof segment.changed === 'boolean')
         && inlineChanges.map(segment => segment.text).join('') === content;
       const segments = valid ? inlineChanges : [{ text: content, changed: true }];
-      for (const segment of segments) code.append(element('span', segment.changed ? 'inline-changed' : 'inline-common', segment.text));
+      for (const segment of segments) {
+        const span = element('span', segment.changed ? 'inline-changed' : 'inline-common');
+        // Keep glyph painting independent of the highlight's fractional padding.
+        if (segment.changed) span.append(element('span', 'inline-glyph', segment.text));
+        else span.textContent = segment.text;
+        code.append(span);
+      }
       if (!content) code.append(document.createTextNode('\u200b'));
     } else code.textContent = content || '\u200b';
     source.append(code);
@@ -130,6 +145,7 @@
     }, { disabled: !hasExplanation || Boolean(editing), key: key + ':why', hunk: hunk.id,
       label: 'Why change ' + (hunk.index + 1),
       title: hasExplanation ? 'Show the explanation for this change' : 'No explanation provided' });
+    if (!hasExplanation) { why.classList.add('why-unavailable'); why.setAttribute('aria-hidden', 'true'); }
     why.dataset.whyId = hunk.id;
     why.setAttribute('aria-expanded', String(hasExplanation && openWhy === hunk.id));
     why.setAttribute('aria-controls', 'rr-explanation');
@@ -146,6 +162,7 @@
     editing.draft = textarea.value;
     editing.selectionStart = textarea.selectionStart;
     editing.selectionEnd = textarea.selectionEnd;
+    editing.selectionDirection = textarea.selectionDirection;
     editing.scrollTop = textarea.scrollTop;
     editing.scrollLeft = textarea.scrollLeft;
   }
@@ -154,16 +171,36 @@
     const file = state.files.find(item => item.path === editing.filePath);
     return !file || !file.hunks.some(hunk => hunk.id === editing.hunkId && decisionOf(hunk) === 'pending');
   }
-  function openEditor(file, hunk, rowIndex, columnOffset = 0) {
+  function openEditor(file, hunk, rowIndex, columnOffset = 0, directInput = null) {
     if (editing) { root.querySelector('.pending-editor textarea')?.focus({ preventScroll: true }); return; }
     if (!state || state.busy || awaitingDecision || !state.trusted || decisionOf(hunk) !== 'pending') return;
-    const draft = hunk.after.replace(/\r\n|\r/g, '\n');
+    const draft = hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g, '\n').replace(/\n$/, '');
     const offset = draft.split('\n').slice(0, rowIndex).reduce((sum, line) => sum + line.length + 1, 0) + columnOffset;
     openWhy = null;
     editing = { filePath: file.path, hunkId: hunk.id, revision: state.revision, draft,
+      hadProposedLine: hunk.newLines > 0, rightStart: Number(directInput?.closest('.code-side').dataset.proposedLine) || hunk.oldStart,
       index: hunk.index, oldStart: hunk.oldStart, original: hunk.before, anchorIndex: rowIndex,
       selectionStart: Math.min(offset, draft.length), selectionEnd: Math.min(offset, draft.length),
       scrollTop: 0, scrollLeft: 0, saving: false, editId: null, error: null };
+    if (directInput) {
+      // Keep the native textarea and browser selection alive on the first click.
+      const cell = directInput.closest('.code-side');
+      cell.classList.add('pending-editor');
+      cell.setAttribute('aria-label', 'Edit proposed change ' + (hunk.index + 1));
+      cell.closest('.hunk').classList.add('hunk-editing');
+      cell.closest('.diff-row').classList.add('editing-row');
+      directInput.dataset.focusKey = 'edit:draft';
+      root.querySelector('.why-popover')?.remove();
+      cell.querySelector('.action-gutter').replaceChildren(editorActions());
+      for (const control of root.querySelectorAll('.inline-actions button,.file-actions button')) {
+        if (!control.dataset.focusKey?.startsWith('edit:')) control.disabled = true;
+      }
+      for (const input of root.querySelectorAll('.direct-editor-input')) {
+        if (input !== directInput) input.readOnly = true;
+      }
+      captureEditor(); saveViewState(); sizeEditor();
+      return;
+    }
     saveViewState(); render();
     root.querySelector('.pending-editor textarea')?.focus({ preventScroll: true });
   }
@@ -184,60 +221,88 @@
       draft: editing.draft, revision: editing.revision, editId: editing.editId };
     render(); post(message);
   }
+  function editorActions() {
+    const actions = element('div', 'inline-actions pending-editor-actions');
+    actions.addEventListener('keydown', event => {
+      if (event.isComposing) return;
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelEditor(); }
+      else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); submitEditor(); }
+    });
+    actions.append(button(editing.saving ? 'Saving…' : 'Save', 'button button-accept button-inline', submitEditor,
+      {key: 'edit:save', disabled: editing.saving || state.busy || !state.trusted || staleEditor(), title: 'Save the proposal to the .rr request (Ctrl/Cmd+Enter)'}),
+      button('Cancel', 'button button-secondary button-inline', cancelEditor, {key: 'edit:cancel', disabled: editing.saving}));
+    return actions;
+  }
+  function editorInput(value, hunkId, index) {
+    const textarea = element('textarea', 'pending-editor-textarea');
+    textarea.value = value; textarea.wrap = 'soft'; textarea.spellcheck = false; textarea.rows = 1;
+    textarea.dataset.hunk = hunkId;
+    textarea.setAttribute('aria-label', 'Proposed text for change ' + (index + 1));
+    textarea.setAttribute('autocapitalize', 'off'); textarea.setAttribute('autocomplete', 'off');
+    for (const event of ['input', 'select', 'click', 'keyup', 'scroll']) textarea.addEventListener(event, () => {
+      if (!editing || editing.hunkId !== hunkId) return;
+      captureEditor(); saveViewState();
+      if (event === 'input') sizeEditor();
+    });
+    textarea.addEventListener('keydown', event => {
+      if (!editing || editing.hunkId !== hunkId || event.isComposing) return;
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelEditor(); }
+      else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); submitEditor(); }
+      else if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && !textarea.readOnly) {
+        event.preventDefault(); textarea.setRangeText('\t', textarea.selectionStart, textarea.selectionEnd, 'end');
+        captureEditor(); saveViewState(); sizeEditor();
+      }
+    });
+    return textarea;
+  }
   function sizeEditor() {
     const textarea = root.querySelector('.pending-editor textarea');
     if (!textarea) return;
-    // Grow within the normal document flow; the paired original stretches with it.
-    const scroll = root.querySelector('[data-scroll-area]');
-    const previousTop = scroll?.scrollTop;
-    textarea.style.height = '0px';
-    textarea.style.height = textarea.scrollHeight + 'px';
-    if (scroll && previousTop !== undefined) scroll.scrollTop = previousTop;
+    // The ordinary code surface determines height; the input adds no box or row.
+    const mirror = textarea.parentElement.querySelector('.code-text');
+    if (!mirror) return;
+    if (textarea.dataset.mirrorValue !== textarea.value) {
+      mirror.textContent = textarea.value + (!textarea.value || /\n$/.test(textarea.value) ? '\u200b' : '');
+      textarea.dataset.mirrorValue = textarea.value;
+    }
+    const cell = textarea.closest('.code-side');
+    const hasProposed = editing?.hadProposedLine !== false || textarea.value.length > 0;
+    cell.classList.toggle('added', hasProposed); cell.classList.toggle('empty', !hasProposed);
+    cell.querySelector('.line-marker').textContent = hasProposed ? '+' : ' ';
+    cell.querySelector('.line-number').textContent = hasProposed ? (editing.rightStart || editing.oldStart || '') : '';
+    textarea.style.height = mirror.getBoundingClientRect().height + 'px';
+    refreshOverview();
   }
   function renderEditorRow(leftText, leftStart, rightStart, inlineChanges) {
     const row = element('div', 'diff-row editing-row');
     row.dataset.pair = 'code';
     row.dataset.hunkRow = editing.hunkId;
+    row.dataset.rowKey = 'hunk:' + editing.hunkId + ':0';
     const original = element('div', 'editing-original');
     const originalLines = sourceLines(leftText);
     originalLines.forEach((line, index) => original.append(codeSide('left', 'removed', leftStart + index, line, inlineChanges?.[index]?.before)));
     if (!originalLines.length) original.append(codeSide('left', 'empty', null, ''));
-    const editor = element('section', 'code-side right added pending-editor');
+    const hasProposed = editing.hadProposedLine !== false || editing.draft.length > 0;
+    const editor = element('section', 'code-side right pending-editor ' + (hasProposed ? 'added' : 'empty'));
+    editing.rightStart = rightStart || editing.oldStart;
     editor.dataset.hunkId = editing.hunkId;
     editor.setAttribute('aria-label', 'Edit proposed change ' + (editing.index + 1));
-    const number = element('span', 'line-number', rightStart || editing.oldStart || '');
-    const marker = element('span', 'line-marker', '+');
+    const number = element('span', 'line-number', hasProposed ? editing.rightStart : '');
+    const marker = element('span', 'line-marker', hasProposed ? '+' : ' ');
     number.setAttribute('aria-hidden', 'true'); marker.setAttribute('aria-hidden', 'true');
-    const content = element('div', 'pending-editor-content');
-    const textarea = element('textarea', 'pending-editor-textarea');
-    textarea.value = editing.draft; textarea.wrap = 'soft'; textarea.spellcheck = false; textarea.rows = 1;
-    textarea.readOnly = Boolean(editing.saving); textarea.dataset.focusKey = 'edit:draft'; textarea.dataset.hunk = editing.hunkId;
-    textarea.setAttribute('aria-label', 'Proposed text for change ' + (editing.index + 1));
-    textarea.setAttribute('autocapitalize', 'off'); textarea.setAttribute('autocomplete', 'off');
-    for (const event of ['input', 'select', 'click', 'keyup', 'scroll']) textarea.addEventListener(event, () => {
-      captureEditor(); saveViewState();
-      if (event === 'input') sizeEditor();
-    });
-    editor.addEventListener('keydown', event => {
-      if (event.isComposing) return;
-      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelEditor(); }
-      else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); submitEditor(); }
-      else if (event.target === textarea && event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && !textarea.readOnly) {
-        event.preventDefault(); textarea.setRangeText('\t', textarea.selectionStart, textarea.selectionEnd, 'end');
-        captureEditor(); saveViewState(); sizeEditor();
-      }
-    });
-    content.append(textarea);
+    const content = element('div', 'code-source pending-editor-content');
+    const mirror = element('span', 'code-text', editing.draft + (!editing.draft || /\n$/.test(editing.draft) ? '\u200b' : ''));
+    mirror.setAttribute('aria-hidden', 'true');
+    const textarea = editorInput(editing.draft, editing.hunkId, editing.index);
+    textarea.readOnly = Boolean(editing.saving); textarea.dataset.focusKey = 'edit:draft';
+    textarea.dataset.mirrorValue = editing.draft;
+    content.append(mirror, textarea);
     const stale = staleEditor();
     const error = stale ? 'The request changed. Your draft is kept; cancel and reopen the change before saving.' : editing.error;
     if (error) { const notice = element('p', 'pending-editor-error', error); notice.setAttribute('role', 'alert'); content.append(notice); }
     const gutter = element('span', 'action-gutter');
-    const actions = element('div', 'inline-actions pending-editor-actions');
-    actions.append(button(editing.saving ? 'Saving…' : 'Save', 'button button-accept button-inline', submitEditor,
-      {key: 'edit:save', disabled: editing.saving || state.busy || !state.trusted || stale, title: 'Save the proposal to the .rr request (Ctrl/Cmd+Enter)'}),
-      button('Cancel', 'button button-secondary button-inline', cancelEditor, {key: 'edit:cancel', disabled: editing.saving}));
-    gutter.append(actions); editor.append(number, marker, content, gutter); row.append(original, editor);
-    textarea.setSelectionRange(Math.min(editing.selectionStart || 0, textarea.value.length), Math.min(editing.selectionEnd || 0, textarea.value.length));
+    gutter.append(editorActions()); editor.append(number, marker, content, gutter); row.append(original, editor);
+    textarea.setSelectionRange(Math.min(editing.selectionStart || 0, textarea.value.length), Math.min(editing.selectionEnd || 0, textarea.value.length), editing.selectionDirection || 'none');
     return row;
   }
   function clickedColumn(source, event) {
@@ -247,22 +312,43 @@
     const prefix = document.createRange(); prefix.selectNodeContents(source); prefix.setEnd(caret.startContainer, caret.startOffset);
     return prefix.toString().replace(/\u200b/g, '').length;
   }
+  function updateContextLineNumber(cell, number) {
+    const text = number === null ? '' : String(number);
+    if ((cell.dataset.line || '') === text) return;
+    if (number === null) delete cell.dataset.line;
+    else cell.dataset.line = text;
+    cell.firstElementChild.textContent = text;
+  }
   function appendPairs(container, leftText, rightText, pending, cursor, controls) {
     const left = sourceLines(leftText);
     const right = sourceLines(rightText);
     const length = Math.max(left.length, right.length, controls && controls.decision !== 'pending' ? 1 : 0);
     for (let index = 0; index < length; index += 1) {
-      const row = element('div', 'diff-row');
-      row.dataset.pair = 'code';
+      const rowKey = controls ? 'hunk:' + controls.hunk.id + ':' + index : 'context:' + cursor.offset + ':' + index;
+      const proposedLine = cursor.right;
       const hasLeft = index < left.length;
       const hasRight = index < right.length;
+      const leftNumber = hasLeft ? cursor.left++ : null;
+      const rightNumber = hasRight ? cursor.right++ : null;
+      const cached = !controls && cursor.reusableContextRows?.get(rowKey);
+      if (cached && cached.leftText === (hasLeft ? left[index] : '') && cached.rightText === (hasRight ? right[index] : '')) {
+        updateContextLineNumber(cached.original, leftNumber);
+        updateContextLineNumber(cached.proposed, rightNumber);
+        cursor.contextRows.set(rowKey, cached);
+        container.append(cached.row);
+        continue;
+      }
+      const row = element('div', 'diff-row');
+      row.dataset.pair = 'code';
+      row.dataset.rowKey = rowKey;
       const inline = pending && controls && Array.isArray(controls.hunk.inlineChanges)
         ? controls.hunk.inlineChanges[index] : undefined;
       const original = codeSide('left', hasLeft ? pending ? 'removed' : 'context' : 'empty',
-        hasLeft ? cursor.left++ : null, hasLeft ? left[index] : '', inline && inline.before);
+        leftNumber, hasLeft ? left[index] : '', inline && inline.before);
       const proposed = codeSide('right', hasRight ? pending ? 'added' : 'context' : 'empty',
-        hasRight ? cursor.right++ : null, hasRight ? right[index] : '', inline && inline.after);
+        rightNumber, hasRight ? right[index] : '', inline && inline.after);
       if (pending && controls) {
+        proposed.dataset.proposedLine = String(proposedLine);
         const source = proposed.querySelector('.code-source');
         source.tabIndex = index === 0 ? 0 : -1;
         source.classList.add('editable-source'); source.dataset.editHunk = controls.hunk.id; source.dataset.editRow = String(index);
@@ -272,9 +358,39 @@
           source.tabIndex = 0; source.dataset.focusKey = controls.file.path + ':' + controls.hunk.id + ':edit'; source.dataset.hunk = controls.hunk.id;
           source.setAttribute('role', 'button'); source.setAttribute('aria-label', 'Edit proposed text for change ' + (controls.hunk.index + 1));
         }
-        source.addEventListener('click', event => { const column = clickedColumn(source, event); event.preventDefault(); openEditor(controls.file, controls.hunk, index, column); });
+        let directInput = null;
+        if (left.length <= 1 && right.length <= 1) {
+          // Keep a single-row block's native text control present before focus,
+          // with highlighted code painted underneath.
+          const draft = controls.hunk.draftAfter ?? controls.hunk.after.replace(/\r\n|\r/g, '\n').replace(/\n$/, '');
+          directInput = editorInput(draft, controls.hunk.id, controls.hunk.index);
+          directInput.classList.add('direct-editor-input');
+          directInput.dataset.mirrorValue = draft;
+          directInput.dataset.focusKey = controls.file.path + ':' + controls.hunk.id + ':input';
+          directInput.readOnly = controls.busy || !state.trusted;
+          directInput.tabIndex = directInput.readOnly ? -1 : 0;
+          source.tabIndex = -1; source.removeAttribute('role');
+          source.querySelector('.code-text').setAttribute('aria-hidden', 'true');
+          directInput.addEventListener('focus', () => {
+            if (!directInput.readOnly && !editing) openEditor(controls.file, controls.hunk, index, directInput.selectionStart, directInput);
+          });
+          source.append(directInput);
+        }
+        source.addEventListener('click', event => {
+          if (event.target === directInput) return;
+          const column = clickedColumn(source, event); event.preventDefault();
+          if (directInput) {
+            directInput.focus({preventScroll: true}); directInput.setSelectionRange(column, column);
+            captureEditor(); saveViewState();
+          } else openEditor(controls.file, controls.hunk, index, column);
+        });
         source.addEventListener('keydown', event => {
-          if (event.key === 'Enter' || event.key === 'F2' || event.key === ' ') { event.preventDefault(); openEditor(controls.file, controls.hunk, index); }
+          if (event.target === directInput) return;
+          if (event.key === 'Enter' || event.key === 'F2' || event.key === ' ') {
+            event.preventDefault();
+            if (directInput) directInput.focus({preventScroll: true});
+            else openEditor(controls.file, controls.hunk, index);
+          }
         });
       }
       if (index === 0 && controls) {
@@ -285,6 +401,9 @@
           hunkControls(controls.file, controls.hunk, controls.decision, controls.busy));
       }
       row.append(original, proposed);
+      if (!controls && cursor.contextRows) cursor.contextRows.set(rowKey, {
+        row, original, proposed, leftText: hasLeft ? left[index] : '', rightText: hasRight ? right[index] : ''
+      });
       container.append(row);
     }
     return length;
@@ -315,59 +434,147 @@
       documentView.append(note);
     }
   }
+  function unifiedPendingBlock(block, file, hunk) {
+    const removed = [], added = [];
+    const pairs = Array.from(block.children);
+    const hasAdded = pairs.some(row => row.children[1]?.classList.contains('added'));
+    const firstProposed = pairs[0]?.children[1];
+    for (const pair of pairs) {
+      const original = pair.children[0], proposed = pair.children[1];
+      const hasOriginal = original?.classList.contains('removed');
+      const wrap = (cell, after) => {
+        const row = element('div', 'diff-row unified-row'); row.dataset.pair = 'code';
+        row.dataset.rowKey = pair.dataset.rowKey + (after && hasOriginal ? ':after' : '');
+        if (cell.dataset.hunkId) row.dataset.hunkRow = cell.dataset.hunkId;
+        row.append(cell); return row;
+      };
+      if (hasOriginal) removed.push(wrap(original, false));
+      if (proposed?.classList.contains('added')) added.push(wrap(proposed, true));
+    }
+    if (!hasAdded && removed.length) {
+      const original = removed[0].firstElementChild;
+      const gutter = firstProposed?.querySelector('.action-gutter');
+      if (gutter) original.append(gutter);
+      original.dataset.hunkId = hunk.id; original.tabIndex = -1;
+      removed[0].dataset.hunkRow = hunk.id;
+      // A deletion has no proposed row to click. Its removed text opens the
+      // same in-place draft editor, initially containing the empty proposal.
+      const source = original.querySelector('.code-source');
+      source.classList.add('editable-source'); source.tabIndex = 0;
+      source.dataset.editHunk = hunk.id; source.dataset.editRow = '0';
+      source.dataset.focusKey = file.path + ':' + hunk.id + ':edit'; source.dataset.hunk = hunk.id;
+      source.setAttribute('role', 'button'); source.setAttribute('aria-label', 'Edit proposed text for change ' + (hunk.index + 1));
+      source.setAttribute('aria-disabled', String(Boolean(state.busy || awaitingDecision || !state.trusted)));
+      source.title = 'Click, Enter, or F2 to edit this proposed deletion in place';
+      source.addEventListener('click', () => openEditor(file, hunk, 0));
+      source.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === 'F2' || event.key === ' ') {
+          event.preventDefault(); openEditor(file, hunk, 0);
+        }
+      });
+    }
+    block.replaceChildren(...removed, ...added);
+  }
+  function unifiedClosedDocument(documentView) {
+    for (const row of documentView.querySelectorAll('.diff-row')) {
+      const original = row.children[0], proposed = row.children[1];
+      if (!original || !proposed) continue;
+      const gutter = proposed.querySelector('.action-gutter');
+      if (gutter) original.append(gutter);
+      if (proposed.dataset.hunkId) { original.dataset.hunkId = proposed.dataset.hunkId; original.tabIndex = -1; }
+      row.classList.add('unified-row'); row.replaceChildren(original);
+    }
+  }
   function renderDocument(file, busy) {
-    const documentView = element('div', 'paired-document');
+    const before = typeof file.before === 'string' ? file.before : '';
+    const reusable = state.closed !== true && contextRowCache.path === file.path && contextRowCache.before === before
+      ? contextRowCache : null;
+    const documentView = reusable?.documentView || element('div', 'paired-document');
+    const rows = [];
+    const output = {append: (...nodes) => rows.push(...nodes)};
     documentView.setAttribute('role', 'region');
     documentView.setAttribute('aria-label', 'Aligned original and proposed file');
-    const before = typeof file.before === 'string' ? file.before : '';
     const hunks = [...file.hunks].sort((a, b) => a.start - b.start || a.index - b.index);
-    const cursor = { offset: 0, left: 1, right: 1 };
+    // Context rows have no editable controls or closures. Reuse their DOM while
+    // rebuilding hunks so every action and input keeps the current host state.
+    const contextRows = state.closed === true ? null : new Map();
+    const reusableContextRows = contextRows && reusable ? reusable.rows : null;
+    const cursor = { offset: 0, left: 1, right: 1, contextRows, reusableContextRows };
     let projectedLeft = '';
     let projectedRight = '';
     for (const hunk of hunks) {
       const unchanged = before.slice(cursor.offset, hunk.start);
-      appendPairs(documentView, unchanged, unchanged, false, cursor);
+      appendPairs(output, unchanged, unchanged, false, cursor);
       projectedLeft += unchanged;
       projectedRight += unchanged;
       const decision = decisionOf(hunk);
-      const leftText = decision === 'accepted' ? hunk.after : hunk.before;
-      const rightText = decision === 'ignored' ? hunk.before : hunk.after;
+      // draftAfter includes logical blank rows even when an EOF insertion has
+      // no trailing physical separator in displayAfter.
+      const proposedRows = typeof hunk.draftAfter === 'string' && hunk.newLines > 0 ? hunk.draftAfter + '\n' : hunk.after;
+      const physicalAfter = hunk.displayAfter === undefined ? hunk.after : '\n' + hunk.after;
+      const leftText = decision === 'accepted' ? proposedRows : hunk.before;
+      const rightText = decision === 'ignored' ? hunk.before : proposedRows;
       const block = element('section', 'hunk hunk-' + decision);
+      block.dataset.overviewHunk = hunk.id;
+      block.dataset.removed = String(decision === 'pending' && sourceLines(hunk.before).length > 0);
+      block.dataset.added = String(decision === 'pending' && sourceLines(hunk.after).length > 0);
       block.setAttribute('aria-label', 'Change ' + (hunk.index + 1) + ', ' + decision);
       if (editing && decision === 'pending' && editing.filePath === file.path && editing.hunkId === hunk.id) {
         block.classList.add('hunk-editing');
         block.append(renderEditorRow(leftText, cursor.left, cursor.right, hunk.inlineChanges));
         cursor.left += sourceLines(leftText).length; cursor.right += sourceLines(rightText).length;
-        documentView.append(block);
+        output.append(block);
       } else if (appendPairs(block, leftText, rightText, decision === 'pending', cursor, {file, hunk, decision, busy})) {
-        documentView.append(block);
+        if (layout === 'unified' && decision === 'pending') unifiedPendingBlock(block, file, hunk);
+        output.append(block);
       }
-      projectedLeft += leftText;
-      projectedRight += rightText;
+      projectedLeft += decision === 'accepted' ? physicalAfter : hunk.before;
+      projectedRight += decision === 'ignored' ? hunk.before : physicalAfter;
       cursor.offset = hunk.end;
     }
     const tail = before.slice(cursor.offset);
-    appendPairs(documentView, tail, tail, false, cursor);
+    appendPairs(output, tail, tail, false, cursor);
     projectedLeft += tail;
     projectedRight += tail;
     const leftEnds = !projectedLeft || /[\r\n]$/.test(projectedLeft);
     const rightEnds = !projectedRight || /[\r\n]$/.test(projectedRight);
-    if (leftEnds || rightEnds) {
+    const leftNeedsRow = cursor.left <= projectedLeft.replace(/\r\n|\r/g, '\n').split('\n').length;
+    const rightNeedsRow = cursor.right <= projectedRight.replace(/\r\n|\r/g, '\n').split('\n').length;
+    if (leftNeedsRow || rightNeedsRow) {
       const row = element('div', 'diff-row');
       row.dataset.pair = 'code';
       row.append(
-        codeSide('left', leftEnds ? 'context' : 'empty', leftEnds ? cursor.left : null, ''),
-        codeSide('right', rightEnds ? 'context' : 'empty', rightEnds ? cursor.right : null, '')
+        codeSide('left', leftNeedsRow ? 'context' : 'empty', leftNeedsRow ? cursor.left : null, ''),
+        codeSide('right', rightNeedsRow ? 'context' : 'empty', rightNeedsRow ? cursor.right : null, '')
       );
-      documentView.append(row);
+      output.append(row);
     }
     if ((!leftEnds && projectedLeft) || (!rightEnds && projectedRight)) {
       const eof = element('div', 'diff-pair eof-row');
       eof.append(element('div', 'eof-side left', leftEnds ? '' : 'No newline at end of file'),
         element('div', 'eof-side right', rightEnds ? '' : 'No newline at end of file'));
-      documentView.append(eof);
+      output.append(eof);
     }
-    if (state.closed === true && typeof file.currentText === 'string') showClosedCurrent(documentView, file.currentText);
+    // Leave unchanged rows attached. Moving every row to a fresh container
+    // forces Chromium to lay out the whole document even when its text is stable.
+    const retained = new Set(rows);
+    for (const child of Array.from(documentView.children)) if (!retained.has(child)) child.remove();
+    let next = documentView.firstChild;
+    for (const row of rows) {
+      if (row === next) next = next.nextSibling;
+      else documentView.insertBefore(row, next);
+    }
+    contextRowCache = {path: file.path, before, rows: contextRows || new Map(), documentView: contextRows ? documentView : null};
+    if (state.closed === true && typeof file.currentText === 'string') {
+      showClosedCurrent(documentView, file.currentText);
+      if (layout === 'unified') unifiedClosedDocument(documentView);
+    }
+    if (layout === 'unified') {
+      for (const note of documentView.querySelectorAll('.eof-row')) {
+        const chosen = state.closed === true ? note.children[0] : Array.from(note.children).find(node => node.classList.contains('right') && node.textContent) || Array.from(note.children).find(node => node.textContent);
+        if (chosen) { note.replaceChildren(chosen); note.classList.add('unified-row'); }
+      }
+    }
     return documentView;
   }
   function whyAnchor(id) {
@@ -475,6 +682,155 @@
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });
   }
+  function lockReviewControls() {
+    const active = document.activeElement;
+    if (active?.matches('.inline-actions button,.file-actions button')) {
+      decisionFocus = {key: active.dataset.focusKey, hunk: active.dataset.hunk};
+    }
+    root.querySelector('.review-app')?.setAttribute('aria-busy', 'true');
+    for (const control of root.querySelectorAll('.inline-actions button,.file-actions button')) control.disabled = true;
+    for (const input of root.querySelectorAll('.pending-editor-textarea')) input.readOnly = true;
+    closeExplanation();
+  }
+  function captureViewport() {
+    const scroll = root.querySelector('[data-scroll-area]');
+    if (!scroll || !viewRows.length) return; // Keep the last position through transient empty states.
+    const top = scroll.getBoundingClientRect().top;
+    let lo = 0, hi = viewRows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (viewRows[mid].getBoundingClientRect().bottom <= top) lo = mid + 1;
+      else hi = mid;
+    }
+    const anchor = viewRows[lo];
+    viewport = {top: scroll.scrollTop, key: anchor?.dataset.rowKey,
+      offset: anchor ? anchor.getBoundingClientRect().top - top : 0};
+  }
+  function restoreViewport() {
+    const scroll = root.querySelector('[data-scroll-area]');
+    if (!scroll) return;
+    const anchor = viewport.key && (viewRows.find(row => row.dataset.rowKey === viewport.key)
+      || viewRows.find(row => row.dataset.rowKey === viewport.key.replace(/:after$/, '')));
+    scroll.scrollTop = anchor
+      ? scroll.scrollTop + anchor.getBoundingClientRect().top - scroll.getBoundingClientRect().top - viewport.offset
+      : viewport.top;
+    updateOverviewThumb();
+  }
+  function onComparisonScroll() {
+    updateOverviewThumb(); positionExplanation();
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0; captureViewport(); saveViewState();
+    });
+  }
+  function updateOverviewThumb() {
+    if (!overview) return;
+    const {scroll, rail, thumb} = overview;
+    const max = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+    const height = rail.clientHeight;
+    const thumbHeight = Math.min(height, Math.max(24, height * scroll.clientHeight / Math.max(1, scroll.scrollHeight)));
+    overview.travel = Math.max(0, height - thumbHeight);
+    overview.max = max;
+    thumb.hidden = max === 0;
+    thumb.style.height = thumbHeight + 'px';
+    thumb.style.transform = 'translateY(' + (max ? scroll.scrollTop / max * overview.travel : 0) + 'px)';
+    rail.setAttribute('aria-valuemax', String(Math.round(max)));
+    rail.setAttribute('aria-valuenow', String(Math.round(scroll.scrollTop)));
+  }
+  function refreshOverview() {
+    if (!overview || !overview.rail.isConnected) return;
+    const {app, scroll, rail, markers} = overview;
+    const rect = scroll.getBoundingClientRect();
+    rail.style.top = rect.top - app.getBoundingClientRect().top + 'px';
+    rail.style.height = scroll.clientHeight + 'px';
+    const scale = rail.clientHeight / Math.max(1, scroll.scrollHeight);
+    const blocks = new Map();
+    for (const {block} of markers) if (!blocks.has(block)) blocks.set(block, block.getBoundingClientRect());
+    const maxTop = Math.max(0, rail.clientHeight - 3);
+    for (const {node, block} of markers) {
+      const blockRect = blocks.get(block);
+      node.style.top = Math.min(Math.max(0, (blockRect.top - rect.top + scroll.scrollTop) * scale), maxTop) + 'px';
+      node.style.height = Math.max(3, blockRect.height * scale) + 'px';
+    }
+    updateOverviewThumb();
+  }
+  function renderOverview(app) {
+    const scroll = app.querySelector('[data-scroll-area]');
+    if (!scroll) return;
+    scroll.id = 'rr-comparison-scroll';
+    const rail = element('div', 'change-scrollbar');
+    rail.tabIndex = completion ? -1 : 0; rail.dataset.focusKey = 'pane:scrollbar';
+    rail.setAttribute('role', 'scrollbar'); rail.setAttribute('aria-orientation', 'vertical');
+    rail.setAttribute('aria-controls', scroll.id); rail.setAttribute('aria-valuemin', '0');
+    rail.setAttribute('aria-label', 'Scroll comparison; red and green markers locate pending changes');
+    rail.title = 'Scroll comparison. Click a red or green marker to jump to that change.';
+    const thumb = element('div', 'change-scrollbar-thumb');
+    rail.append(thumb);
+    const markers = [];
+    for (const block of scroll.querySelectorAll('.hunk-pending')) {
+      for (const kind of ['removed', 'added']) {
+        if (block.dataset[kind] !== 'true') continue;
+        const node = element('div', 'change-scrollbar-marker ' + kind);
+        node.dataset.overviewTarget = block.dataset.overviewHunk;
+        node.title = block.getAttribute('aria-label');
+        node.addEventListener('pointerdown', event => {
+          if (completion || event.button !== 0) return;
+          event.preventDefault(); event.stopPropagation();
+          const draftFocus = document.activeElement?.matches('.pending-editor textarea') ? document.activeElement : null;
+          scroll.scrollTop += block.getBoundingClientRect().top - scroll.getBoundingClientRect().top - Math.min(40, scroll.clientHeight / 4);
+          (draftFocus || rail).focus({preventScroll: true}); onComparisonScroll();
+        });
+        markers.push({node, block}); rail.append(node);
+      }
+    }
+    overview = {app, scroll, rail, thumb, markers, max: 0, travel: 0};
+    let drag = null;
+    rail.addEventListener('pointerdown', event => {
+      if (completion || !event.isPrimary || event.button !== 0) return;
+      event.preventDefault();
+      const draftFocus = document.activeElement?.matches('.pending-editor textarea') ? document.activeElement : null;
+      rail.focus({preventScroll: true});
+      if (event.target !== thumb) {
+        const position = event.clientY - rail.getBoundingClientRect().top - thumb.clientHeight / 2;
+        scroll.scrollTop = overview.travel ? position / overview.travel * overview.max : 0;
+        updateOverviewThumb();
+      }
+      drag = {id: event.pointerId, y: event.clientY, top: scroll.scrollTop, draftFocus};
+      rail.setPointerCapture(event.pointerId);
+    });
+    rail.addEventListener('pointermove', event => {
+      if (!drag || drag.id !== event.pointerId || !overview.travel) return;
+      scroll.scrollTop = drag.top + (event.clientY - drag.y) / overview.travel * overview.max;
+      updateOverviewThumb();
+    });
+    const endDrag = event => {
+      if (!drag || drag.id !== event.pointerId) return;
+      const draftFocus = drag.draftFocus;
+      drag = null;
+      if (draftFocus?.isConnected) draftFocus.focus({preventScroll: true});
+      if (rail.hasPointerCapture(event.pointerId)) rail.releasePointerCapture(event.pointerId);
+      captureViewport(); saveViewState();
+    };
+    rail.addEventListener('pointerup', endDrag); rail.addEventListener('pointercancel', endDrag);
+    rail.addEventListener('lostpointercapture', () => { drag = null; });
+    rail.addEventListener('wheel', event => {
+      if (completion) return;
+      event.preventDefault();
+      scroll.scrollTop += event.deltaY * (event.deltaMode === 1 ? 22 : event.deltaMode === 2 ? scroll.clientHeight : 1);
+    }, {passive: false});
+    rail.addEventListener('keydown', event => {
+      if (completion) return;
+      let next = scroll.scrollTop;
+      if (event.key === 'ArrowUp') next -= 22;
+      else if (event.key === 'ArrowDown') next += 22;
+      else if (event.key === 'PageUp') next -= scroll.clientHeight * .9;
+      else if (event.key === 'PageDown') next += scroll.clientHeight * .9;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = scroll.scrollHeight;
+      else return;
+      event.preventDefault(); scroll.scrollTop = next; onComparisonScroll();
+    });
+    app.append(rail);
+  }
   function splitMetrics() {
     const comparison = root.querySelector('[data-scroll-area]');
     const app = root.querySelector('.review-app');
@@ -493,8 +849,8 @@
         + (parseFloat(style.columnGap) || 0) * Math.max(0, badges.length - 1)
         + (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
     }
-    let minimumLeft = Math.max(160, gutter + 80);
-    let minimumRight = Math.max(gutter + actions + 80, summaryWidth + actions);
+    let minimumLeft = Math.max(160, gutter + 80 + 15);
+    let minimumRight = Math.max(gutter + actions + 80 + 8, summaryWidth + actions);
     // Tiny windows cannot satisfy both ideals. Retain both panes proportionally.
     if (minimumLeft + minimumRight > available) {
       const scale = available / (minimumLeft + minimumRight);
@@ -503,11 +859,28 @@
     return { app, available, min: minimumLeft / available, max: 1 - minimumRight / available };
   }
   function applySplit() {
+    if (layout === 'unified') {
+      const comparison = root.querySelector('[data-scroll-area]'), app = root.querySelector('.review-app');
+      if (!comparison || !app) return;
+      const css = getComputedStyle(app);
+      const gutter = parseFloat(css.getPropertyValue('--rr-gutter')) || 66;
+      const actions = parseFloat(css.getPropertyValue('--rr-action-gutter')) || 152;
+      root.style.setProperty('--rr-code-width', Math.max(0, comparison.clientWidth - 15 - gutter - actions) + 'px');
+      sizeEditor(); positionExplanation(); refreshOverview();
+      return;
+    }
     const metrics = splitMetrics();
     if (!metrics) return;
     const ratio = Math.max(metrics.min, Math.min(metrics.max, splitRatio));
     root.style.setProperty('--rr-left-width', (ratio * 100) + '%');
     root.style.setProperty('--rr-divider-left', (metrics.available * ratio) + 'px');
+    // Both code surfaces wrap at exactly the same width, even after resizing.
+    const css = getComputedStyle(root);
+    const gutter = parseFloat(css.getPropertyValue('--rr-gutter')) || 66;
+    const actions = parseFloat(css.getPropertyValue('--rr-action-gutter')) || 152;
+    const leftCode = metrics.available * ratio - gutter - 15;
+    const rightCode = metrics.available * (1 - ratio) - gutter - actions - 8;
+    root.style.setProperty('--rr-code-width', Math.max(0, Math.min(leftCode, rightCode)) + 'px');
     const separator = root.querySelector('.pane-splitter');
     if (separator) {
       separator.setAttribute('aria-valuemin', String(Math.round(metrics.min * 100)));
@@ -515,7 +888,7 @@
       separator.setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
       separator.setAttribute('aria-valuetext', 'Original ' + Math.round(ratio * 100) + '%, Revision ' + Math.round((1 - ratio) * 100) + '%');
     }
-    sizeEditor(); positionExplanation();
+    sizeEditor(); positionExplanation(); refreshOverview();
   }
   function setSplitRatio(value, persist = true) {
     const metrics = splitMetrics();
@@ -588,30 +961,39 @@
     app.append(separator);
   }
   function updateLayout() {
-    const comparison = root.querySelector('[data-scroll-area]');
-    if (comparison) root.style.setProperty('--rr-scrollbar-width', Math.max(0, comparison.offsetWidth - comparison.clientWidth) + 'px');
     const documentView = root.querySelector('.paired-document');
     if (documentView) {
-      // Inline box height depends on the chosen editor font. Pad only to its
-      // visual line box, so cloned highlights never spill onto the next wrap.
-      const probe = element('span', 'inline-metric-probe', 'M');
-      documentView.append(probe);
-      const fontHeight = probe.getBoundingClientRect().height;
-      const lineHeight = parseFloat(getComputedStyle(documentView).lineHeight);
-      probe.remove();
-      root.style.setProperty('--rr-inline-padding', Math.max(0, (lineHeight - fontHeight) / 2) + 'px');
+      const style = getComputedStyle(documentView);
+      const key = [style.fontFamily, style.fontSize, style.fontWeight, style.fontStyle, style.lineHeight].join('|');
+      if (key !== fontMetricKey) {
+        const probe = element('span', 'inline-metric-probe', 'M');
+        documentView.append(probe);
+        const fontHeight = probe.getBoundingClientRect().height;
+        probe.remove();
+        root.style.setProperty('--rr-inline-padding', Math.max(0, (parseFloat(style.lineHeight) - fontHeight) / 2) + 'px');
+        fontMetricKey = key;
+      }
     }
     applySplit();
+  }
+  function reconcileChildren(parent, nodes) {
+    const keep = new Set(nodes);
+    for (const child of [...parent.children]) if (!keep.has(child)) child.remove();
+    let next = parent.firstElementChild;
+    for (const node of nodes) {
+      if (node === next) next = next.nextElementSibling;
+      else parent.insertBefore(node, next);
+    }
   }
   function render() {
     if (!state) return;
     endSplitDrag(false, false);
     captureEditor();
-    const previousScroll = root.querySelector('[data-scroll-area]');
-    const scrollTop = previousScroll ? previousScroll.scrollTop : 0;
+    captureViewport();
+    overview = null;
     const active = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset : {};
-    const activeKey = active.focusKey;
-    const activeHunk = active.hunk || active.hunkId;
+    const activeKey = active.focusKey || decisionFocus?.key;
+    const activeHunk = active.hunk || active.hunkId || decisionFocus?.hunk;
     const files = Array.isArray(state.files) ? state.files : [];
     const file = files[0];
     const closed = state.closed === true;
@@ -619,8 +1001,10 @@
     const busy = Boolean(state.busy || awaitingDecision || editing || completion);
     const rawOpacity = typeof state.unchangedOpacity === 'number' && Number.isFinite(state.unchangedOpacity) ? state.unchangedOpacity : 20;
     root.style.setProperty('--rr-context-opacity', String(Math.min(100, Math.max(0, rawOpacity)) / 100));
-    const app = element('div', 'review-app');
+    const app = root.querySelector('.review-app') || element('div', 'review-app');
+    const appChildren = [];
     app.classList.toggle('is-closed', closed);
+    app.classList.toggle('layout-unified', layout === 'unified');
     app.classList.toggle('highlight-changed-lines', state.highlightChangedLines !== false);
     app.classList.toggle('show-only-changed-text', state.showOnlyChangedText === true);
     app.setAttribute('aria-busy', String(Boolean(state.busy || awaitingDecision || (editing && editing.saving) || (completion && completion.resolving))));
@@ -631,7 +1015,7 @@
       filename.append(button(file.path, 'filename-link',
         () => post({ type: 'openTarget', filePath: file.path }),
         { key: file.path + ':original', title: 'Open original file' }));
-      original.append(element('p', 'eyebrow', file.issue && !(closed && typeof file.currentText === 'string') ? 'REQUEST SNAPSHOT' : 'ORIGINAL'), filename);
+      original.append(element('p', 'eyebrow', file.issue && !(closed && typeof file.currentText === 'string') ? 'REQUEST SNAPSHOT' : layout === 'unified' ? 'FILE' : 'ORIGINAL'), filename);
       const proposed = element('section', 'pane-banner right');
       proposed.append(element('p', 'eyebrow', 'REVISION REQUEST'));
       const summaryRow = element('div', 'summary-row');
@@ -654,20 +1038,22 @@
       }
       proposed.append(summaryRow);
       header.append(original, proposed);
-      app.append(header);
+      appChildren.push(header);
     }
-    if (!state.trusted) app.append(banner('Trust this workspace to accept or ignore changes. You can still inspect this request.', 'info'));
-    if (closed && file) app.append(banner('This revision request is closed.', 'info'));
-    if (state.error && !dismissedErrors.has(state.error)) app.append(banner(state.error));
+    if (!state.trusted) appChildren.push(banner('Trust this workspace to accept or ignore changes. You can still inspect this request.', 'info'));
+    if (closed && file) appChildren.push(banner('This revision request is closed.', 'info'));
+    if (state.error && !dismissedErrors.has(state.error)) appChildren.push(banner(state.error));
     if (file) {
-      if (!closed && file.issue && file.issue !== state.error && !dismissedErrors.has(file.issue)) app.append(banner(file.issue));
-      const content = element('main', 'comparison-scroll');
-      content.dataset.scrollArea = 'true';
+      if (!closed && file.issue && file.issue !== state.error && !dismissedErrors.has(file.issue)) appChildren.push(banner(file.issue));
+      let content = app.querySelector('[data-scroll-area]');
+      if (!content) {
+        content = element('main', 'comparison-scroll'); content.dataset.scrollArea = 'true';
+        content.addEventListener('scroll', onComparisonScroll, {passive: true});
+      }
       content.setAttribute('aria-label', 'Original and proposed content of ' + file.path);
-      content.addEventListener('scroll', positionExplanation);
-      if (!file.hunks.length) content.append(element('p', 'unchanged-note', 'No changes proposed.'));
-      content.append(renderDocument(file, busy));
-      app.append(content);
+      const documentView = renderDocument(file, busy);
+      reconcileChildren(content, file.hunks.length ? [documentView] : [element('p', 'unchanged-note', 'No changes proposed.'), documentView]);
+      appChildren.push(content);
     } else {
       const empty = element('main', 'empty-state');
       empty.append(element('span', 'empty-symbol', closed ? '✓' : state.error ? '!' : '≋'),
@@ -679,8 +1065,9 @@
           awaitingDecision = true; dismissedErrors.clear(); saveViewState(); render(); post({type: 'deleteRequest'});
         }, {key: 'empty:delete-request', disabled: state.busy || awaitingDecision,
           title: 'Delete this .rr request; the original file stays unchanged'}));
-      app.append(empty);
+      appChildren.push(empty);
     }
+    reconcileChildren(app, appChildren);
     if (editing && !app.querySelector('.pending-editor')) {
       // An external edit can remove the active hunk or even the request. Keep
       // its unsaved draft visible in flow instead of silently discarding it.
@@ -688,17 +1075,21 @@
       if (!content) {
         content = element('main', 'comparison-scroll'); content.dataset.scrollArea = 'true';
         app.querySelector('.empty-state')?.remove(); app.append(content);
+        content.addEventListener('scroll', onComparisonScroll, {passive: true});
       }
       const fallback = element('section', 'paired-document pending-editor-fallback');
       fallback.setAttribute('aria-label', 'Unsaved proposal draft');
       fallback.append(renderEditorRow(file ? '' : editing.original || '', editing.oldStart || 1, editing.oldStart || 1));
       content.prepend(fallback);
     }
-    if (file) renderSplitter(app);
-    root.replaceChildren(app);
-    const currentScroll = root.querySelector('[data-scroll-area]');
-    if (currentScroll) currentScroll.scrollTop = scrollTop;
-    renderExplanation(app, file); sizeEditor(); renderCompletion(app);
+    if (file) {
+      if (layout === 'sideBySide') renderSplitter(app);
+      renderOverview(app);
+    }
+    if (root.firstElementChild !== app) root.replaceChildren(app);
+    viewRows = Array.from(root.querySelectorAll('[data-row-key]'));
+    renderExplanation(app, file); renderCompletion(app);
+    updateLayout(); restoreViewport();
     let replacement = activeKey
       ? Array.from(root.querySelectorAll('[data-focus-key]')).find(node => node.dataset.focusKey === activeKey && !node.disabled)
       : null;
@@ -706,7 +1097,7 @@
       replacement = Array.from(root.querySelectorAll('button[data-hunk]')).find(node => node.dataset.hunk === activeHunk && !node.disabled)
         || Array.from(root.querySelectorAll('[data-hunk-id]')).find(node => node.dataset.hunkId === activeHunk);
     }
-    if (replacement) replacement.focus({ preventScroll: true });
+    if (replacement) { replacement.focus({ preventScroll: true }); decisionFocus = null; }
     const completionDialog = root.querySelector('.completion-dialog');
     if (completionDialog && !completionDialog.contains(document.activeElement)) {
       (root.querySelector('[data-focus-key="completion:no"]:not(:disabled)') || completionDialog).focus({preventScroll: true});
@@ -718,12 +1109,22 @@
       const source = hunk ? editorAnchor({hunkId: hunk.id, anchorIndex: 0}) : null;
       (source || root.querySelector('.filename-link'))?.focus({preventScroll: true}); focusAfterEdit = null;
     }
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(updateLayout);
-    else updateLayout();
+    saveViewState();
   }
   window.addEventListener('message', event => {
     const message = event.data;
     if (!message) return;
+    if (message.type === 'toggleLayout') {
+      if (!layout) { pendingLayoutToggle = !pendingLayoutToggle; return; }
+      captureEditor(); captureViewport();
+      layout = layout === 'unified' ? 'sideBySide' : 'unified';
+      saveViewState(); render();
+      return;
+    }
+    if (message.type === 'busy') {
+      if (state && message.busy === true) { state.busy = true; lockReviewControls(); }
+      return;
+    }
     if (message.type === 'completionPrompt') {
       if (typeof message.completionId !== 'string' || typeof message.revision !== 'string') return;
       if (completion?.completionId === message.completionId) return;
@@ -754,6 +1155,11 @@
       return;
     }
     if (message.type !== 'state') return;
+    if (!layout) {
+      layout = message.defaultLayout === 'sideBySide' ? 'sideBySide' : 'unified';
+      if (pendingLayoutToggle) layout = layout === 'unified' ? 'sideBySide' : 'unified';
+      pendingLayoutToggle = false;
+    }
     if (state && (message.revision !== state.revision || message.requestName !== state.requestName || (message.busy && !state.busy))) dismissedErrors.clear();
     if (state && message.error && message.error !== state.error) dismissedErrors.delete(message.error);
     const activeErrors = new Set([message.error, ...(Array.isArray(message.files) ? message.files.map(file => file.issue) : [])]);
@@ -778,8 +1184,8 @@
     }
   });
   window.addEventListener('blur', () => endSplitDrag(true, false));
-  window.addEventListener('pagehide', () => endSplitDrag(false, false));
+  window.addEventListener('pagehide', () => { endSplitDrag(false, false); captureEditor(); captureViewport(); saveViewState(); });
   if (typeof ResizeObserver === 'function') new ResizeObserver(updateLayout).observe(root);
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateLayout);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { fontMetricKey = null; updateLayout(); });
   post({ type: 'ready' });
 })();

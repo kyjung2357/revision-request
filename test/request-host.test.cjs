@@ -27,6 +27,7 @@ const vscode = {
   TabInputText: class {},
   workspace: {
     isTrusted: true,
+    get workspaceFolders() { return scratch ? [{uri: Uri.file(scratch), name: 'request-test'}] : []; },
     get textDocuments() { return [...documents.values()]; },
     getWorkspaceFolder(uri) { return scratch && !path.relative(scratch, uri.fsPath).startsWith('..') ? {uri: Uri.file(scratch), name: 'request-test'} : undefined; },
     getConfiguration() { return {
@@ -61,6 +62,7 @@ const load = Module._load;
 Module._load = function(name, parent, main) { return name === 'vscode' ? vscode : load.call(this, name, parent, main); };
 require('tsx/cjs');
 const {ReviewService} = require('../src/extension.ts');
+const {McpHost} = require('../src/mcpHost.ts');
 Module._load = load;
 function context() {
   const values = new Map();
@@ -129,7 +131,7 @@ test('accepted deletion baseline survives restart and a different pending entry 
   await first.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision);
   const restarted = service(first.state); state = await ready(restarted.api, item);
   const pending = state.files[0].hunks.find(hunk => hunk.decision === 'pending');
-  await restarted.api.editPending(item.request, item.relative, pending.id, 'edited\n', state.revision);
+  await restarted.api.editPending(item.request, item.relative, pending.id, 'edited', state.revision);
   state = await ready(service(first.state).api, item); assert.equal(await read(item.target), 'context\nold\n');
   assert.deepEqual(await statuses(item), ['accepted', 'pending']); assert.equal(state.files[0].hunks.find(hunk => hunk.decision === 'pending').after, 'edited\n');
   await restarted.api.undo(item.request, item.relative, state.files[0].hunks[0].id, state.revision); assert.equal(await read(item.target), item.before);
@@ -194,7 +196,7 @@ test('Ignore and Undo ignored persist status without a source write', async () =
 
 test('retained or failed deletion keeps baselines; successful manual deletion clears every identity cache', async () => {
   const item = await fixture(); const created = service(); let state = await ready(created.api, item);
-  await created.api.editPending(item.request, item.relative, state.files[0].hunks[0].id, 'EDITED\n', state.revision);
+  await created.api.editPending(item.request, item.relative, state.files[0].hunks[0].id, 'EDITED', state.revision);
   const retained = created.state.workspaceState.keys(); assert.ok(retained.filter(key => key.includes('.baseline.')).length >= 2);
   const originalDelete = vscode.workspace.fs.delete;
   vscode.workspace.fs.delete = async () => {throw new Error('Injected delete refusal');};
@@ -283,4 +285,52 @@ test('insertion and replacement at one original row retain independent buttons a
   state = await ready(api, item);
   assert.deepEqual(state.files[0].hunks.map(hunk => hunk.decision), ['accepted', 'ignored']);
   assert.equal(await read(item.target), 'X\nA\n');
+});
+
+
+test('real MCP host persists omitted reasons without changing legacy empty-reason retry hashes', async () => {
+  const folder = 'mcp-case-' + (++serial); await fs.mkdir(path.join(scratch, folder));
+  const relative = folder + '/source.txt', target = Uri.file(path.join(scratch, relative));
+  const source = 'old\nline\n'; await fs.writeFile(target.fsPath, source);
+  const {api, state: stateContext} = service(), writesBefore = sourceWrites.length;
+  const host = new McpHost(stateContext, api, async () => {}, () => false);
+  const workspace = Uri.file(scratch).toString();
+  const readTarget = await host.handler('read_target', {path: relative}, workspace);
+  const entries = [{line: 1, before: 'old', after: 'NEW'}, {line: 2, before: 'line', after: 'LINE', reason: ''}];
+  const args = {path: relative, expectedHash: readTarget.hash, clientRequestId: 'omitted-reason-fixture', request: entries};
+  const created = await host.handler('create_request', args, workspace);
+  const requestPath = path.join(scratch, relative + '.rr'), savedText = await fs.readFile(requestPath, 'utf8');
+  const saved = JSON.parse(savedText);
+  assert.equal(Object.hasOwn(saved.request[0], 'reason'), false);
+  assert.equal(Object.hasOwn(saved.request[1], 'reason'), true); assert.equal(saved.request[1].reason, '');
+  assert.equal(await read(target), source); assert.equal(sourceWrites.length, writesBefore);
+  const expectedLegacyHash = require('node:crypto').createHash('sha256').update(JSON.stringify({path: relative, expectedHash: readTarget.hash,
+    request: entries.map(entry => ({line: entry.line, before: entry.before, after: entry.after, reason: entry.reason ?? '', status: 'pending'}))})).digest('hex');
+  const record = stateContext.workspaceState.get('mcp.requestRegistry.v1').find(item => item.requestId === created.requestId);
+  assert.equal(record.inputHash, expectedLegacyHash);
+  const retry = await host.handler('create_request', {...args, request: entries.map(({reason, ...entry}) => ({...entry, ...(reason === undefined ? {reason: ''} : {})}))}, workspace);
+  assert.equal(retry.requestId, created.requestId); assert.equal(await fs.readFile(requestPath, 'utf8'), savedText);
+  const changedReason = entries.map(entry => ({...entry, reason: 'Different proposal'}));
+  await assert.rejects(host.handler('create_request', {...args, request: changedReason}, workspace), error => error.code === 'IDEMPOTENCY_CONFLICT');
+});
+
+
+test('collapsing mixed-EOL blocks are refused before source or request writes', async () => {
+  const item = await fixture('middle\rlast\ntail', [{line: 1, before: 'middle\nlast', after: '\n', status: 'pending'}]);
+  const {api, state: contextState} = service(), targetBefore = await read(item.target), requestBefore = await read(item.request);
+  const writesBefore = sourceWrites.length, state = await api.getState(item.request);
+  assert.match(state.error, /merge separate CR and LF/); assert.equal(state.verified, false);
+  await assert.rejects(api.decide(item.request, item.relative, 'unresolved', 'accepted', state.revision), /merge separate CR and LF/);
+  assert.equal(await read(item.target), targetBefore); assert.equal(await read(item.request), requestBefore);
+  assert.equal(sourceWrites.length, writesBefore); assert.equal(journals(contextState).length, 0);
+});
+
+test('cached multiline Undo after restart preserves mixed EOL bytes exactly', async () => {
+  const item = await fixture('middle\rlast\ntail', [{line: 1, before: 'middle\nlast', after: 'MIDDLE\nLAST', status: 'pending'}]);
+  const initial = service(); let state = await ready(initial.api, item);
+  await initial.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision);
+  assert.equal(await read(item.target), 'MIDDLE\rLAST\ntail');
+  const restarted = service(initial.state); state = await ready(restarted.api, item);
+  await restarted.api.undo(item.request, item.relative, state.files[0].hunks[0].id, state.revision);
+  assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending']);
 });

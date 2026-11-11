@@ -1,6 +1,6 @@
 # Revision Request
 
-**Revision Request** lets you review proposed changes and decide which ones to apply to your files.
+**Revision Request** is a VS Code extension that lets you review proposed changes and decide which ones to apply to your files.
 
 Each `.rr` file contains a revision request for one existing UTF-8 text file (for example, `.py`, `.ts`, `.md`, `.json`, and `.tex`). Opening it does not modify the original.
 
@@ -28,8 +28,9 @@ Accepting changes requires workspace trust. Unsaved or conflicting changes to th
 - **Ignore**: Record the decision without changing the original.
 - **Accept all / Ignore all**: Decide all remaining pending changes in the request.
 - **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and the original still matches the recorded changes.
-- **Why**: Show the change's explanation in a popover. The button is disabled when no explanation is provided.
+- **Why**: Show the change's explanation in a popover. Without an explanation, the button stays disabled and its text blends into the background.
 - **ORIGINAL**: Click the filename beneath this label to open the editable original file.
+- **Toggle Comparison Layout**: Use the preview title-bar button to switch between side-by-side columns and a unified view with removed text followed by added text. Unified is the default; choose another default in Settings. The preview remembers your choice.
 - **Native diff**: Use this Explorer context-menu command on a `.rr` file to open VS Code's built-in comparison.
 - **Open RR as JSON**: Use this Explorer context-menu command to inspect the stored request without automatically opening its preview.
 
@@ -71,9 +72,11 @@ Both creation methods preserve the original line endings and UTF-8 BOM. Changes 
 
 ## Other functions 
 
-- **Resize columns**: Drag the center divider; the preview remembers its position. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
+- **Navigate changes**: The 15px scrollbar shows red/green markers for pending changes. Click a marker to jump to it, or drag the thumb to scroll. It sits between the columns in side-by-side view and at the right edge in unified view. Accept and Undo preserve your place.
 
-- **Edit proposal**: Click pending code to edit one source line in place. Save and Cancel replace its action buttons. Save changes only the `.rr` proposal; Accept is still required to change the original. Saving the original content removes that entry without affecting other decisions. Undo resolved entries before editing them.
+- **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
+
+- **Edit proposal**: Click pending code to place the caret and edit the proposed block directly in place. Save and Cancel replace its action buttons. Save changes only the `.rr` proposal; Accept is still required to change the original. Saving the original content removes that entry without affecting other decisions. Undo resolved entries before editing them.
 
 
 

@@ -24,7 +24,7 @@ function textValue(value: unknown, label: string, limit = MAX_TEXT): string {
 function fragment(value: unknown, label: string): string | null {
   if (value === null) return null;
   const result = textValue(value, label);
-  if (/[\r\n]/.test(result)) throw new Error(label + ' must contain text from a single line, without newline characters.');
+  if (/\r/.test(result)) throw new Error(label + ' must use LF (\\n), not CR, between logical lines.');
   return result;
 }
 function timestamp(value: unknown): string {
@@ -72,15 +72,19 @@ export function sourceLines(value: string): SourceLine[] {
 }
 const unique = (source: string, snippet: string) => snippet === '' ? source === '' : source.indexOf(snippet) >= 0 && source.indexOf(snippet, source.indexOf(snippet) + 1) < 0;
 function uniqueOffset(source: string, snippet: string, label: string): number {
-  if (!unique(source, snippet)) throw new Error(label + ' must match exactly once within its original line. Include enough unchanged text from that same line.');
+  if (!unique(source, snippet)) throw new Error(label + ' must match exactly once within its original line or consecutive block. Include enough unchanged text from that block.');
   return snippet === '' ? 0 : source.indexOf(snippet);
 }
 /** Smallest changed span, expanded only within its line when anchors need context. */
 export function minimalLineReplacement(before: string, after: string): {before: string; after: string} {
+  return minimalBlockReplacement(before, after);
+}
+/** Minimize within boundary lines without trimming away any consumed logical line. */
+export function minimalBlockReplacement(before: string, after: string): {before: string; after: string} {
   const a = Array.from(before), b = Array.from(after);
   let left = 0, rightA = a.length, rightB = b.length;
-  while (left < rightA && left < rightB && a[left] === b[left]) left++;
-  while (rightA > left && rightB > left && a[rightA - 1] === b[rightB - 1]) { rightA--; rightB--; }
+  while (left < rightA && left < rightB && a[left] === b[left] && a[left] !== '\n') left++;
+  while (rightA > left && rightB > left && a[rightA - 1] === b[rightB - 1] && a[rightA - 1] !== '\n') { rightA--; rightB--; }
   const deadline = Date.now() + 1500;
   const rightContext = a.length - rightA;
   for (let padding = 0; padding <= left + rightContext; padding++) {
@@ -103,10 +107,15 @@ function insertionEnding(lines: SourceLine[], line: number): string {
   }
   return '\n';
 }
+const logicalLines = (text: string) => text.split('\n');
+const blockText = (lines: SourceLine[]) => lines.map(line => line.content).join('\n');
 function bootstrapBaseline(request: RevisionRequest, target: string): string {
   const accepted = request.request.filter(entry => entry.status === 'accepted');
   if (!accepted.length) return target;
-  if (accepted.some(entry => entry.after === null)) throw new Error('Accepted line deletions need the saved baseline to preserve exact original line endings.');
+  if (accepted.some(entry => entry.after === null || (entry.before !== null &&
+      (entry.after === '' || entry.before.includes('\n') || entry.after!.includes('\n'))))) {
+    throw new Error('Accepted deletions, empty replacements, or multiline replacements need the saved baseline to preserve exact original line endings.');
+  }
   const inserted = accepted.filter(entry => entry.before === null);
   const insertions = new Map<number, RequestEntry[]>(), replacements = new Map<number, RequestEntry>();
   for (const entry of accepted) {
@@ -118,25 +127,30 @@ function bootstrapBaseline(request: RevisionRequest, target: string): string {
   let lastError: unknown;
   for (const current of candidates) {
     try {
-      const count = current.length - inserted.length;
+      const count = current.length - inserted.reduce((sum, entry) => sum + logicalLines(entry.after!).length, 0);
       if (count < 0) throw new Error('Recorded insertions do not match the current original.');
       const baseline: {content: string; ending: string}[] = [];
       let index = 0;
       for (let line = 1; line <= count + 1; line++) {
         for (const entry of insertions.get(line) ?? []) {
-          if (current[index]?.content !== entry.after) throw new Error('Accepted inserted line does not match the current original.');
-          index++;
+          for (const content of logicalLines(entry.after!)) {
+            if (current[index]?.content !== content) throw new Error('Accepted inserted block does not match the current original.');
+            index++;
+          }
         }
         if (line > count) break;
-        const original = current[index++];
-        if (!original) throw new Error('The original line is missing.');
-        let content = original.content;
         const replacement = replacements.get(line);
+        const length = replacement ? logicalLines(replacement.before!).length : 1;
+        const block = current.slice(index, index + length);
+        if (block.length !== length) throw new Error('The original block is missing.');
+        let contents = block.map(item => item.content);
         if (replacement) {
+          const content = blockText(block);
           const start = uniqueOffset(content, replacement.after!, 'Accepted request.after');
-          content = content.slice(0, start) + replacement.before! + content.slice(start + replacement.after!.length);
+          contents = logicalLines(content.slice(0, start) + replacement.before! + content.slice(start + replacement.after!.length));
         }
-        baseline.push({content, ending: original.ending});
+        contents.forEach((content, offset) => baseline.push({content, ending: block[offset]!.ending}));
+        index += length; line += length - 1;
       }
       if (index !== current.length) throw new Error('Accepted entries reference lines outside the original.');
       if (count && inserted.some(entry => entry.line === count + 1) && current[current.length - 1]?.ending === '') baseline[count - 1]!.ending = '';
@@ -151,31 +165,61 @@ export function resolveRequest(request: RevisionRequest, target: string, cachedB
   textValue(target, 'Current original');
   const baseline = textValue(cachedBaseline ?? bootstrapBaseline(request, target), 'Request baseline');
   const original = sourceLines(baseline);
-  const seen = new Set<number>();
   const planned = request.request.map((entry, index) => {
     const source = original[entry.line - 1];
     if (entry.before === null) {
-      if (entry.line > original.length + 1) throw new Error('Inserted line must be before an original line or immediately after its last line.');
+      if (entry.line > original.length + 1) throw new Error('Inserted block must be before an original line or immediately after its last line.');
       const append = entry.line === original.length + 1;
       const unterminated = append && original.length > 0 && original[original.length - 1]!.ending === '';
-      if (unterminated && request.request.some(item => item.line === original.length && item.after === null)) throw new Error('Replace the final line instead of combining its deletion with an append at an unterminated end of file.');
-      const ending = insertionEnding(original, entry.line), content = entry.after!;
-      const start = source?.start ?? baseline.length;
+      if (unterminated && request.request.some(item => item.before !== null && item.after === null &&
+          item.line + logicalLines(item.before).length - 1 === original.length)) {
+        throw new Error('Replace the final line instead of combining its deletion with an append at an unterminated end of file.');
+      }
+      const ending = insertionEnding(original, entry.line), contents = logicalLines(entry.after!);
+      const content = contents.join(ending), start = source?.start ?? baseline.length;
       return {entry, index, start, end: start, before: '', after: unterminated ? ending + content : content + ending,
-        displayAfter: unterminated ? content : undefined, oldLines: 0, newLines: 1};
+        displayAfter: unterminated ? content : undefined, draftAfter: entry.after!, oldLines: 0, newLines: contents.length};
     }
-    if (!source) throw new Error('Request.line does not identify an existing original line.');
-    if (seen.has(entry.line)) throw new Error('Combine changes on the same original line into one request entry.');
-    seen.add(entry.line);
+    const length = logicalLines(entry.before).length;
+    const block = original.slice(entry.line - 1, entry.line - 1 + length);
+    if (!source || block.length !== length) throw new Error('Request.line and before must identify an existing original line or consecutive block.');
+    const content = blockText(block), last = block[block.length - 1]!;
+    const before = baseline.slice(source.start, last.end);
     if (entry.after === null) {
-      if (entry.before !== source.content) throw new Error('Deleting a line requires its complete original text in before.');
-      return {entry, index, start: source.start, end: source.end, before: source.content + source.ending, after: '', displayAfter: undefined, oldLines: 1, newLines: 0};
+      if (entry.before !== content) throw new Error('Deleting a block requires its complete original text in before.');
+      return {entry, index, start: source.start, end: last.end, before, after: '', displayAfter: undefined, draftAfter: '', oldLines: length, newLines: 0};
     }
-    const start = uniqueOffset(source.content, entry.before, 'Request ' + (index + 1) + '.before');
-    const after = source.content.slice(0, start) + entry.after + source.content.slice(start + entry.before.length);
-    return {entry, index, start: source.start, end: source.end, before: source.content + source.ending,
-      after: after + source.ending, displayAfter: undefined, oldLines: 1, newLines: 1};
+    const offset = uniqueOffset(content, entry.before, 'Request ' + (index + 1) + '.before');
+    const contents = logicalLines(content.slice(0, offset) + entry.after + content.slice(offset + entry.before.length));
+    const after = contents.map((value, lineIndex) => value + (lineIndex === contents.length - 1 ? last.ending
+      : block[lineIndex]?.ending || insertionEnding(original, entry.line + lineIndex))).join('');
+    if (after.replace(/\r\n|\r/g, '\n') !== contents.join('\n') + (last.ending ? '\n' : '')) {
+      throw new Error('The proposal would merge separate CR and LF line endings. Keep the affected logical lines distinct.');
+    }
+    return {entry, index, start: source.start, end: last.end, before, after, displayAfter: undefined, draftAfter: contents.join('\n'),
+      oldLines: length, newLines: contents.length};
   }).sort((a, b) => a.start - b.start || a.end - b.end || a.index - b.index);
+  let occupiedEnd = -1;
+  for (const item of planned) {
+    if (item.start < occupiedEnd) throw new Error('Request entries overlap original lines. Combine changes on the same original line or block into one entry; insertions may share its outer boundaries.');
+    occupiedEnd = Math.max(occupiedEnd, item.end);
+  }
+  // Every entry is independently reviewable. Track possible trailing CRs in a
+  // single pass, including empty deletions and same-anchor insertions, so no
+  // decision subset can turn two logical separators into one physical CRLF.
+  let mayEndWithCR = false, boundaryOffset = 0;
+  const appendAlternatives = (pieces: string[]) => {
+    if (mayEndWithCR && pieces.some(piece => piece.startsWith('\n'))) {
+      throw new Error('The proposal would merge separate CR and LF line endings. Keep the affected logical lines distinct.');
+    }
+    mayEndWithCR = pieces.some(piece => piece ? piece.endsWith('\r') : mayEndWithCR);
+  };
+  for (const item of planned) {
+    appendAlternatives([baseline.slice(boundaryOffset, item.start)]);
+    appendAlternatives([item.before, item.after]);
+    boundaryOffset = item.end;
+  }
+  appendAlternatives([baseline.slice(boundaryOffset)]);
   const decisions: Record<string, Decision> = {}, entryIndexByHunkId: Record<string, number> = {};
   const duplicates = new Map<string, number>(); let delta = 0;
   const hunks = planned.map((item, index): Hunk => {
@@ -183,7 +227,7 @@ export function resolveRequest(request: RevisionRequest, target: string, cachedB
     const ordinal = duplicates.get(identity) ?? 0; duplicates.set(identity, ordinal + 1);
     const id = createHash('sha256').update(identity + ':' + ordinal).digest('hex').slice(0, 24);
     const hunk: Hunk = {id, index, start: item.start, end: item.end, before: item.before, after: item.after,
-      ...(item.displayAfter === undefined ? {} : {displayAfter: item.displayAfter}),
+      ...(item.displayAfter === undefined ? {} : {displayAfter: item.displayAfter}), draftAfter: item.draftAfter,
       oldStart: item.entry.line, oldLines: item.oldLines, newStart: item.entry.line + delta, newLines: item.newLines,
       contextBefore: original.slice(Math.max(0, item.entry.line - 4), item.entry.line - 1).map(line => line.content),
       contextAfter: original.slice(item.entry.line - 1 + item.oldLines, item.entry.line + 2).map(line => line.content)};
@@ -266,25 +310,26 @@ export function ensureRequestTime(text: string, time: string): string {
   const inserted = text.slice(0, token.end) + ',' + separator + '"time": ' + JSON.stringify(checked) + text.slice(token.end);
   parseRequestDocument(inserted); return inserted;
 }
-/** Edit the displayed single line, keeping other entries and the target unchanged. */
+/** Edit one displayed block, keeping other entries and the target unchanged. */
 export function editPendingRequest(text: string, baseline: string, hunkId: string, draft: string): {text: string; request: RevisionRequest; review: ResolvedRequest; changed: boolean} {
   const request = parseRequestDocument(text), review = resolveRequest(request, baseline, baseline);
   const hunk = review.hunks.find(item => item.id === hunkId);
   if (!hunk) throw new Error('This change no longer exists. Review the refreshed request.');
   const index = review.entryIndexByHunkId[hunkId]!, entry = request.request[index]!;
   if (entry.status !== 'pending') throw new Error('Only pending changes can be edited.');
-  const content = textValue(draft, 'Draft').replace(/(?:\r\n|\r|\n)$/, '');
-  if (/[\r\n]/.test(content)) throw new Error('Edit one line at a time. Add separate request entries for additional lines.');
-  const displayed = (hunk.displayAfter ?? hunk.after).replace(/(?:\r\n|\r|\n)$/, '');
+  const content = textValue(draft, 'Draft').replace(/\r\n|\r/g, '\n');
+  const displayed = hunk.draftAfter!;
   if (content === displayed) return {text, request, review, changed: false};
-  const entries = requestEntries(text), source = sourceLines(baseline)[entry.line - 1];
+  const entries = requestEntries(text);
+  const original = sourceLines(baseline);
+  const source = blockText(original.slice(entry.line - 1, entry.line - 1 + hunk.oldLines));
   let updated: string;
-  if (entry.before !== null && content === source!.content) {
+  if (entry.before !== null && content === source) {
     const start = index === entries.length - 1 && index > 0 ? entries[index - 1]!.end : entries[index]!.start;
     const end = index < entries.length - 1 ? entries[index + 1]!.start : entries[index]!.end;
     updated = text.slice(0, start) + text.slice(end);
   } else {
-    const replacement = entry.before === null ? {before: null, after: content} : minimalLineReplacement(source!.content, content);
+    const replacement = entry.before === null ? {before: null, after: content} : minimalBlockReplacement(source, content);
     const beforeToken = property(text, entries[index]!.start, 'before'), afterToken = property(text, entries[index]!.start, 'after');
     if (!beforeToken || !afterToken) throw new Error('The selected entry has no before/after text.');
     updated = replaceTokens(text, [{...beforeToken, value: JSON.stringify(replacement.before)}, {...afterToken, value: JSON.stringify(replacement.after)}]);

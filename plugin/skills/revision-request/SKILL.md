@@ -11,10 +11,11 @@ Create reviewable proposals for existing UTF-8 text files while keeping the targ
 
 1. Call `rr_get_format` (or read `rr://format`) for the connected version's format.
 2. Use `rr_read_target` with the intended workspace-relative path. Keep its exact saved content and SHA-256 `hash` together. Dirty or stale targets need a fresh saved snapshot; do not save or discard the user's unsaved edits without authorization.
-3. Build entries using original 1-based line numbers and exact, single-line `before`/`after` snippets. A replacement must match once on its indicated line; use minimal same-line context. Combine replacements/deletions on the same original line. Neither string may contain CR or LF.
-   - `before: null` inserts a complete line before the anchor; original line count plus one appends. Insertions at one anchor follow array order.
-   - `after: null` deletes a whole line, so `before` must be that entire line without its ending.
+3. Build atomic entries using original 1-based first-line numbers and exact `before`/`after` fragments or contiguous blocks. Group related consecutive changes into one entry by default; keep independent changes separate. Use LF (`\n` in JSON) between logical lines; CR is rejected. Match uniquely beginning in the indicated original line: first/last lines may be fragments, intervening lines must be complete. Do not overlap consumed original line ranges or insert strictly inside another block; boundary insertions are allowed.
+   - `before: null` inserts complete LF-separated lines before the anchor; original line count plus one appends. Insertions at one anchor follow array order.
+   - `after: null` deletes the whole original block, so `before` contains its complete lines with LF separators and no final physical line ending.
    - `""` means empty text; both values cannot be null.
+   - `reason` is optional. Omit it or use `""` unless an explanation helps the reviewer. Do not generate reasons for every entry by default. Saved line endings and the BOM are preserved separately.
 4. Call `rr_create_request` with `path`, the returned hash as `expectedHash`, a fresh `clientRequestId`, and `request: [{line, before, after, reason?}]`. Do not send `time` or `status`; the server supplies them. Retry the same ID only with the identical payload. Inspect an existing request instead of overwriting it.
 5. Call `rr_open_preview` with the returned `requestId`. Report the proposal as pending and identify the target/request. Creating or opening it is not acceptance.
 6. Use `rr_get_request_status` later when review results are needed. Report accepted, ignored, pending, stale, or unavailable results accurately. A missing request file does not prove acceptance.

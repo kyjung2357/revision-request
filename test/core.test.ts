@@ -185,7 +185,7 @@ test('render rejects stale or overlapping change groups instead of producing a c
   assert.throws(() => renderAccepted(file.before, [hunk!], { [hunk!.id]: 'typo' as Decision }), /invalid review decision/);
 });
 
-test('intraline comparison preserves separate common LaTeX stretches between multiple edits', () => {
+test('intraline comparison marks entire LaTeX tokens while preserving unchanged words', () => {
   const before = '\\alpha = 2x + 3y.\\label{eq:estimate}\r\n';
   const after = '\\alpha = 1x + 4y.\\label{eq:estimate}\r\n';
   const hunk = computeHunks(make(before, after))[0]!;
@@ -193,17 +193,87 @@ test('intraline comparison preserves separate common LaTeX stretches between mul
   const [row] = computeInlineChanges(hunk);
   assert.deepEqual(row, {
     before: [
-      {text: '\\alpha = ', changed: false}, {text: '2', changed: true},
-      {text: 'x + ', changed: false}, {text: '3', changed: true},
-      {text: 'y.\\label{eq:estimate}', changed: false},
+      {text: '\\alpha = ', changed: false}, {text: '2x', changed: true},
+      {text: ' + ', changed: false}, {text: '3y.\\label{eq:estimate}', changed: true},
     ],
     after: [
-      {text: '\\alpha = ', changed: false}, {text: '1', changed: true},
-      {text: 'x + ', changed: false}, {text: '4', changed: true},
-      {text: 'y.\\label{eq:estimate}', changed: false},
+      {text: '\\alpha = ', changed: false}, {text: '1x', changed: true},
+      {text: ' + ', changed: false}, {text: '4y.\\label{eq:estimate}', changed: true},
     ],
   });
   assert.deepEqual(hunk, snapshot, 'Presentation metadata must not mutate a hunk or its identity.');
+  assert.equal(renderAccepted(before, [hunk], {[hunk.id]: 'accepted'}), after);
+});
+
+test('intraline word matches stay normal when adjacent words are inserted and removed', () => {
+  const [row] = computeInlineChanges({before: '# Team notebook guide', after: '# Team decision notebook'});
+  assert.deepEqual(row, {
+    before: [{text: '# Team notebook', changed: false}, {text: ' guide', changed: true}],
+    after: [
+      {text: '# Team ', changed: false}, {text: 'decision ', changed: true},
+      {text: 'notebook', changed: false},
+    ],
+  });
+});
+
+test('intraline sentence edits do not expose matching letters inside changed words', () => {
+  const [row] = computeInlineChanges({
+    before: '3. Paste every message from the chat into the page.',
+    after: '3. List the people who attended.',
+  });
+  assert.equal(row!.before.map(segment => segment.text).join(''), '3. Paste every message from the chat into the page.');
+  assert.equal(row!.after.map(segment => segment.text).join(''), '3. List the people who attended.');
+  assert.deepEqual(row!.after, [
+    {text: '3. ', changed: false}, {text: 'List', changed: true},
+    {text: ' the ', changed: false}, {text: 'people who attended.', changed: true},
+  ]);
+  assert.ok(row!.before.filter(segment => !segment.changed).every(segment => /^(?:3\. | the )$/.test(segment.text)));
+});
+
+test('intraline changed blocks include the exact whitespace between adjacent changed words', () => {
+  const [row] = computeInlineChanges({before: 'keep old\t  value tail', after: 'keep new\t value! tail'});
+  assert.deepEqual(row, {
+    before: [
+      {text: 'keep ', changed: false}, {text: 'old\t  value', changed: true},
+      {text: ' tail', changed: false},
+    ],
+    after: [
+      {text: 'keep ', changed: false}, {text: 'new\t value!', changed: true},
+      {text: ' tail', changed: false},
+    ],
+  });
+});
+
+test('intraline whitespace-only edits remain marked without changing nearby words', () => {
+  for (const [before, after, oldChanged, newChanged] of [
+    ['same  words', 'same\twords', '  ', '\t'],
+    [' same ', '\tsame  ', ' ', '\t '],
+    [' \t ', '  ', '\t', ''],
+  ]) {
+    const [row] = computeInlineChanges({before: before!, after: after!});
+    assert.equal(row!.before.map(segment => segment.text).join(''), before);
+    assert.equal(row!.after.map(segment => segment.text).join(''), after);
+    assert.equal(row!.before.filter(segment => segment.changed).map(segment => segment.text).join(''), oldChanged);
+    assert.equal(row!.after.filter(segment => segment.changed).map(segment => segment.text).join(''), newChanged);
+    assert.ok(row!.before.filter(segment => segment.changed).every(segment => /^\s+$/.test(segment.text)));
+    assert.ok(row!.after.filter(segment => segment.changed).every(segment => /^\s+$/.test(segment.text)));
+  }
+});
+
+test('intraline Unicode and punctuation belong to their entire whitespace-delimited token', () => {
+  const before = 'keep 한글😀. e\u0301clair α,β \u00a0tail';
+  const after = 'keep 한글😁. e\u0301clairs α;β \u00a0tail';
+  const [row] = computeInlineChanges({before, after});
+  assert.deepEqual(row, {
+    before: [
+      {text: 'keep ', changed: false}, {text: '한글😀. e\u0301clair α,β', changed: true},
+      {text: ' \u00a0tail', changed: false},
+    ],
+    after: [
+      {text: 'keep ', changed: false}, {text: '한글😁. e\u0301clairs α;β', changed: true},
+      {text: ' \u00a0tail', changed: false},
+    ],
+  });
 });
 
 test('intraline Unicode edits keep whole code points and exact surrounding text', () => {
@@ -235,6 +305,9 @@ test('intraline work limits fall back to whole changed text without losing conte
   const pairs = [
     {before: 'a'.repeat(8193) + 'x', after: 'a'.repeat(8193) + 'y'},
     {before: 'a'.repeat(1024), after: 'b'.repeat(1024)},
+    // More than 512 token edits must use the conservative fallback even though
+    // the repeated final word could otherwise remain normal.
+    {before: 'old '.repeat(300) + 'tail', after: 'new '.repeat(300) + 'tail'},
   ];
   for (const input of pairs) {
     assert.deepEqual(computeInlineChanges(input), [

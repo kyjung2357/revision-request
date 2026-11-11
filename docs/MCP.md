@@ -42,7 +42,7 @@ A normal agent workflow is:
 
 1. Read `rr://format` or call `rr_get_format` without arguments.
 2. Call `rr_read_target` with a workspace-relative path. It returns `path`, exact saved `content`, and its SHA-256 `hash`. Keep the text and hash together. Save or undo unsaved target edits first; reads and proposals refuse dirty targets.
-3. Prepare independent `request` entries with original 1-based `line` numbers, single-line `before`/`after` fragments, and optional per-entry `reason`. Each `before` must match once within its indicated original line; include minimal context from that same line if needed. The `before` and `after` strings cannot contain CR or LF. Line endings and BOM are handled separately.
+3. Prepare atomic `request` entries with original 1-based first-line numbers and exact `before`/`after` fragments or LF-separated blocks. Group related contiguous changes into one entry by default; retain separate entries for independent changes. A block must match uniquely beginning in its indicated original line. Use LF (`\n`) for logical line breaks; CR is rejected. Saved line endings and BOM are preserved separately. `reason` is optional: omit it or use `""` when no explanation is needed.
 4. Call `rr_create_request` using the returned hash as `expectedHash` and a fresh `clientRequestId` for this proposal.
 5. Use the returned request ID with `rr_open_preview` when the user should see the review.
 6. Report that the proposal is pending. Check `rr_get_request_status` later to learn what the user accepted or ignored.
@@ -82,9 +82,9 @@ Pass that object to `rr_read_target`, then send this shape to `rr_create_request
 
 The server validates that the target still matches `expectedHash`, resolves each snippet exactly, and creates the `.rr` file exclusively. It supplies the creation `time` and writes every entry with `status: "pending"`; these fields are not accepted from the MCP client. It does not write `after` into the target. MCP creates the request beside the target: `src/math.py` becomes `src/math.py.rr`. The filename preserves the full target basename and extension.
 
-Each entry is one atomic decision on a single original line. Use one replacement/deletion entry per original line; combine multiple edits on that line. The original `line` values stay fixed after other decisions. The saved shape is `{path, time, request: [{line, before, after, reason, status}]}`.
+Each entry is one atomic decision on a fragment or consecutive block. `line` identifies its first original line and stays fixed after other decisions. First/last lines may be partial matches; all intervening lines must match completely. Consumed replacement/deletion line ranges cannot overlap. An insertion strictly inside another block is invalid, while start/end boundary insertions are allowed. The saved shape is `{path, time, request: [{line, before, after, reason?, status}]}`.
 
-`before: null` inserts the complete `after` line before the indicated original line; original line count plus one appends. Several insertions at one anchor follow array order. `after: null` deletes the complete indicated original line, so `before` must contain its full content without the line ending. An empty string means empty text or a blank line. Both values cannot be null. To change several lines, send several entries.
+`before: null` inserts complete new lines from LF-separated `after` before the indicated original line; original line count plus one appends. Several insertions at one anchor follow array order. `after: null` deletes the complete original block, so `before` contains all of its lines with LF separators and no final physical line ending. An empty string means empty text or a blank line. Both values cannot be null. For example, `{line: 8, before: "old()\nfinish()", after: "new()\nfinish()"}` is one two-line decision.
 
 New entries must start pending. Agents must not write accepted/ignored JSON statuses to claim that a human reviewed the proposal. Status metadata alone never applies or undoes source changes; cached source verification also prevents mismatched states from being reported as completed review. Use the authorized review UI or, only when explicitly enabled, the MCP decision tools.
 
@@ -98,7 +98,7 @@ Paths are relative to the connected workspace. Request IDs, revisions, hunk IDs,
 | --- | --- | --- |
 | `rr_get_format` | None | Returns the guide, schema, and example, including when the VS Code bridge is offline. |
 | `rr_read_target` | `path` | Reads an existing UTF-8 target and returns its content and hash. |
-| `rr_create_request` | `path`, `expectedHash`, `clientRequestId`, `request: [{line, before, after, reason?}]` | Creates line changes with server-generated time and pending statuses. |
+| `rr_create_request` | `path`, `expectedHash`, `clientRequestId`, `request: [{line, before, after, reason?}]` | Creates fragment/block changes with server-generated time and pending statuses. |
 | `rr_list_requests` | Optional `includeCompleted` (default `false`) | Lists existing requests; set true to also include retained completion receipts after cleanup. |
 | `rr_get_request_status` | `requestId` | Retrieves the request's current review state or retained completion receipt. |
 | `rr_open_preview` | `requestId` | Opens the review UI without making a decision. |
