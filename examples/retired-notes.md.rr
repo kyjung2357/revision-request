@@ -1,54 +1,12 @@
 {
   "path": "examples/retired-notes.md",
-  "time": "2026-11-10T22:22:46-05:00",
+  "time": "2026-11-11T05:38:23.920Z",
   "request": [
     {
       "line": 1,
-      "before": "# Retired scratch notes",
+      "before": "# Retired scratch notes\n\nTemporary check: confirm the sample report prints.\nTemporary check: confirm the headings wrap.\n\nThese notes have been copied into the project checklist.\nThis scratch file is intentionally kept for future use.",
       "after": null,
-      "reason": "Remove the retired scratch content while keeping the file itself.",
-      "status": "pending"
-    },
-    {
-      "line": 2,
-      "before": "",
-      "after": null,
-      "reason": "Remove a separator while clearing the retired scratch content.",
-      "status": "pending"
-    },
-    {
-      "line": 3,
-      "before": "Temporary check: confirm the sample report prints.",
-      "after": null,
-      "reason": "Remove the retired scratch content while keeping the file itself.",
-      "status": "pending"
-    },
-    {
-      "line": 4,
-      "before": "Temporary check: confirm the headings wrap.",
-      "after": null,
-      "reason": "Remove the retired scratch content while keeping the file itself.",
-      "status": "pending"
-    },
-    {
-      "line": 5,
-      "before": "",
-      "after": null,
-      "reason": "Remove a separator while clearing the retired scratch content.",
-      "status": "pending"
-    },
-    {
-      "line": 6,
-      "before": "These notes have been copied into the project checklist.",
-      "after": null,
-      "reason": "Remove the retired scratch content while keeping the file itself.",
-      "status": "pending"
-    },
-    {
-      "line": 7,
-      "before": "This scratch file is intentionally kept for future use.",
-      "after": null,
-      "reason": "Remove the retired scratch content while keeping the file itself.",
+      "reason": "Clear the retired notes while keeping the file itself.",
       "status": "pending"
     }
   ]

@@ -1,0 +1,48 @@
+\documentclass{article}
+\usepackage{amsmath,amssymb}
+\title{A grouped revision example}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+
+\section{Assumptions}
+Let \(f:\mathbb R\to\mathbb R\) be differentiable at \(x\).
+We consider increments of either sign \(h\).
+The derivative describes the local first-order change in the function.
+
+\section{Local approximation}
+The first-order expansion includes a remainder:
+\begin{align*}
+  f(x+h) &= f(x)+f'(x)h+r(h), \\
+  \frac{r(h)}{h} &\longrightarrow 0
+  \qquad (h\to0).
+\end{align*}
+Thus the error becomes small relative to the increment.
+
+\section{A worked example}
+Take \(f(t)=t^2\) and keep \(x\) fixed.
+Then \(f'(x)=2x\).
+
+
+The full calculation can be reviewed as one insertion:
+\begin{align*}
+  f(x+h)-f(x)
+    &= (x+h)^2-x^2 \\
+    &= 2xh+h^2, \\
+  f(x+h)-f(x)-f'(x)h
+    &= h^2.
+\end{align*}
+For nonzero \(h\), divide the remainder by the increment:
+\[
+  \frac{h^2}{h}=h\longrightarrow0.
+\]
+The same limit holds for increments of either sign.
+At \(h=0\), the original difference is exactly zero.
+No additional assumption on the sign of \(x\) is needed.
+
+\section{Reading the result}
+A useful explanation names the assumptions, keeps each calculation near the claim it supports, and states which terms disappear in the limit so that readers can check the reasoning without jumping between distant paragraphs.
+The calculation above identifies the remainder explicitly.
+
+\end{document}

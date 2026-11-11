@@ -1,124 +1,86 @@
 {
   "path": "examples/inventory_report.py",
-  "time": "2026-11-10T22:22:46-05:00",
+  "time": "2026-11-11T05:38:23.920Z",
   "request": [
     {
       "line": 5,
       "before": null,
       "after": "# Each row describes one product; prices are in dollars.",
-      "reason": "Document the units used by the self-contained sample data.",
       "status": "pending"
     },
     {
       "line": 6,
       "before": null,
       "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
       "status": "pending"
     },
     {
       "line": 17,
       "before": "list(items)",
       "after": "[item for item in items if item[\"enabled\"]]",
-      "reason": "Exclude disabled products from every section of the report.",
+      "reason": "Exclude disabled products from the report.",
       "status": "pending"
     },
     {
-      "line": 24,
-      "before": "e",
-      "after": "e * item[\"quantity\"]",
-      "reason": "Multiply unit price by the available quantity when computing stock value.",
+      "line": 21,
+      "before": "total = 0.0\n    for item in items:\n        price = item[\"price\"]\n        total += price\n    return total",
+      "after": "return sum(item[\"price\"] * item[\"quantity\"] for item in items)",
+      "reason": "Replace the loop with a quantity-weighted sum.",
       "status": "pending"
     },
     {
       "line": 31,
       "before": "<",
       "after": "<=",
-      "reason": "Include products exactly at the reorder threshold.",
+      "reason": "",
       "status": "pending"
     },
     {
       "line": 36,
       "before": "]",
       "after": "].strip()",
-      "reason": "Remove surrounding whitespace before aligning product names.",
       "status": "pending"
     },
     {
       "line": 39,
       "before": "1f",
       "after": "2f",
-      "reason": "Display unit prices with two decimal places.",
       "status": "pending"
     },
     {
       "line": 45,
       "before": "items",
       "after": "sorted(items, key=lambda row: row[\"name\"].strip())",
-      "reason": "Sort the displayed rows by their trimmed product names.",
       "status": "pending"
     },
     {
       "line": 51,
       "before": "    print(\"DEBUG: inventory rows loaded\")",
       "after": null,
-      "reason": "Remove the temporary diagnostic output from the report.",
       "status": "pending"
     },
     {
       "line": 54,
       "before": null,
       "after": "    print(\"Only enabled products appear in this report.\")",
-      "reason": "Explain which products are included in the printed report.",
       "status": "pending"
     },
     {
       "line": 55,
-      "before": "len(",
-      "after": "sum(item['quantity'] for item in ",
-      "reason": "Sum quantities instead of counting product rows.",
-      "status": "pending"
-    },
-    {
-      "line": 56,
-      "before": "{inventory_value(items):.1",
-      "after": "${inventory_value(items):.2",
-      "reason": "Show the dollar symbol and two decimal places for the total value.",
-      "status": "pending"
-    },
-    {
-      "line": 57,
-      "before": "\"Low stock",
-      "after": "f\"Low stock (at most {LOW_STOCK} units)",
-      "reason": "Explain the inclusive low-stock threshold in the heading.",
+      "before": "len(items)}\")\n    print(f\"Stock value: {inventory_value(items):.1f}\")\n    print(\"Low stock",
+      "after": "sum(item['quantity'] for item in items)}\")\n    print(f\"Stock value: ${inventory_value(items):.2f}\")\n    print(f\"Low stock (at most {LOW_STOCK} units)",
       "status": "pending"
     },
     {
       "line": 59,
-      "before": "}:",
-      "after": ".strip()}:",
-      "reason": "Use the trimmed name in low-stock notices as well as the table.",
-      "status": "pending"
-    },
-    {
-      "line": 60,
-      "before": "    print(\"This diagnostic message is no longer needed.\")",
-      "after": null,
-      "reason": "Remove an obsolete diagnostic footer.",
+      "before": "}: {item['quantity']} left\")\n    print(\"This diagnostic message is no longer needed.",
+      "after": ".strip()}: {item['quantity']} left",
       "status": "pending"
     },
     {
       "line": 65,
       "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 65,
-      "before": null,
-      "after": "# Run this file directly to print the sample report.",
-      "reason": "Add a usage hint at the end of the sample script.",
+      "after": "\n# Run this file directly to print the sample report.",
       "status": "pending"
     }
   ]

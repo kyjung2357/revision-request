@@ -1,103 +1,11 @@
 {
   "path": "examples/blank-notes.md",
-  "time": "2026-11-10T22:22:46-05:00",
+  "time": "2026-11-11T05:38:23.920Z",
   "request": [
     {
       "line": 1,
       "before": null,
-      "after": "# Field notes",
-      "reason": "Add a heading to organize the previously empty notes file.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "## Observation",
-      "reason": "Add a heading to organize the previously empty notes file.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "Record the date, place, and question before collecting details.",
-      "reason": "Add a concrete prompt to the new field-notes template.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "## Evidence",
-      "reason": "Add a heading to organize the previously empty notes file.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "- Link the source material.",
-      "reason": "Add a concrete prompt to the new field-notes template.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "- Separate observations from assumptions.",
-      "reason": "Add a concrete prompt to the new field-notes template.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "## Next step",
-      "reason": "Add a heading to organize the previously empty notes file.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "",
-      "reason": "Insert a blank line to separate the surrounding sections.",
-      "status": "pending"
-    },
-    {
-      "line": 1,
-      "before": null,
-      "after": "Write one action that would resolve the most important open question.",
-      "reason": "Add a concrete prompt to the new field-notes template.",
+      "after": "# Field notes\n\n## Observation\n\nRecord the date, place, and question before collecting details.\n\n## Evidence\n\n- Link the source material.\n- Separate observations from assumptions.\n\n## Next step\n\nWrite one action that would resolve the most important open question.",
       "status": "pending"
     }
   ]

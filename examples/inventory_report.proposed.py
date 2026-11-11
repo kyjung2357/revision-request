@@ -20,11 +20,7 @@ def active_items(items: list[dict]) -> list[dict]:
 
 
 def inventory_value(items: list[dict]) -> float:
-    total = 0.0
-    for item in items:
-        price = item["price"]
-        total += price * item["quantity"]
-    return total
+    return sum(item["price"] * item["quantity"] for item in items)
 
 
 def low_stock_items(items: list[dict]) -> list[dict]:

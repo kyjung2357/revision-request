@@ -1,0 +1,45 @@
+{
+  "path": "examples/multiline-demo.tex",
+  "time": "2026-11-11T05:38:23.920Z",
+  "request": [
+    {
+      "line": 11,
+      "before": "positive increments",
+      "after": "increments of either sign",
+      "reason": "Differentiability uses increments of either sign.",
+      "status": "pending"
+    },
+    {
+      "line": 15,
+      "before": "approximation is written as an exact equality:\n\\[\n  f(x+h)=f(x)+f'(x)h.\n\\]\nThe remainder is omitted from this draf",
+      "after": "first-order expansion includes a remainder:\n\\begin{align*}\n  f(x+h) &= f(x)+f'(x)h+r(h), \\\\\n  \\frac{r(h)}{h} &\\longrightarrow 0\n  \\qquad (h\\to0).\n\\end{align*}\nThus the error becomes small relative to the incremen",
+      "reason": "Keep the expansion and its remainder condition in one review decision.",
+      "status": "pending"
+    },
+    {
+      "line": 23,
+      "before": "=",
+      "after": "=2",
+      "reason": "",
+      "status": "pending"
+    },
+    {
+      "line": 25,
+      "before": "\\section{Temporary checklist}\nThis section is only a drafting reminder.\nCheck the assumptions before sharing the note.\nAdd a worked calculation if there is room.\nRemove this checklist before publication.",
+      "after": null,
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": null,
+      "after": "The full calculation can be reviewed as one insertion:\n\\begin{align*}\n  f(x+h)-f(x)\n    &= (x+h)^2-x^2 \\\\\n    &= 2xh+h^2, \\\\\n  f(x+h)-f(x)-f'(x)h\n    &= h^2.\n\\end{align*}\nFor nonzero \\(h\\), divide the remainder by the increment:\n\\[\n  \\frac{h^2}{h}=h\\longrightarrow0.\n\\]\nThe same limit holds for increments of either sign.\nAt \\(h=0\\), the original difference is exactly zero.\nNo additional assumption on the sign of \\(x\\) is needed.\n",
+      "status": "pending"
+    },
+    {
+      "line": 33,
+      "before": "next version will contain a worked calculation",
+      "after": "calculation above identifies the remainder explicitly",
+      "status": "pending"
+    }
+  ]
+}

@@ -1,18 +1,21 @@
 # Revision Request examples
 
-Open the repository root as the VS Code workspace, then open one of the requests below. Every request uses a workspace-relative path beginning with `examples/` and starts with all entries pending.
+Open the repository root as the VS Code workspace, then open a request below. All entries start as pending.
 
-| Request | Original lines | What to review |
+| Request | Decisions | What to review |
 | --- | ---: | --- |
-| [inventory_report.py.rr](inventory_report.py.rr) | 64 | 10 replacements, 5 added lines, 2 deleted lines |
-| [team-notes.md.rr](team-notes.md.rr) | 44 | 11 replacements, 6 added lines, 3 deleted lines |
-| [blank-notes.md.rr](blank-notes.md.rr) | 0 | 0 replacements, 14 added lines, 0 deleted lines |
-| [retired-notes.md.rr](retired-notes.md.rr) | 7 | 0 replacements, 0 added lines, 7 deleted lines |
+| [inventory_report.py.rr](inventory_report.py.rr) | 13 | Runnable Python; a five-line calculation replaced at once; grouped totals, individual fixes, additions, and deletions |
+| [team-notes.md.rr](team-notes.md.rr) | 13 | Long wrapped paragraphs, table edits, related lines reviewed together, and an appended block |
+| [blank-notes.md.rr](blank-notes.md.rr) | 1 | One decision inserts a complete 14-line template into an empty file |
+| [retired-notes.md.rr](retired-notes.md.rr) | 1 | One decision deletes all seven lines and keeps the file |
+| [multiline-demo.tex.rr](multiline-demo.tex.rr) | 6 | An equation block, a worked calculation, a removed draft section, and small independent corrections |
 
-The Python report is self-contained and can be run directly. The team-notes example includes long paragraphs for checking line wrapping. The blank-notes original is an actual zero-byte file; the retired-notes request clears every line but keeps the file.
+Related lines are grouped with `\n` inside JSON strings, so a whole block has one **Accept / Ignore** choice. Independent edits remain separate. Some entries omit `reason`, while others use an empty string; both leave the Why button invisible without changing the button alignment. Entries with an explanation still show **Why**.
 
-Each `*.proposed.*` snapshot shows the result of accepting every entry. Each entry contains one line-level edit and a reason for the **Why** button; review the entries individually with **Accept** or **Ignore**.
+The preview starts in unified mode by default. Use **Toggle Comparison Layout** in the editor title to compare the same request side by side. The longer examples also exercise wrapping, scroll markers, and keeping your position after Accept or Undo.
 
-**Accept** changes the original examples. To try them repeatedly, use a copy of the repository or restore only the example files and requests you changed.
+Each `*.proposed.*` file is the exact result of accepting every entry. The blank-notes original is a zero-byte file; accepting the retired-notes request clears its contents but keeps the file. The Python report runs without external packages.
 
-The existing `manuscript.tex` and `manuscript.proposed.tex` are preserved as saved. They currently match, so they have no pending example request.
+**Accept changes the original example.** Use a disposable copy of this workspace if you want to repeat the review. Keep the pending request and original together when sharing an example.
+
+The previously reviewed `manuscript.tex` and its matching proposed copy are preserved. Use `multiline-demo.tex.rr` for the new TeX example.
