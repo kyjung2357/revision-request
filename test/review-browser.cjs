@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
+const Module = require('node:module');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 
@@ -18,7 +19,7 @@ const runName = new Date().toISOString().replace(/[:.]/g, '-');
 const runDir = path.join(scratchRoot, runName);
 const results = [];
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-let browser, server, cdp, computeInlineChanges, parseRequestDocument, resolveRequest, browserLog = '', runCreated = false;
+let browser, server, cdp, computeInlineChanges, parseRequestDocument, resolveRequest, createRequestViewHtml, browserLog = '', runCreated = false;
 
 async function findBrowser() {
   const candidates = [
@@ -90,14 +91,23 @@ function mockScript() {
 }
 
 async function startServer() {
-  const css = await fs.readFile(path.join(root, 'media', 'review.css'));
-  const js = await fs.readFile(path.join(root, 'media', 'review.js'));
+  const [css,js,createCss,createJs] = await Promise.all(['review.css','review.js','create-request.css','create-request.js'].map(name=>fs.readFile(path.join(root,'media',name))));
+  const createTheme = ':root{--vscode-foreground:#d4d4d4;--vscode-editor-background:#1e1e1e;--vscode-descriptionForeground:#aaa;--vscode-input-background:#252526;--vscode-input-foreground:#d4d4d4;--vscode-panel-border:#555;--vscode-button-secondaryForeground:#fff;--vscode-button-secondaryBackground:#3a3d41;--vscode-button-secondaryHoverBackground:#45494e;--vscode-button-foreground:#fff;--vscode-button-background:#0e639c;--vscode-button-hoverBackground:#1177bb;--vscode-focusBorder:#007fd4;--vscode-errorForeground:#f48771;}';
+  let createHtml = createRequestViewHtml({cspSource:"'self'",asWebviewUri:uri=>({toString:()=>'/'+path.basename(uri.fsPath)})},{fsPath:root});
+  const nonce = createHtml.match(/<script nonce="([^"]+)"/)[1];
+  createHtml = createHtml.replace('</head>','<link rel="stylesheet" href="/create-theme.css"></head>').replace('<script nonce=', '<script nonce="'+nonce+'" src="/create-mock.js"></script><script nonce=');
+  const createMock = "window.__createMessages=[];window.__xss=0;window.__setCreate=state=>{window.__createState=structuredClone(state);window.dispatchEvent(new MessageEvent('message',{data:state}));};window.acquireVsCodeApi=()=>({postMessage:message=>window.__createMessages.push(structuredClone(message)),getState:()=>({}),setState:()=>{}});";
   const html = Buffer.from('<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Revision Request layout fixture</title><link rel="stylesheet" href="/review.css"></head><body><div id="app"></div><script src="/mock.js"></script><script src="/review.js"></script></body></html>');
   const routes = new Map([
     ['/', ['text/html; charset=utf-8', html]],
     ['/review.css', ['text/css; charset=utf-8', css]],
     ['/review.js', ['text/javascript; charset=utf-8', js]],
-    ['/mock.js', ['text/javascript; charset=utf-8', Buffer.from(mockScript())]]
+    ['/mock.js', ['text/javascript; charset=utf-8', Buffer.from(mockScript())]],
+    ['/create', ['text/html; charset=utf-8', Buffer.from(createHtml)]],
+    ['/create-request.css', ['text/css; charset=utf-8', createCss]],
+    ['/create-request.js', ['text/javascript; charset=utf-8', createJs]],
+    ['/create-theme.css', ['text/css; charset=utf-8', Buffer.from(createTheme)]],
+    ['/create-mock.js', ['text/javascript; charset=utf-8', Buffer.from(createMock)]]
   ]);
   server = http.createServer((request, response) => {
     const route = routes.get(request.url);
@@ -1190,6 +1200,50 @@ async function runDefaultLayoutTests() {
   });
 }
 
+async function runCreateRequestTests() {
+  for(const width of [900,400]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride',{width,height:850,deviceScaleFactor:1,mobile:false});
+    await cdp.evaluate('window.__createReloadMarker=true');
+    await cdp.send('Page.navigate',{url:'http://127.0.0.1:'+server.address().port+'/create'});
+    const deadline=Date.now()+6000;let ready=false;
+    while(Date.now()<deadline){if(await cdp.evaluate("Boolean(!window.__createReloadMarker&&window.__createMessages?.some(message=>message.command==='ready'))")){ready=true;break;}await delay(40);}
+    assert.equal(ready,true,'The production creation form sends ready');
+    const set=async fields=>{await cdp.evaluate('window.__setCreate('+JSON.stringify({type:'state',busy:false,selecting:false,...fields})+')');await settle();};
+    const snapshot=()=>cdp.evaluate(`(() => {const ids=['select-original','select-proposed','create-request','cancel'];return {title:document.querySelector('h1').textContent,steps:document.querySelectorAll('.steps li').length,body:document.body.textContent,
+      original:document.getElementById('original-path').textContent,proposed:document.getElementById('proposed-path').textContent,output:document.getElementById('output-path').textContent,
+      error:document.getElementById('error-message').textContent,errorHidden:document.getElementById('error-message').hidden,
+      buttons:Object.fromEntries(ids.map(id=>{const button=document.getElementById(id),r=button.getBoundingClientRect();return[id,{disabled:button.disabled,label:button.textContent,x:r.x,right:r.right,height:r.height}];})),
+      width:innerWidth,scrollWidth:document.documentElement.scrollWidth,injected:document.querySelectorAll('.path-display img,.path-display svg,.error img').length,xss:window.__xss,messages:window.__createMessages};})()`);
+    const click=async id=>{const point=await cdp.evaluate(`(() => {const button=document.getElementById(${JSON.stringify(id)});button.scrollIntoView({block:'nearest'});const r=button.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await settle();};
+    const selected={original:'C:/workspace/'+('long folder/').repeat(8)+'original <img src=x onerror="window.__xss=99">.tex',proposed:'C:/copies/modified & revised.tex',output:'C:/workspace/original.tex.rr'};
+    await runTest(width+'px: the creation form explains the workflow and enables Create only after both native choices',async()=>{
+      await set({});let view=await snapshot();assert.equal(view.title,'Create Revision Request');assert.equal(view.steps,3);assert.ok(view.body.includes('Both input files stay unchanged'));
+      assert.equal(view.buttons['create-request'].disabled,true);await click('select-original');assert.deepEqual((await snapshot()).messages.at(-1),{command:'selectOriginal'});
+      await set({original:selected.original,output:selected.output});view=await snapshot();assert.equal(view.buttons['create-request'].disabled,true);assert.equal(view.original,selected.original);
+      await click('select-proposed');assert.deepEqual((await snapshot()).messages.at(-1),{command:'selectProposed'});
+      await set(selected);view=await snapshot();assert.equal(view.buttons['create-request'].disabled,false);assert.equal(view.proposed,selected.proposed);assert.equal(view.output,selected.output);
+      assert.equal(view.injected,0);assert.equal(view.xss,0);assert.ok(view.scrollWidth<=width,'Long selected paths wrap without horizontal overflow');
+      for(const button of Object.values(view.buttons)){assert.ok(button.x>=0&&button.right<=width);assert.ok(button.height>=30);}
+      await set({original:'C:/workspace/manuscript.tex',proposed:'C:/copies/manuscript-revised.tex',output:'C:/workspace/manuscript.tex.rr'});
+      await cdp.evaluate('window.scrollTo(0,0)');await settle();await screenshot('create-request-'+width+'-ready');
+    });
+    await runTest(width+'px: selecting and creating block duplicate commands while inline errors keep the form reusable',async()=>{
+      for(const field of ['selecting','busy']) {
+        await set({...selected,[field]:true});const before=await snapshot();assert.ok(Object.values(before.buttons).every(button=>button.disabled));
+        if(field==='busy')assert.equal(before.buttons['create-request'].label,'Creating…');
+        await cdp.evaluate("document.querySelectorAll('button').forEach(button=>button.click());document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))");
+        assert.equal((await snapshot()).messages.length,before.messages.length,'Blocked form emits no command');
+      }
+      const error='Request failed <img src=x onerror="window.__xss=98">.';await set({...selected,error});let view=await snapshot();
+      assert.equal(view.error,error);assert.equal(view.errorHidden,false);assert.equal(view.original,selected.original);assert.equal(view.proposed,selected.proposed);assert.equal(view.buttons['create-request'].disabled,false);assert.equal(view.injected,0);assert.equal(view.xss,0);
+      await click('create-request');assert.deepEqual((await snapshot()).messages.at(-1),{command:'create'},'Only the action is sent; paths stay host-owned');
+      await set(selected);assert.equal((await snapshot()).errorHidden,true);
+      await click('cancel');assert.deepEqual((await snapshot()).messages.at(-1),{command:'cancel'});
+      await cdp.evaluate("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))");assert.deepEqual((await snapshot()).messages.at(-1),{command:'cancel'});
+    });
+  }
+}
+
 async function runLayoutTests() {
   for (const width of [1200, 620]) {
     await resetFixture(width);
@@ -1594,18 +1648,22 @@ async function main() {
     'Refuse to create artifacts until .codex-test-ui is ignored.');
   const executable = await findBrowser();
   await fs.mkdir(runDir, { recursive: true }); runCreated = true;
-  const corePath = path.join(runDir, 'core.cjs'), requestPath = path.join(runDir, 'request.cjs');
-  await Promise.all([[corePath,'core.ts'],[requestPath,'request.ts']].map(([outfile,entry])=>
+  const corePath = path.join(runDir, 'core.cjs'), requestPath = path.join(runDir, 'request.cjs'), createPath = path.join(runDir, 'create-view.cjs');
+  await Promise.all([[corePath,'core.ts'],[requestPath,'request.ts'],[createPath,'createRequestView.ts']].map(([outfile,entry])=>
     require('esbuild').build({entryPoints:[path.join(root,'src',entry)],outfile,
-      bundle:true,platform:'node',format:'cjs',logLevel:'silent'})));
+      bundle:true,platform:'node',format:'cjs',external:['vscode'],logLevel:'silent'})));
   ({computeInlineChanges} = require(corePath));
   ({parseRequestDocument,resolveRequest} = require(requestPath));
+  const load = Module._load;
+  Module._load = function(name,parent,main){return name==='vscode'?{Uri:{joinPath:(uri,...parts)=>({fsPath:path.join(uri.fsPath,...parts)})}}:load.call(this,name,parent,main);};
+  try { ({createRequestViewHtml} = require(createPath)); } finally { Module._load = load; }
   for (const hunk of fixture.files[0].hunks) hunk.inlineChanges = computeInlineChanges(hunk);
   const url = await startServer();
   console.log('Browser: ' + executable); console.log('Artifacts: ' + runDir);
   await startBrowser(executable, url);
   await runDefaultLayoutTests();
   await runLayoutTests();
+  await runCreateRequestTests();
   assert.equal(cdp.exceptions.length, 0, 'Production JavaScript must not throw browser exceptions');
   console.log('Real browser layout: ' + results.length + '/' + results.length + ' checks passed.');
 }

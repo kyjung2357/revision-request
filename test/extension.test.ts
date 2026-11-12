@@ -1287,7 +1287,7 @@ export async function run(): Promise<void> {
       assert.equal(capabilities.allowAgentDecisions, false, 'A repository-supplied workspace override must never enable decisions');
       await withMcpClient(async client => {
         const names = (await client.listTools()).tools.map(item => item.name);
-        for (const name of ['rr_read_target', 'rr_create_request', 'rr_get_request_status', 'rr_open_preview', 'rr_get_format']) assert.ok(names.includes(name));
+        for (const name of ['rr_read_target', 'rr_create_request', 'rr_create_request_from_files', 'rr_get_request_status', 'rr_open_preview', 'rr_get_format']) assert.ok(names.includes(name));
         assert.equal(names.includes('rr_decide'), false); assert.equal(names.includes('rr_undo'), false);
         const format = await client.callTool({name: 'rr_get_format', arguments: {}});
         assert.notEqual(format.isError, true); assert.equal((format.structuredContent as {language: string}).language, 'en');
@@ -1327,6 +1327,44 @@ export async function run(): Promise<void> {
       assert.deepEqual(await bytes(item.target), Buffer.from('\uFEFFheader\r\nFirst inserted line.\r\nSecond inserted line.\r\n\r\ntail'));
       await api.undo(request, item.relative, status.hunks[0]!.id, await latestRevision(request));
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+    });
+  });
+
+  await check('Bundled MCP compares saved files, groups adjacent edits and keeps both inputs unchanged', async () => {
+    await withMcpClient(async client => {
+      const item = await mcpTarget('mcp-from-files', '\uFEFFheader\r\nold\r\ncontext\r\nlast\r\n');
+      const proposedPath = 'mcp-from-files.proposed.tex';
+      const proposed = vscode.Uri.joinPath(workspace!, proposedPath);
+      const after = '\uFEFFheader\r\nNew first line.\r\nNew second line.\r\ncontext\r\nLAST\r\n';
+      await vscode.workspace.fs.writeFile(proposed, Buffer.from(after));
+      const originalRead = await tool<{content: string; hash: string}>(client, 'rr_read_target', {path: item.relative});
+      const proposedRead = await tool<{content: string; hash: string}>(client, 'rr_read_target', {path: proposedPath});
+      assert.equal(originalRead.content, item.before); assert.equal(proposedRead.content, after);
+      const args = {path: item.relative, proposedPath, expectedHash: originalRead.hash,
+        expectedProposedHash: proposedRead.hash, clientRequestId: randomUUID()};
+      await toolRefused(client, 'rr_create_request_from_files', {...args, expectedProposedHash: '0'.repeat(64)}, /STALE_PROPOSED|modified copy changed/i);
+      const status = await tool<McpStatus>(client, 'rr_create_request_from_files', args);
+      assert.equal(status.pending, 2); assert.equal(status.accepted, 0); assert.equal(status.ignored, 0);
+      const request = vscode.Uri.joinPath(workspace!, status.requestPath);
+      const initialBytes = await bytes(request);
+      const stored = JSON.parse(initialBytes.toString('utf8'));
+      assert.equal(stored.path, item.relative); assert.ok(Number.isFinite(Date.parse(stored.time)));
+      assert.equal(stored.request.length, 2);
+      assert.ok(stored.request.some((entry: {after: string | null}) => entry.after?.includes('\n')));
+      assert.ok(stored.request.every((entry: {status: string; reason?: string}) => entry.status === 'pending' && !('reason' in entry)));
+      assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
+      assert.deepEqual(await bytes(proposed), Buffer.from(after));
+      const listed = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: status.requestId});
+      assert.equal(listed.requestId, status.requestId); assert.equal(listed.pending, 2);
+      assert.equal((await tool<McpStatus>(client, 'rr_create_request_from_files', args)).requestId, status.requestId);
+      assert.deepEqual(await bytes(request), initialBytes, 'An identical retry must not rewrite the request.');
+      await toolRefused(client, 'rr_create_request_from_files', {...args, clientRequestId: randomUUID()}, /REQUEST_EXISTS|already exists/i);
+      await api.decide(request, item.relative, undefined, 'accepted', await latestRevision(request));
+      assert.deepEqual(await bytes(item.target), Buffer.from(after), 'The generated entries must reproduce the modified copy exactly.');
+      assert.deepEqual(await bytes(proposed), Buffer.from(after));
+      const completed = await tool<McpStatus>(client, 'rr_create_request_from_files', args);
+      assert.equal(completed.requestId, status.requestId); assert.equal(completed.accepted, 2);
+      assert.equal(completed.pending, 0);
     });
   });
 

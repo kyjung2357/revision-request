@@ -22,6 +22,16 @@ Create reviewable proposals for existing UTF-8 text files while keeping the targ
 
 If the snapshot changed, read it again and rebuild the proposal. Do not guess hashes, IDs, revisions, or hunk IDs.
 
+## Create a proposal from an existing modified copy
+
+When the user already has an original and a separately edited copy, use `rr_create_request_from_files` to compare them instead of manually converting their differences into entries. Both saved UTF-8 files must be inside the connected workspace.
+
+1. Call `rr_read_target` for each file and keep their respective hashes.
+2. Call `rr_create_request_from_files` with `path` (original), `proposedPath` (modified copy), `expectedHash` (original hash), `expectedProposedHash` (copy hash), and a fresh `clientRequestId`. `reason` is optional. Do not send `time` or `status`.
+3. Call `rr_open_preview` with the returned request ID, report it as pending, and leave decisions to the user. Check `rr_get_request_status` later if needed.
+
+The tool creates only the `.rr` beside the original and preserves both inputs. It refuses stale or unsaved inputs and existing output requests. Retry an identical payload with the same ID; for changed inputs, read both again and use a new ID. Continue using `rr_create_request` when proposing explicit fragments or blocks without a saved modified copy.
+
 ## Connection and direct-file fallback
 
 Use the available Revision Request MCP tools. If they are unavailable and connection setup is requested, read [the setup skill](../setup/SKILL.md). `rr_get_format` works offline and does not prove a live bridge connection. Run **Revision Request: Diagnose MCP Connection** in VS Code, or the installed plugin's `node scripts/launch-mcp.cjs --diagnose`, when `rr_*` tools are unavailable. `rr_diagnose` distinguishes the configured workspace, reachable bridge, adapter, plugin metadata, and capability warnings. A bridge probe alone does not prove that this agent has discovered its tools; confirm `rr_list_requests` from the current agent after reconnecting.

@@ -1,0 +1,33 @@
+(() => {
+  'use strict';
+  const vscode = acquireVsCodeApi();
+  const original = document.getElementById('original-path');
+  const proposed = document.getElementById('proposed-path');
+  const output = document.getElementById('output-path');
+  const error = document.getElementById('error-message');
+  const create = document.getElementById('create-request');
+  const cancel = document.getElementById('cancel');
+  const selectOriginal = document.getElementById('select-original');
+  const selectProposed = document.getElementById('select-proposed');
+  let blocked = false;
+  const send = command => { if (!blocked) vscode.postMessage({command}); };
+  selectOriginal.addEventListener('click', () => send('selectOriginal'));
+  selectProposed.addEventListener('click', () => send('selectProposed'));
+  create.addEventListener('click', () => {if (!create.disabled) send('create');});
+  cancel.addEventListener('click', () => send('cancel'));
+  document.addEventListener('keydown', event => {if (event.key === 'Escape' && !blocked) send('cancel');});
+  window.addEventListener('message', event => {
+    const state = event.data;
+    if (!state || state.type !== 'state') return;
+    blocked = Boolean(state.busy || state.selecting);
+    original.textContent = state.original || 'No file selected';
+    proposed.textContent = state.proposed || 'No file selected';
+    output.textContent = state.output || 'Choose an original to see where the request will be saved.';
+    error.textContent = state.error || '';
+    error.hidden = !state.error;
+    create.disabled = blocked || !state.original || !state.proposed;
+    create.textContent = state.busy ? 'Creating…' : 'Create Revision Request';
+    cancel.disabled = selectOriginal.disabled = selectProposed.disabled = blocked;
+  });
+  vscode.postMessage({command:'ready'});
+})();

@@ -62,7 +62,7 @@ After connecting, the same workflow is available through `rr_diagnose`. It repor
 
 The release process synchronizes this plugin's version, format guide, schema, and capability metadata with the extension. Installers keep cached copies, so updating the extension does not itself replace an installed plugin. If diagnostics reports a stale version or guide, update/reinstall the plugin through its host and reconnect; do not edit the cache. Keep the existing workspace configuration unless intentionally switching workspaces.
 
-For repository development, run `npm run sync:plugin` to regenerate release files or `npm run check:plugin-sync` to detect drift. Both VSIX builds and plugin packaging synchronize these files automatically. `docs/FORMAT.md`, `schemas/revision-request.schema.json`, `compatibility.json`, and the root `package.json` are the owning sources.
+For repository development, run `npm run sync:plugin` to regenerate release files or `npm run check:plugin` to detect drift. Both VSIX builds and plugin packaging synchronize these files automatically. `docs/FORMAT.md`, `schemas/revision-request.schema.json`, `compatibility.json`, and the root `package.json` are the owning sources.
 
 ## Use it
 

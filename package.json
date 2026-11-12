@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -75,8 +75,7 @@
       },
       {
         "command": "revisionRequest.createRequest",
-        "title": "Revision Request: Create Revision Request",
-        "icon": "$(add)"
+        "title": "Revision Request: Create Revision Request"
       },
       {
         "command": "revisionRequest.refresh",
@@ -131,16 +130,11 @@
     "viewsWelcome": [
       {
         "view": "revisionRequest.requests",
-        "contents": "[Create Revision Request](command:revisionRequest.createRequest)\nNo revision request in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
+        "contents": "No revision request in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
       }
     ],
     "menus": {
       "view/title": [
-        {
-          "command": "revisionRequest.createRequest",
-          "when": "view == revisionRequest.requests",
-          "group": "navigation@1"
-        },
         {
           "command": "revisionRequest.refresh",
           "when": "view == revisionRequest.requests",
@@ -252,7 +246,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",

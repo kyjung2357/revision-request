@@ -97,6 +97,8 @@ export async function createRequestFile(options: CreateRequestFileOptions): Prom
       throw new Error('An input file changed while preparing the request. Save both files and try again.');
     }
   }
+  // Recheck cancellation, workspace trust, and editor state after the final reads.
+  await options.assertReady?.();
   try {
     // Exclusive creation also rejects existing files and symbolic links.
     await writeFile(output, serialized, { encoding: 'utf8', flag: 'wx' });

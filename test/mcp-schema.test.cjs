@@ -85,3 +85,19 @@ test('format tool and schema resource publish the same multiline contract', asyn
   assert.deepEqual(format.schema, schema);
   assert.equal(validate(format.example).valid, true);
 });
+
+
+test('file-comparison creation is discoverable and requires both exact input hashes', async t => {
+  const {client, calls} = await connected(t);
+  const tool = (await client.listTools()).tools.find(tool => tool.name === 'rr_create_request_from_files');
+  assert.ok(tool); assert.match(tool.description, /separately saved modified copy/);
+  const args = {path:'source.py',proposedPath:'source.proposed.py',expectedHash:'a'.repeat(64),expectedProposedHash:'b'.repeat(64),clientRequestId:'snapshot-fixture'};
+  const result = await client.callTool({name:tool.name,arguments:args});
+  assert.notEqual(result.isError,true);
+  assert.deepEqual(calls.at(-1),{method:'create_request_from_files',args});
+  for (const invalid of [
+    {...args,expectedProposedHash:undefined}, {...args,expectedHash:'bad'}, {...args,proposedPath:undefined},
+    {...args,status:'accepted'}, {...args,reason:null}, {...args,output:'outside.rr'},
+  ]) assert.equal((await client.callTool({name:tool.name,arguments:invalid})).isError,true);
+  assert.equal(calls.length,1,'Invalid comparison requests must not reach the host');
+});

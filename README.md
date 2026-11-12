@@ -56,11 +56,11 @@ Use this workflow when you have edited a copy yourself and want someone else to 
 
 1. Keep the original file, such as `paper/section.tex`, and make your edits in a separate copy, such as `paper/section.proposed.tex`.
 2. Open and trust the workspace containing the original in VS Code. Save both files.
-3. In the **Revision Request** sidebar, click the **+** button (**Create Revision Request**) at the top of **Requests**. Select the original file first, then the modified copy.
-4. The extension creates `paper/section.tex.rr` beside the original and opens its preview. Both input files remain unchanged, and an existing request is never overwritten.
+3. Run **Revision Request: Create Revision Request** from the Command Palette. The creation window explains the workflow and the two file roles.
+4. Use **Select original** and **Select modified copy**, check the selected paths, then click **Create Revision Request**. The extension creates `paper/section.tex.rr` beside the original and opens its preview. Both input files remain unchanged, and an existing request is never overwritten.
 5. Send the generated `.rr` file, with its changes still pending, to the reviewer.
 
-The reviewer needs Revision Request and a copy of the original with the same contents at the request's workspace-relative `path`. If they already have that original, you only need to send the `.rr` file.
+The reviewer needs Revision Request and a copy of the original with the same contents at the request's workspace-relative `path`. If they already have that original, you only need to send the `.rr` file. An agent can also compare two saved workspace files through [`rr_create_request_from_files`](docs/MCP.md#create-a-request-from-two-saved-files).
 
 ### Using the repository CLI
 

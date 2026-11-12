@@ -1018,7 +1018,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('revisionRequest.createRequest', async () => {
       try {
-        const uri = await createRequestFromFiles(action => service.runExclusive(action));
+        const uri = await createRequestFromFiles(context.extensionUri, action => service.runExclusive(action));
         if (!uri) return;
         tree.refresh();
         await editor.openPreview(uri);

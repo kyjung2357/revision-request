@@ -334,3 +334,92 @@ test('cached multiline Undo after restart preserves mixed EOL bytes exactly', as
   await restarted.api.undo(item.request, item.relative, state.files[0].hunks[0].id, state.revision);
   assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending']);
 });
+
+
+async function comparisonFixture() {
+  const folder = 'mcp-files-' + (++serial); await fs.mkdir(path.join(scratch, folder));
+  const originalPath = folder + '/source.txt', proposedPath = folder + '/source.proposed.txt';
+  const original = Uri.file(path.join(scratch,originalPath)), proposed = Uri.file(path.join(scratch,proposedPath));
+  const before = Buffer.from('\uFEFFone\r\ntwo\r\nkeep\r\n');
+  const after = Buffer.from('\uFEFFONE\r\nTWO\r\nkeep\r\nadded\r\n');
+  await fs.writeFile(original.fsPath,before); await fs.writeFile(proposed.fsPath,after);
+  const {api,state:stateContext}=service();
+  const host=new McpHost(stateContext,api,async()=>{assert.fail('Creation must not open the preview automatically');},()=>false);
+  const workspace=Uri.file(scratch).toString();
+  const readOriginal=await host.handler('read_target',{path:originalPath},workspace);
+  const readProposed=await host.handler('read_target',{path:proposedPath},workspace);
+  const args={path:originalPath,proposedPath,expectedHash:readOriginal.hash,expectedProposedHash:readProposed.hash,clientRequestId:'files-'+serial};
+  return {original,proposed,before,after,api,host,workspace,args,output:original.fsPath+'.rr'};
+}
+const codeIs=code=>error=>error.code===code;
+async function noComparisonOutput(item) { await assert.rejects(fs.stat(item.output),{code:'ENOENT'}); }
+
+test('MCP compares two saved files into grouped pending requests and keeps both input bytes unchanged',async()=>{
+  const item=await comparisonFixture(), writesBefore=sourceWrites.length;
+  const made=await item.host.handler('create_request_from_files',item.args,item.workspace);
+  assert.equal(made.status,'pending'); assert.equal(made.pending,2);
+  const text=await fs.readFile(item.output,'utf8'), request=JSON.parse(text);
+  assert.equal(request.path,item.args.path); assert.ok(request.time);
+  assert.ok(request.request.every(entry=>entry.status==='pending' && !Object.hasOwn(entry,'reason')));
+  assert.ok(request.request[0].before.includes('\n'));
+  const {resolveRequest}=require('../src/request.ts');
+  assert.equal(resolveRequest(request,item.before.toString()).file.after,item.after.toString());
+  assert.deepEqual(await fs.readFile(item.original.fsPath),item.before);
+  assert.deepEqual(await fs.readFile(item.proposed.fsPath),item.after);
+  assert.equal(sourceWrites.length,writesBefore);
+  const status=await item.host.handler('get_request_status',{requestId:made.requestId},item.workspace);
+  assert.equal(status.requestId,made.requestId); assert.equal(status.pending,2);
+  const retry=await item.host.handler('create_request_from_files',item.args,item.workspace);
+  assert.equal(retry.requestId,made.requestId); assert.equal(await fs.readFile(item.output,'utf8'),text);
+  await assert.rejects(item.host.handler('create_request_from_files',{...item.args,reason:'Different intent'},item.workspace),codeIs('IDEMPOTENCY_CONFLICT'));
+  await assert.rejects(item.host.handler('create_request_from_files',{...item.args,clientRequestId:'another-'+serial},item.workspace),codeIs('REQUEST_EXISTS'));
+  assert.equal(await fs.readFile(item.output,'utf8'),text);
+  const state=await item.api.getState(Uri.file(item.output));
+  await item.api.decide(Uri.file(item.output),item.args.path,state.files[0].hunks[0].id,'accepted',state.revision);
+  const reviewed=await item.host.handler('create_request_from_files',item.args,item.workspace);
+  assert.equal(reviewed.requestId,made.requestId); assert.equal(reviewed.accepted,1,'Retry retrieves existing human decisions without regenerating from a changed source');
+});
+
+test('MCP file comparison rejects stale hashes, dirty inputs/output, identical files, and unknown fields',async()=>{
+  for(const field of ['expectedHash','expectedProposedHash']) {
+    const item=await comparisonFixture();
+    await assert.rejects(item.host.handler('create_request_from_files',{...item.args,[field]:'0'.repeat(64)},item.workspace),codeIs(field==='expectedHash'?'STALE_TARGET':'STALE_PROPOSED'));
+    await noComparisonOutput(item);
+  }
+  for(const target of ['original','proposed','output']) {
+    const item=await comparisonFixture(); const uri=target==='output'?Uri.file(item.output):item[target];
+    documents.set(uri.toString(),{uri,isDirty:true,getText:()=> 'unsaved'});
+    try {await assert.rejects(item.host.handler('create_request_from_files',item.args,item.workspace),codeIs('DIRTY_DOCUMENT'));}
+    finally {documents.delete(uri.toString());}
+    await noComparisonOutput(item);
+  }
+  const item=await comparisonFixture();
+  await assert.rejects(item.host.handler('create_request_from_files',{...item.args,proposedPath:item.args.path,expectedProposedHash:item.args.expectedHash},item.workspace),codeIs('SAME_FILE'));
+  await assert.rejects(item.host.handler('create_request_from_files',{...item.args,status:'accepted'},item.workspace),codeIs('INVALID_ARGUMENT'));
+  await fs.writeFile(item.proposed.fsPath,item.before);
+  await assert.rejects(item.host.handler('create_request_from_files',{...item.args,expectedProposedHash:item.args.expectedHash},item.workspace),codeIs('NO_CHANGES'));
+  await noComparisonOutput(item);
+});
+
+test('MCP file comparison stays inside the selected workspace and detects dirty aliases and late modified-copy edits',async()=>{
+  const item=await comparisonFixture();
+  for(const proposedPath of ['../outside.txt',item.proposed.fsPath,'.git/config']) {
+    await assert.rejects(item.host.handler('create_request_from_files',{...item.args,proposedPath},item.workspace));
+    await noComparisonOutput(item);
+  }
+  const alias=Uri.file(path.join(path.dirname(item.proposed.fsPath),'hardlink.txt'));
+  await fs.link(item.proposed.fsPath,alias.fsPath);
+  documents.set(alias.toString(),{uri:alias,isDirty:true,getText:()=> 'unsaved alias'});
+  try {await assert.rejects(item.host.handler('create_request_from_files',item.args,item.workspace),codeIs('DIRTY_DOCUMENT'));}
+  finally {documents.delete(alias.toString());}
+  await noComparisonOutput(item);
+  const originalRead=item.host.readTarget.bind(item.host); let reads=0;
+  item.host.readTarget=async(folder,filePath)=>{
+    const result=await originalRead(folder,filePath);
+    if(filePath===item.args.proposedPath && ++reads===1) await fs.writeFile(item.proposed.fsPath,'changed later\n');
+    return result;
+  };
+  await assert.rejects(item.host.handler('create_request_from_files',item.args,item.workspace),codeIs('STALE_PROPOSED'));
+  await noComparisonOutput(item);
+  assert.deepEqual(await fs.readFile(item.original.fsPath),item.before);
+});

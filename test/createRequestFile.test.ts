@@ -37,7 +37,7 @@ test('saved files produce a compact request with pending entries and leave both 
   assert.equal(resolveRequest(request, f.before).file.after, f.after);
   assert.equal(await readFile(f.original, 'utf8'), f.before);
   assert.equal(await readFile(f.proposed, 'utf8'), f.after);
-  assert.equal(readyCalls, 2);
+  assert.ok(readyCalls >= 3, 'Editor readiness is checked again after the final snapshot reads.');
 });
 
 test('line insertion and deletion produce explicit null fragments', async t => {
@@ -123,7 +123,7 @@ test('identical saved copies report no changes without creating a request', asyn
 });
 
 test('readiness rejection before reading or before writing creates no output', async t => {
-  for (const rejectOn of [1, 2]) {
+  for (const rejectOn of [1, 2, 3]) {
     const f = await fixture(t);
     let calls = 0;
     await assert.rejects(createRequestFile({ ...f.options, assertReady: async () => {

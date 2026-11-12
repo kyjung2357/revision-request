@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import { validateRequestPath, requestFingerprint } from './core';
 import { parseRequestDocument, proposalIdentity, resolveRequest } from './request';
+import { createRequestFromSnapshots } from './createRequest';
 import type { ReviewService } from './extension';
 import { McpBridgeError, type McpHandler, type McpStatus, type McpClientStatus } from './mcpTypes';
 
@@ -242,7 +243,66 @@ export class McpHost {
       if (current) current.receipt = receipt;
     });
   }
-  private async createRequest(folder: vscode.WorkspaceFolder, args: Record<string, unknown>): Promise<McpStatus> {
+  private async createRequestFromFiles(folder: vscode.WorkspaceFolder, args: Record<string, unknown>): Promise<McpStatus> {
+    if (Object.keys(args).some(key => !['path', 'proposedPath', 'expectedHash', 'expectedProposedHash', 'clientRequestId', 'reason'].includes(key))) {
+      throw new McpBridgeError('INVALID_ARGUMENT', 'Use path, proposedPath, both hashes, clientRequestId, and optional reason.');
+    }
+    const filePath = validatePath(args.path), proposedPath = validatePath(args.proposedPath);
+    const expectedHash = requiredString(args.expectedHash, 'expectedHash', 64).toLowerCase();
+    const expectedProposedHash = requiredString(args.expectedProposedHash, 'expectedProposedHash', 64).toLowerCase();
+    if (![expectedHash, expectedProposedHash].every(value => /^[a-f0-9]{64}$/.test(value))) {
+      throw new McpBridgeError('INVALID_ARGUMENT', 'Use the SHA-256 hashes returned by rr_read_target for both files.');
+    }
+    const clientRequestId = requiredString(args.clientRequestId, 'clientRequestId', 256);
+    if (args.reason !== undefined && (typeof args.reason !== 'string' || Buffer.byteLength(args.reason, 'utf8') > 50_000 ||
+        args.reason.includes('\0') || Buffer.from(args.reason, 'utf8').toString('utf8') !== args.reason)) {
+      throw new McpBridgeError('INVALID_ARGUMENT', 'reason must be valid Unicode text up to 50,000 UTF-8 bytes, without NUL characters.');
+    }
+    const reason = args.reason as string | undefined;
+    const inputHash = hash(JSON.stringify({method: 'create_request_from_files', path: filePath, proposedPath,
+      expectedHash, expectedProposedHash, reason: reason ?? ''}));
+    return this.service.runExclusive(async () => {
+      this.workspace(folder.uri.toString());
+      // A retry retrieves the original request even after human review changes its source.
+      const retry = this.records().find(item => item.workspaceUri === folder.uri.toString() && item.clientRequestId === clientRequestId);
+      if (retry) {
+        if (retry.inputHash !== inputHash) throw new McpBridgeError('IDEMPOTENCY_CONFLICT', 'This clientRequestId was already used with different file-comparison inputs.');
+        return this.status(retry);
+      }
+      const [sourcePath, copyPath] = await Promise.all([this.resolveTarget(folder, filePath), this.resolveTarget(folder, proposedPath)]);
+      const [sourceInfo, copyInfo] = await Promise.all([fs.stat(sourcePath.real), fs.stat(copyPath.real)]);
+      if (samePath(sourcePath.real, copyPath.real) || (sourceInfo.ino !== 0 && sourceInfo.ino === copyInfo.ino && sourceInfo.dev === copyInfo.dev)) {
+        throw new McpBridgeError('SAME_FILE', 'The proposed file must be a separate modified copy of the original.');
+      }
+      const [source, proposed] = await Promise.all([this.readTarget(folder, filePath), this.readTarget(folder, proposedPath)]);
+      if (source.hash !== expectedHash) throw new McpBridgeError('STALE_TARGET', 'The original changed. Read it again before comparing the files.');
+      if (proposed.hash !== expectedProposedHash) throw new McpBridgeError('STALE_PROPOSED', 'The modified copy changed. Read it again before comparing the files.');
+      const generated = createRequestFromSnapshots(filePath, source.content, proposed.content, {reason});
+      if (!generated.request.length) throw new McpBridgeError('NO_CHANGES', 'The modified copy is identical to the original.');
+      const verifyCopy = async () => {
+        const output = path.resolve(folder.uri.fsPath, filePath + '.rr');
+        for (const document of vscode.workspace.textDocuments) {
+          if (!document.isDirty || document.uri.scheme !== 'file') continue;
+          const info = await fs.stat(document.uri.fsPath).catch(() => undefined);
+          if (samePath(document.uri.fsPath, output) || (info && info.ino !== 0 &&
+              [sourceInfo, copyInfo].some(input => input.dev === info.dev && input.ino === info.ino))) {
+            throw new McpBridgeError('DIRTY_DOCUMENT', 'Save or undo unsaved edits in the input files or request before comparing the files.');
+          }
+        }
+        const checked = await this.resolveTarget(folder, proposedPath);
+        const info = await fs.stat(checked.real);
+        if (!samePath(checked.real, copyPath.real) || info.dev !== copyInfo.dev || info.ino !== copyInfo.ino ||
+            (await this.readTarget(folder, proposedPath)).hash !== expectedProposedHash) {
+          throw new McpBridgeError('STALE_PROPOSED', 'The modified copy changed while preparing the request. Read it again.');
+        }
+      };
+      return this.createRequest(folder, {path: filePath, expectedHash, clientRequestId,
+        request: generated.request.map(({status: _status, ...entry}) => entry)},
+      {inputHash, beforeWrite: verifyCopy, alreadyExclusive: true});
+    });
+  }
+  private async createRequest(folder: vscode.WorkspaceFolder, args: Record<string, unknown>,
+    internal: {inputHash?: string; beforeWrite?: () => Promise<void>; alreadyExclusive?: boolean} = {}): Promise<McpStatus> {
     const filePath = validatePath(args.path);
     const expectedHash = requiredString(args.expectedHash, 'expectedHash', 64).toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(expectedHash)) throw new McpBridgeError('INVALID_ARGUMENT', 'expectedHash must be the SHA-256 hash returned by read_target.');
@@ -264,8 +324,8 @@ export class McpHost {
     // Keep existing retry hashes stable while preserving omitted reasons in JSON.
     const normalizedEntries = proposal.request.map(entry => ({line: entry.line, before: entry.before, after: entry.after,
       reason: entry.reason ?? '', status: entry.status}));
-    const inputHash = hash(JSON.stringify({path: filePath, expectedHash, request: normalizedEntries}));
-    return this.service.runExclusive(async () => {
+    const inputHash = internal.inputHash ?? hash(JSON.stringify({path: filePath, expectedHash, request: normalizedEntries}));
+    const commit = async () => {
       this.workspace(folder.uri.toString());
       const retry = this.records().find(item => item.workspaceUri === folder.uri.toString() && item.clientRequestId === clientRequestId);
       if (retry) {
@@ -287,6 +347,7 @@ export class McpHost {
       // Exclusive creation prevents replacing a request, including a symlink.
       const latest = await this.readTarget(folder, filePath);
       if (latest.hash !== expectedHash) throw new McpBridgeError('STALE_TARGET', 'The target changed while preparing the request.');
+      await internal.beforeWrite?.();
       this.workspace(folder.uri.toString());
       let handle: fs.FileHandle;
       try { handle = await fs.open(writePath, 'wx'); }
@@ -300,6 +361,7 @@ export class McpHost {
         if (!inside(root, openedPath) || path.relative(root, openedPath).split(path.sep).some(part => part.toLowerCase() === '.git')) throw new McpBridgeError('OUTSIDE_WORKSPACE', 'The request path changed outside this workspace.');
         const finalSource = await this.readTarget(folder, filePath);
         if (finalSource.hash !== expectedHash) throw new McpBridgeError('STALE_TARGET', 'The target changed before the request could be written.');
+        await internal.beforeWrite?.();
         this.workspace(folder.uri.toString());
         await handle.writeFile(text, 'utf8');
       } catch (error) {
@@ -312,7 +374,8 @@ export class McpHost {
       const record = await this.registerRequest(folder, uri, {clientRequestId, inputHash});
       this.service.changed();
       return this.status(record);
-    });
+    };
+    return internal.alreadyExclusive ? commit() : this.service.runExclusive(commit);
   }
   private async handle(method: Parameters<McpHandler>[0], args: Record<string, unknown>, workspaceUri: string): Promise<unknown> {
     const folder = this.workspace(workspaceUri);
@@ -337,6 +400,7 @@ export class McpHost {
       }
       case 'read_target': return this.readTarget(folder, validatePath(args.path));
       case 'create_request': return this.createRequest(folder, args);
+      case 'create_request_from_files': return this.createRequestFromFiles(folder, args);
       case 'list_requests': {
         if (args.includeCompleted !== undefined && typeof args.includeCompleted !== 'boolean') throw new McpBridgeError('INVALID_ARGUMENT', 'includeCompleted must be a boolean.');
         const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*.rr'), '**/{node_modules,.git,.codex-*}/**', MAX_ACTIVE);

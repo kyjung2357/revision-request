@@ -2,11 +2,13 @@ import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createRequestFile } from './createRequestFile';
+import { showCreateRequestView } from './createRequestView';
 
 const samePath = (left: string, right: string) => path.relative(left, right) === '';
 
-/** Pick saved before/after files and create a reviewable request without saving either input. */
+/** Show an explanation and explicit file choices before creating a reviewable request. */
 export async function createRequestFromFiles(
+  extensionUri: vscode.Uri,
   runExclusive: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
 ): Promise<vscode.Uri | undefined> {
   const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file');
@@ -15,27 +17,31 @@ export async function createRequestFromFiles(
   const active = vscode.window.activeTextEditor?.document.uri;
   const defaultUri = active?.scheme === 'file' && vscode.workspace.getWorkspaceFolder(active) && !active.path.endsWith('.rr')
     ? active : folders[0]!.uri;
-  const original = (await vscode.window.showOpenDialog({
-    title: 'Select the original file (before changes)', openLabel: 'Select original',
-    canSelectFiles: true, canSelectFolders: false, canSelectMany: false, defaultUri,
-  }))?.[0];
-  if (!original) return undefined;
+  return showCreateRequestView({extensionUri, defaultUri,
+    create: (original, proposed, isCancelled) => createRequestFromSelection(original, proposed, runExclusive, isCancelled)});
+}
+
+/** Commit only the chosen saved snapshots; the form never supplies arbitrary paths. */
+export async function createRequestFromSelection(
+  original: vscode.Uri, proposed: vscode.Uri,
+  runExclusive: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
+  isCancelled: () => boolean = () => false,
+): Promise<vscode.Uri> {
   const folder = vscode.workspace.getWorkspaceFolder(original);
   if (original.scheme !== 'file' || !folder || folder.uri.scheme !== 'file') {
     throw new Error('Select an original file inside an open local workspace.');
   }
-  const proposed = (await vscode.window.showOpenDialog({
-    title: 'Select the modified copy (after changes)', openLabel: 'Select modified copy',
-    canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
-    defaultUri: vscode.Uri.file(path.dirname(original.fsPath)),
-  }))?.[0];
-  if (!proposed) return undefined;
+  if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before creating a revision request.');
   if (proposed.scheme !== 'file') throw new Error('Select a local modified copy.');
   const output = original.fsPath + '.rr';
-  const assertReady = async () => {
+  const assertCurrent = () => {
+    if (isCancelled()) throw new Error('Request creation was cancelled.');
     if (!vscode.workspace.isTrusted || vscode.workspace.getWorkspaceFolder(original)?.uri.toString() !== folder.uri.toString()) {
       throw new Error('The selected workspace changed. Create the request again.');
     }
+  };
+  const assertReady = async () => {
+    assertCurrent();
     const inputs = await Promise.all([original.fsPath, proposed.fsPath].map(async name => ({
       real: await fs.realpath(name), stat: await fs.stat(name),
     })));
@@ -49,6 +55,7 @@ export async function createRequestFromFiles(
         throw new Error('Save or discard unsaved edits in "' + path.basename(name) + '" before creating the request.');
       }
     }
+    assertCurrent();
   };
   const created = await runExclusive(() => createRequestFile({
     workspace: folder.uri.fsPath,

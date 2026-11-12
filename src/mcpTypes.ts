@@ -2,7 +2,7 @@
 export const BRIDGE_PROTOCOL = 1;
 export const BRIDGE_MAX_BYTES = 32 * 1024 * 1024;
 export const BRIDGE_METHODS = [
-  'capabilities', 'client_status', 'read_target', 'create_request', 'list_requests',
+  'capabilities', 'client_status', 'read_target', 'create_request', 'create_request_from_files', 'list_requests',
   'get_request_status', 'open_preview', 'decide', 'undo'
 ] as const;
 export type BridgeMethod = typeof BRIDGE_METHODS[number];

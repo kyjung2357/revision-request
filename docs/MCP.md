@@ -102,15 +102,40 @@ New entries must start pending. Agents must not write accepted/ignored JSON stat
 
 If the source changed, read it again and prepare a fresh proposal. Do not substitute a guessed hash or reuse an old snapshot. Retrying the **same `clientRequestId` with the same payload** is idempotent, including when the client lost the first response. Reusing that ID for a different payload is not a new proposal; use a new ID instead. An existing request file is not silently overwritten. Idempotency records share the bounded local request registry; this is not permanent retry history. If an old record has expired, inspect the current source and requests before submitting again.
 
+## Create a request from two saved files
+
+Use `rr_create_request_from_files` when a separately modified copy already exists. The server compares it with the original and groups consecutive changes into review entries. Use `rr_create_request` instead when the agent is supplying specific fragments or blocks directly.
+
+1. Call `rr_read_target` for the original, then for the modified copy. Both must be saved UTF-8 files inside the connected workspace. Keep each returned `hash`.
+2. Call `rr_create_request_from_files` with their workspace-relative paths, both hashes, and a fresh `clientRequestId`:
+
+```json
+{
+  "path": "paper/section.tex",
+  "proposedPath": "paper/section.proposed.tex",
+  "expectedHash": "<hash returned for the original>",
+  "expectedProposedHash": "<hash returned for the modified copy>",
+  "clientRequestId": "eebfe318-07db-47bc-b170-cfbcc03ab96b"
+}
+```
+
+An optional `reason` explains the generated changes; omit it when unnecessary. The server creates only `paper/section.tex.rr`, with pending entries and a creation time. It does not modify either input or overwrite an existing request. Dirty files, stale hashes, identical inputs, and paths outside the connected workspace are refused. Changes consisting only of line endings or the final newline cannot be represented and are also refused.
+
+3. Call `rr_open_preview` with the returned `requestId` for human review, then use `rr_get_request_status` to check later decisions. Creation does not open the preview or accept any changes automatically.
+
+Use the same `clientRequestId` and payload only when retrying the same operation. Read both files again and use a fresh ID when preparing a different proposal. Do not send `status` or `time`; the server supplies them.
+
 ## Tools
 
 Paths are relative to the connected workspace. Request IDs, revisions, hunk IDs, and hashes are returned values; do not infer them from filenames or line numbers.
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
+| `rr_diagnose` | None | Reports the workspace connection, component versions, and format compatibility without changing files or decisions. |
 | `rr_get_format` | None | Returns the guide, schema, and example, including when the VS Code bridge is offline. |
 | `rr_read_target` | `path` | Reads an existing UTF-8 target and returns its content and hash. |
 | `rr_create_request` | `path`, `expectedHash`, `clientRequestId`, `request: [{line, before, after, reason?}]` | Creates fragment/block changes with server-generated time and pending statuses. |
+| `rr_create_request_from_files` | `path`, `proposedPath`, `expectedHash`, `expectedProposedHash`, `clientRequestId`; optional `reason` | Compares two saved workspace files and creates a pending request while preserving both inputs. |
 | `rr_list_requests` | Optional `includeCompleted` (default `false`) | Lists existing requests; set true to also include retained completion receipts after cleanup. |
 | `rr_get_request_status` | `requestId` | Retrieves the request's current review state or retained completion receipt. |
 | `rr_open_preview` | `requestId` | Opens the review UI without making a decision. |

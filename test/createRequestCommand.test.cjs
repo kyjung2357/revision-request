@@ -1,6 +1,6 @@
 'use strict';
-// Exercise the actual picker workflow against disposable files without building
-// or launching the extension. Only the VS Code selection/editor APIs are mocked.
+// Exercise selected-file creation against disposable files without building
+// or launching the extension. The explanatory form is tested separately.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -50,10 +50,10 @@ const vscode = {
 const load = Module._load;
 Module._load = function(name, parent, main) { return name === 'vscode' ? vscode : load.call(this, name, parent, main); };
 require('tsx/cjs');
-let createRequestFromFiles;
+let createRequestFromFiles, createRequestFromSelection;
 let resolveRequest;
 try {
-  ({createRequestFromFiles} = require('../src/createRequestCommand.ts'));
+  ({createRequestFromFiles, createRequestFromSelection} = require('../src/createRequestCommand.ts'));
   ({resolveRequest} = require('../src/request.ts'));
 } finally { Module._load = load; }
 
@@ -103,14 +103,12 @@ async function absent(uri) { await assert.rejects(fs.lstat(uri.fsPath), {code: '
 
 test('Two selected saved files create original.ext.rr with pending changes and leave both inputs unchanged', async () => {
   const item = await fixture();
-  choose(item);
   vscode.window.activeTextEditor = {document: {uri: item.target, isDirty: false}};
   let exclusiveCalls = 0;
-  const created = await createRequestFromFiles(async action => { exclusiveCalls++; return action(); });
+  const created = await createRequestFromSelection(item.target, item.modified, async action => { exclusiveCalls++; return action(); });
   assert.equal(created?.toString(), item.output.toString());
   assert.equal(exclusiveCalls, 1, 'Creation must use the shared review transaction queue.');
-  assert.equal(dialogs.length, 2);
-  assert.ok(dialogs.every(options => options.canSelectMany === false));
+  assert.equal(dialogs.length, 0, 'Committing selections must not reopen native pickers.');
   const request = JSON.parse(await fs.readFile(created.fsPath, 'utf8'));
   assert.equal(request.path, item.relative);
   assert.ok(Number.isFinite(Date.parse(request.time)));
@@ -122,23 +120,18 @@ test('Two selected saved files create original.ext.rr with pending changes and l
   await inputsUnchanged(item);
 });
 
-for (const picker of ['original', 'modified']) {
-  test('Cancelling the ' + picker + ' picker creates nothing and leaves both inputs unchanged', async () => {
-    const item = await fixture();
-    selectionQueue = picker === 'original' ? [undefined] : [[item.target], undefined];
-    assert.equal(await createRequestFromFiles(), undefined);
-    assert.equal(dialogs.length, picker === 'original' ? 1 : 2);
-    await absent(item.output);
-    await inputsUnchanged(item);
-  });
-}
+test('Closing the form before creation commits leaves both inputs unchanged', async () => {
+  const item = await fixture();
+  await assert.rejects(createRequestFromSelection(item.target, item.modified, action => action(), () => true), /cancelled/);
+  await absent(item.output);
+  await inputsUnchanged(item);
+});
 
 for (const input of ['original', 'modified']) {
   test('An unsaved ' + input + ' editor is refused without saving inputs or creating a request', async () => {
     const item = await fixture();
-    choose(item);
-    const document = dirty(input === 'original' ? item.target : item.modified);
-    await assert.rejects(createRequestFromFiles(), /unsaved|dirty|save/i);
+      const document = dirty(input === 'original' ? item.target : item.modified);
+    await assert.rejects(createRequestFromSelection(item.target, item.modified), /unsaved|dirty|save/i);
     assert.equal(document.isDirty, true);
     assert.equal(document.getText(), 'unsaved editor text');
     await absent(item.output);
@@ -151,17 +144,15 @@ test('A dirty editor opened through a filesystem alias is refused', async () => 
   const alias = path.join(workspacePath, 'alias-' + serial);
   await fs.symlink(path.dirname(item.target.fsPath), alias, process.platform === 'win32' ? 'junction' : 'dir');
   dirty(Uri.file(path.join(alias, path.basename(item.target.fsPath))));
-  choose(item);
-  await assert.rejects(createRequestFromFiles(), /unsaved|dirty|save/i);
+  await assert.rejects(createRequestFromSelection(item.target, item.modified), /unsaved|dirty|save/i);
   await absent(item.output);
   await inputsUnchanged(item);
 });
 
 test('A dirty output editor is refused even when its saved request does not exist', async () => {
   const item = await fixture();
-  choose(item);
   dirty(item.output);
-  await assert.rejects(createRequestFromFiles(), /unsaved|dirty|save/i);
+  await assert.rejects(createRequestFromSelection(item.target, item.modified), /unsaved|dirty|save/i);
   await absent(item.output);
   await inputsUnchanged(item);
 });
@@ -169,7 +160,7 @@ test('A dirty output editor is refused even when its saved request does not exis
 test('An original outside the opened workspace is refused without creating a request', async () => {
   const item = await fixture();
   selectionQueue = [[item.modified], [item.target]];
-  await assert.rejects(createRequestFromFiles(), /workspace/i);
+  await assert.rejects(createRequestFromSelection(item.modified, item.target), /workspace/i);
   await absent(Uri.file(item.modified.fsPath + '.rr'));
   await absent(item.output);
   await inputsUnchanged(item);
@@ -179,20 +170,45 @@ test('An existing request is preserved byte for byte', async () => {
   const item = await fixture();
   const existing = Buffer.from('existing request, including unsaved review history\r\n');
   await fs.writeFile(item.output.fsPath, existing);
-  choose(item);
-  await assert.rejects(createRequestFromFiles(), /exist|already/i);
+  await assert.rejects(createRequestFromSelection(item.target, item.modified), /exist|already/i);
   assert.deepEqual(await fs.readFile(item.output.fsPath), existing);
   await inputsUnchanged(item);
 });
 
 test('An untrusted workspace is refused before displaying a picker', async () => {
   vscode.workspace.isTrusted = false;
-  await assert.rejects(createRequestFromFiles(), /trust/i);
+  await assert.rejects(createRequestFromFiles(Uri.file(root)), /trust/i);
   assert.equal(dialogs.length, 0);
 });
 
 test('No local workspace is refused before displaying a picker', async () => {
   vscode.workspace.workspaceFolders = [];
-  await assert.rejects(createRequestFromFiles(), /workspace|folder/i);
+  await assert.rejects(createRequestFromFiles(Uri.file(root)), /workspace|folder/i);
   assert.equal(dialogs.length, 0);
+});
+
+test('Create Revision Request is exposed only in the Command Palette', () => {
+  const manifest = require('../package.json');
+  assert.ok(manifest.contributes.commands.some(command => command.command === 'revisionRequest.createRequest'));
+  for (const [location, items] of Object.entries(manifest.contributes.menus)) {
+    if (location !== 'commandPalette') assert.ok(items.every(item => item.command !== 'revisionRequest.createRequest'));
+  }
+  assert.ok(manifest.contributes.viewsWelcome.every(view => !view.contents.includes('command:revisionRequest.createRequest')));
+});
+
+test('Closing the form during final snapshot reads prevents the request commit', async () => {
+  const item = await fixture();
+  const readFile = fs.readFile;
+  let cancelled = false, reads = 0;
+  fs.readFile = async function(filename, ...args) {
+    const result = await readFile.call(this, filename, ...args);
+    if (path.resolve(String(filename)) === path.resolve(item.modified.fsPath) && ++reads === 2) cancelled = true;
+    return result;
+  };
+  try {
+    await assert.rejects(createRequestFromSelection(item.target, item.modified, action => action(), () => cancelled), /cancelled/);
+  } finally { fs.readFile = readFile; }
+  assert.equal(cancelled, true);
+  await absent(item.output);
+  await inputsUnchanged(item);
 });

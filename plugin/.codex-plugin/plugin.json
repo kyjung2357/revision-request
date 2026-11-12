@@ -1,6 +1,6 @@
 {
   "name": "revision-request",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Prepare revision requests for human review in VS Code before changing source files.",
   "author": {
     "name": "Kiyuob Jung",
