@@ -4,6 +4,6 @@
     "optional-reasons",
     "null-insert-delete"
   ],
-  "formatGuideSha256": "a757fa76f6dc391fe94a352267bc0fa917abd734413beddb5501fdbe1ec5f403",
-  "extensionVersion": "0.1.4"
+  "formatGuideSha256": "729de0a1a58c91f5003c31044e88078ae512ba45f6e6c03a0ba4d7a8c38a7712",
+  "extensionVersion": "0.2.0"
 }

@@ -5,6 +5,8 @@
   const proposed = document.getElementById('proposed-path');
   const output = document.getElementById('output-path');
   const error = document.getElementById('error-message');
+  const revision = document.getElementById('original-revision');
+  const gitNotice = document.getElementById('git-notice');
   const create = document.getElementById('create-request');
   const cancel = document.getElementById('cancel');
   const selectOriginal = document.getElementById('select-original');
@@ -21,6 +23,9 @@
     if (!state || state.type !== 'state') return;
     blocked = Boolean(state.busy || state.selecting);
     original.textContent = state.original || 'No file selected';
+    revision.textContent = state.originalRevision || '';
+    revision.hidden = !state.originalRevision;
+    gitNotice.hidden = state.originalMode !== 'git';
     proposed.textContent = state.proposed || 'No file selected';
     output.textContent = state.output || 'Choose an original to see where the request will be saved.';
     error.textContent = state.error || '';

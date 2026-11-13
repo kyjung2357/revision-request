@@ -24,3 +24,5 @@ button:disabled { opacity: .5; cursor: default; }
 [hidden] { display: none !important; }
 code { font-family: var(--vscode-editor-font-family, monospace); }
 @media (max-width: 460px) { body { padding: 20px 14px; } .field-heading { align-items: flex-start; flex-direction: column; gap: 6px; } h1 { font-size: 21px; } }
+
+.revision { overflow-wrap: anywhere; }

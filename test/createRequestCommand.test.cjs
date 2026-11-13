@@ -187,13 +187,15 @@ test('No local workspace is refused before displaying a picker', async () => {
   assert.equal(dialogs.length, 0);
 });
 
-test('Create Revision Request is exposed only in the Command Palette', () => {
+test('Create Revision Request remains in the Command Palette and has a persistent sidebar button', () => {
   const manifest = require('../package.json');
   assert.ok(manifest.contributes.commands.some(command => command.command === 'revisionRequest.createRequest'));
   for (const [location, items] of Object.entries(manifest.contributes.menus)) {
     if (location !== 'commandPalette') assert.ok(items.every(item => item.command !== 'revisionRequest.createRequest'));
   }
-  assert.ok(manifest.contributes.viewsWelcome.every(view => !view.contents.includes('command:revisionRequest.createRequest')));
+  const views=manifest.contributes.views.revisionRequest;
+  assert.deepEqual(views.map(view=>view.id),['revisionRequest.create','revisionRequest.requests']);
+  assert.ok(manifest.contributes.viewsWelcome.some(view=>view.view==='revisionRequest.create'&&view.contents.includes('[Create Revision Request](command:revisionRequest.createRequest)')));
 });
 
 test('Closing the form during final snapshot reads prevents the request commit', async () => {

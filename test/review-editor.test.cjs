@@ -26,7 +26,7 @@ class Emitter {
   dispose() { this.listeners.clear(); }
 }
 class Panel {
-  active = true; viewColumn = 1; disposed = false; reveals = 0; title = 'Preview';
+  active = true; visible = true; viewColumn = 1; disposed = false; reveals = 0; title = 'Preview';
   changed = new Emitter(); closed = new Emitter(); received = new Emitter();
   onDidChangeViewState = this.changed.event;
   onDidDispose = this.closed.event;
@@ -38,7 +38,7 @@ class Panel {
   };
   reveal() {
     if (this.failReveal) {this.failReveal = false; throw new Error('Injected reveal failure');}
-    assert.equal(this.disposed, false); this.reveals++; this.active = true;
+    assert.equal(this.disposed, false); this.reveals++; this.active = true; this.visible = true;
     this.changed.fire({webviewPanel: this});
   }
   dispose() { if (!this.disposed) {this.disposed = true; this.closed.fire();} }
@@ -48,13 +48,21 @@ const vscode = {
   Uri, EventEmitter: Emitter, ViewColumn: {Active: -1},
   workspace: {
     get textDocuments() {return current.documents;},
-    getConfiguration: () => ({get: (_key, fallback) => current.previewOnOpen ?? fallback}),
+    getConfiguration: () => ({
+      inspect: key => ({globalValue: current[key], ...current.settingScopes?.[key]}),
+      get: (key, fallback) => {
+        const values = {globalValue: current[key], ...current.settingScopes?.[key]};
+        return ['workspaceFolderLanguageValue', 'workspaceLanguageValue', 'globalLanguageValue',
+          'workspaceFolderValue', 'workspaceValue', 'globalValue'].map(scope => values[scope]).find(value => value !== undefined) ?? fallback;
+      },
+    }),
     getWorkspaceFolder(uri) {
       const relative = path.relative(current.workspace.fsPath, uri.fsPath);
       return uri.scheme === 'file' && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)
         ? {uri: current.workspace} : undefined;
     },
   },
+  commands: {executeCommand: async (command,key,value) => {if(command==='setContext')current.context.set(key,value);}},
   window: {
     createWebviewPanel(_viewType, title, _column, options) {
       current.attempts++;
@@ -63,6 +71,7 @@ const vscode = {
       panel.failReveal = current.failReveal; current.failReveal = false;
       current.created.push(panel); return panel;
     },
+    showOpenDialog: async () => {current.picks++; return current.pick;},
     showErrorMessage: async message => {current.errors.push(message);},
     showTextDocument: async uri => {current.sourceOpens.push(uri.toString());},
   },
@@ -72,9 +81,9 @@ Module._load = function(name, parent, main) { return name === 'vscode' ? vscode 
 require('tsx/cjs');
 const {ReviewEditor} = require('../src/extension.ts');
 Module._load = originalLoad;
-const tick = () => new Promise(resolve => setImmediate(resolve));
+const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 function setup(t) {
-  current = {workspace: Uri.file(path.join(__dirname, 'virtual-workspace')), attempts: 0, created: [], errors: [], sourceOpens: [], requests: [], documents: []};
+  current = {workspace: Uri.file(path.join(__dirname, 'virtual-workspace')), attempts: 0, created: [], errors: [], sourceOpens: [], requests: [], documents: [], context: new Map(), picks: 0};
   const changed = new Emitter(), deleted = new Emitter();
   const service = {
     onDidChange: changed.event, onDidDeleteRequest: deleted.event,
@@ -88,7 +97,7 @@ function setup(t) {
   return {editor, uri, document, service, changed, deleted};
 }
 test('Python RR automatically previews once per open source document, including after preview close', async t => {
-  const {editor, uri, document} = setup(t);
+  const {editor, uri, document} = setup(t); current.previewMode = 'once';
   editor.autoPreview({document}); await tick();
   assert.equal(current.attempts, 1);
   assert.match(current.created[0].webview.html, /data-request-uri="[^"]*inventory_report\.py\.rr"/);
@@ -104,7 +113,7 @@ test('Python RR automatically previews once per open source document, including 
   assert.equal(current.attempts, 3, 'A newly opened TextDocument has its own automatic preview');
 });
 test('failed automatic creation can retry without reopening the source document', async t => {
-  const {editor, document} = setup(t); current.failCreate = true;
+  const {editor, document} = setup(t); current.previewMode = 'once'; current.failCreate = true;
   editor.autoPreview({document}); await tick();
   assert.equal(current.attempts, 1); assert.deepEqual(current.errors, ['Injected create failure']);
   editor.autoPreview({document}); await tick();
@@ -149,7 +158,7 @@ test('restored Python panel rebinds the saved request and is reused without dupl
   restored.dispose(); await editor.openPreview(uri); assert.equal(current.created.length, 1);
 });
 test('restored or explicitly opened preview counts the existing source as already previewed', async t => {
-  const {editor, uri, document} = setup(t), restored = new Panel();
+  const {editor, uri, document} = setup(t), restored = new Panel(); current.previewMode = 'once';
   await editor.deserializeWebviewPanel(restored, {requestUri: uri.toString()}); await tick();
   restored.dispose(); editor.autoPreview({document}); await tick();
   assert.equal(current.attempts, 0);
@@ -328,7 +337,8 @@ test('ready arriving during an initial post receives a fresh state after its lis
   const listenerReady = receive({type: 'ready'}); await tick();
   assert.equal(reads, 1);
   firstPost.resolve(); await Promise.all([firstReady, listenerReady]);
-  assert.deepEqual(panel.webview.messages.map(message => message.revision), ['delivery-1', 'delivery-2']);
+  assert.deepEqual(panel.webview.messages.filter(message => message.type === 'state').map(message => message.revision), ['delivery-1', 'delivery-2']);
+  assert.equal(panel.webview.messages.at(-1).type, 'revealFirstChange');
 });
 
 
@@ -391,4 +401,305 @@ test('malformed edited decisions never reach the file service', async t => {
     const result=panel.webview.messages.find(item=>item.type==='editResult');
     assert.equal(result.success,false); assert.ok(result.error);
   }
+});
+
+test('menu draft transformation replies locally without refreshing or submitting a decision', async t => {
+  const {editor, uri, service} = setup(t);
+  const calls = [];
+  service.transformDraft = async (...args) => {calls.push(args); return {draft:'# edited',reviewActions:[]};};
+  service.reviewActions = async () => [{id:'comment',enabled:true,label:'Comment out changed lines'}];
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], refreshes = current.requests.length;
+  panel.received.fire({type:'transformDraft',filePath:'sample.py',hunkId:'h1',draft:'edited',revision:'r1',action:'comment',editId:'transform-1'});
+  await tick(); await tick();
+  assert.equal(calls.length,1);
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-1',draft:'# edited',reviewActions:[]});
+  assert.equal(current.requests.length,refreshes);
+  panel.received.fire({type:'reviewActions',filePath:'sample.py',hunkId:'h1',draft:'edited',revision:'r1',editId:'menu-1'});
+  await tick();
+  assert.equal(panel.webview.messages.at(-1).type,'reviewActionsResult');
+  assert.equal(current.requests.length,refreshes);
+});
+test('menu transformation failures keep a correlated draft error and reject unknown message keys', async t => {
+  const {editor, uri, service} = setup(t);
+  service.transformDraft = async () => {throw Error('Unsafe TeX fragment');};
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], refreshes = current.requests.length;
+  const message = {type:'transformDraft',filePath:'sample.tex',hunkId:'h1',draft:'edited',revision:'r1',action:'markAdded',editId:'transform-2'};
+  panel.received.fire(message); await tick();
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-2',error:'Unsafe TeX fragment'});
+  panel.received.fire({...message,override:true}); await tick();
+  assert.match(panel.webview.messages.at(-1).error,/Invalid/);
+  assert.equal(current.requests.length,refreshes);
+});
+
+test('sidebar Quick Review opens a request and waits for ready plus initial state before enabling', async t => {
+  const {editor,uri} = setup(t);
+  await editor.toggleQuickReview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  assert.equal(panel.webview.messages.some(message => message.type === 'toggleQuickReview'),false);
+  await receive({type:'quickReviewState',enabled:false});
+  await receive({type:'ready'});
+  const toggleIndex = panel.webview.messages.findIndex(message => message.type === 'toggleQuickReview');
+  assert.ok(toggleIndex > 1); assert.equal(panel.webview.messages[toggleIndex-2].type,'state');
+  assert.equal(panel.webview.messages[toggleIndex-1].type,'revealFirstChange');
+  assert.deepEqual(panel.webview.messages[toggleIndex],{type:'toggleQuickReview',enabled:true});
+  await receive({type:'quickReviewState',enabled:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),true);
+  panel.active = false; // Sidebar keyboard/mouse focus must still address this preview.
+  await editor.toggleQuickReview();
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'toggleQuickReview',enabled:false});
+  await receive({type:'quickReviewState',enabled:false});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+});
+test('rapid sidebar toggles before ready resolve to the last requested state', async t => {
+  const {editor,uri} = setup(t);
+  await editor.toggleQuickReview(uri);
+  await editor.toggleQuickReview();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  await receive({type:'ready'});
+  assert.deepEqual(panel.webview.messages.filter(message => message.type==='toggleQuickReview'),[{type:'toggleQuickReview',enabled:false}]);
+  await receive({type:'quickReviewState',enabled:false});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+});
+test('sidebar Quick Review prompts only without an open request and respects cancellation/workspace scope', async t => {
+  const {editor,uri} = setup(t);
+  await editor.toggleQuickReview();
+  assert.equal(current.picks,1); assert.equal(current.attempts,0);
+  current.pick = [Uri.file(path.resolve(__dirname,'outside.tex.rr'))];
+  await assert.rejects(editor.toggleQuickReview(),/inside an open workspace/);
+  assert.equal(current.attempts,0);
+  current.pick = [uri];
+  await editor.toggleQuickReview(); await tick();
+  assert.equal(current.picks,3); assert.equal(current.attempts,1);
+  const receive = [...current.created[0].received.listeners][0];
+  await receive({type:'ready'});
+  assert.deepEqual(current.created[0].webview.messages.at(-1),{type:'toggleQuickReview',enabled:true});
+  current.created[0].dispose();
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+});
+test('Quick Review state follows the selected preview and cannot leak from background or malformed panels', async t => {
+  const {editor,uri} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const first = current.created[0], receiveFirst = [...first.received.listeners][0];
+  await receiveFirst({type:'quickReviewState',enabled:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),true);
+  first.active = false;
+  const other = Uri.joinPath(current.workspace,'other.tex.rr');
+  await editor.openPreview(other); await tick();
+  const second = current.created[1], receiveSecond = [...second.received.listeners][0];
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  await receiveFirst({type:'quickReviewState',enabled:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  await receiveSecond({type:'quickReviewState',enabled:'true'});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  await receiveSecond({type:'quickReviewState',enabled:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),true);
+  second.dispose();
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  await editor.openPreview(uri);
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),true);
+  const unbound = new Panel();
+  await editor.deserializeWebviewPanel(unbound,{});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+});
+test('quick decisions acknowledge only the correlated completed operation and retain failure details', async t => {
+  const {editor,uri,service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], gate = deferred(), calls = [];
+  service.decide = async (...args) => {calls.push(args); await gate.promise;};
+  panel.webview.messages = [];
+  const message = {type:'decide',filePath:'inventory_report.py',hunkId:'pending-1',decision:'accepted',revision:'before',quickDecisionId:'quick-1'};
+  const pending = receive(message); await tick();
+  assert.equal(panel.webview.messages.some(item=>item.type==='quickDecisionResult'),false);
+  gate.resolve(); await pending;
+  assert.deepEqual(calls,[[uri,message.filePath,message.hunkId,message.decision,message.revision]]);
+  assert.deepEqual(panel.webview.messages.find(item=>item.type==='quickDecisionResult'),{
+    type:'quickDecisionResult',quickDecisionId:'quick-1',filePath:message.filePath,hunkId:message.hunkId,decision:'accepted',success:true,error:undefined
+  });
+  service.decide = async () => {throw Error('The request changed. Review it again.');};
+  panel.webview.messages = [];
+  await receive({...message,quickDecisionId:'quick-2',decision:'ignored'});
+  const failed = panel.webview.messages.find(item=>item.type==='quickDecisionResult');
+  assert.equal(failed.success,false); assert.equal(failed.quickDecisionId,'quick-2'); assert.equal(failed.decision,'ignored');
+  assert.match(failed.error,/request changed/);
+  assert.match(panel.webview.messages.find(item=>item.type==='state').error,/request changed/);
+});
+test('malformed quick decisions cannot reach the review service', async t => {
+  const {editor,uri,service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const receive = [...current.created[0].received.listeners][0];
+  service.decide = async () => assert.fail('Malformed quick decisions must not write.');
+  const base = {type:'decide',filePath:'inventory_report.py',hunkId:'pending-1',decision:'accepted',revision:'before'};
+  for (const quickDecisionId of ['',42,'a'.repeat(129)]) await receive({...base,quickDecisionId});
+  await receive({...base,type:'decideFile',quickDecisionId:'bulk-not-allowed'});
+});
+test('Quick Review sidebar icons are filled flat bolts and have no editor-title duplicate', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname,'../package.json'),'utf8'));
+  const title = manifest.contributes.menus['view/title'];
+  for (const command of ['revisionRequest.enableQuickReview','revisionRequest.disableQuickReview']) {
+    const item = title.find(item => item.command === command);
+    assert.equal(item.group,'navigation@1'); assert.match(item.when,/revisionRequest\.requests/);
+    assert.match(item.when,/revisionRequest\.quickReviewActive/);
+    assert.equal(manifest.contributes.menus['editor/title'].some(item=>item.command === command),false);
+    const contribution = manifest.contributes.commands.find(item=>item.command === command);
+    const svg = fs.readFileSync(path.resolve(__dirname,'..',contribution.icon),'utf8');
+    assert.match(svg,/<path[^>]*stroke="none"/); assert.doesNotMatch(svg,/<filter|<linearGradient|fill="none"|stroke-width=/);
+    if (command.endsWith("enableQuickReview")) {assert.match(svg,/<path[^>]*fill="#f2d64b"[^>]*stroke="none"/);assert.doesNotMatch(svg,/<rect/);}
+    else {assert.match(svg,/<rect[^>]*fill="#f2d64b"/);assert.match(svg,/<path[^>]*fill="#3a3215"[^>]*stroke="none"/);}
+  }
+});
+
+test('a reloaded preview replays a sidebar request after its explicit startup reset and ready', async t => {
+  const {editor,uri} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  await receive({type:'ready'});
+  panel.webview.messages = [];
+  await editor.toggleQuickReview();
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'toggleQuickReview',enabled:true});
+  // The message targeted the disappearing webview; its replacement announces
+  // that it is unarmed before registering readiness.
+  await receive({type:'quickReviewState',enabled:false,initial:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  await receive({type:'ready'});
+  assert.deepEqual(panel.webview.messages.filter(message=>message.type==='toggleQuickReview'),[
+    {type:'toggleQuickReview',enabled:true},{type:'toggleQuickReview',enabled:true}
+  ]);
+  await receive({type:'quickReviewState',enabled:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),true);
+  await receive({type:'quickReviewState',enabled:false,initial:true});
+  assert.equal(current.context.get('revisionRequest.quickReviewActive'),false);
+  panel.webview.messages = [];
+  await receive({type:'ready'});
+  assert.equal(panel.webview.messages.some(message=>message.type==='toggleQuickReview'),false,
+    'Reloading alone cannot rearm a previously acknowledged mode');
+});
+
+test('always is the default and normally reselecting an RR reveals its preview again', async t => {
+  const {editor, document, uri} = setup(t);
+  editor.autoPreview({document}); await tick();
+  const panel = current.created[0]; assert.equal(panel.reveals, 1);
+  editor.autoPreview(undefined);
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  editor.autoPreview({document}); await tick();
+  assert.equal(current.attempts, 1); assert.equal(panel.reveals, 2);
+  panel.dispose();
+  editor.autoPreview({document}); await tick();
+  assert.equal(current.attempts, 1, 'Closing the preview cannot recursively reopen it');
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  editor.autoPreview({document}); await tick();
+  assert.equal(current.attempts, 2, 'Returning normally after another source reopens the preview');
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const settings = manifest.contributes.configuration.properties;
+  assert.equal(settings['revisionRequest.previewMode'].default, 'always');
+  assert.deepEqual(settings['revisionRequest.previewMode'].enum, ['always', 'once', 'manual']);
+  assert.ok(settings['revisionRequest.previewOnOpen'].deprecationMessage);
+});
+for (const sourceFirst of [true, false]) test('closing always preview suppresses source fallback when source activation is ' + (sourceFirst ? 'before disposal' : 'after disposal'), async t => {
+  const {editor, document, uri} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0];
+  editor.autoPreview(undefined); panel.active = false;
+  if (sourceFirst) editor.autoPreview({document});
+  panel.dispose();
+  if (!sourceFirst) editor.autoPreview({document});
+  await tick();
+  editor.autoPreview({document}); await tick();
+  assert.equal(current.attempts, 1);
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 2);
+});
+test('Open RR as JSON remains editable through redundant activation and configuration changes', async t => {
+  const {editor, document, uri} = setup(t);
+  await editor.openPreview(uri); const panel = current.created[0];
+  await editor.openSource(uri);
+  editor.autoPreview({document}); await tick();
+  editor.autoPreview(undefined); editor.autoPreview({document}); await tick();
+  current.previewMode = 'manual'; editor.autoPreview({document}); await tick();
+  current.previewMode = 'always'; editor.autoPreview({document}); await tick();
+  assert.equal(panel.reveals, 1, 'Transient events and changing settings must not steal JSON focus');
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'another.py.rr')}}); await tick();
+  editor.autoPreview({document}); await tick();
+  assert.equal(panel.reveals, 2, 'An ordinary activation after selecting another document rearms always mode');
+});
+test('JSON escape belongs to an open document, not every later document with the same URI', async t => {
+  const {editor, document, uri} = setup(t);
+  await editor.openSource(uri); editor.autoPreview({document}); await tick();
+  current.documents = [];
+  const reopened = {uri}; current.documents.push(reopened);
+  editor.autoPreview({document: reopened}); await tick(); assert.equal(current.attempts, 1);
+});
+test('manual mode keeps JSON while explicit preview and sidebar Quick Review remain available', async t => {
+  const {editor, document, uri} = setup(t); current.previewMode = 'manual';
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 0);
+  await editor.openPreview(uri); assert.equal(current.attempts, 1);
+  current.created[0].dispose();
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 1);
+  await editor.toggleQuickReview(uri); assert.equal(current.attempts, 2);
+  const panel = current.created[1]; panel.received.fire({type: 'ready'}); await tick();
+  const navigation = panel.webview.messages.findIndex(message => message.type === 'revealFirstChange');
+  const toggle = panel.webview.messages.findIndex(message => message.type === 'toggleQuickReview');
+  assert.ok(navigation >= 0 && toggle > navigation);
+});
+test('explicit previewMode overrides legacy values at any configuration scope', async t => {
+  const {editor, document} = setup(t);
+  current.previewOnOpen = false;
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 0);
+  current.settingScopes = {previewMode: {workspaceFolderValue: 'always'}};
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 1);
+  current.created[0].dispose();
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  current.previewOnOpen = true;
+  current.settingScopes = {previewMode: {workspaceValue: 'manual'}};
+  editor.autoPreview({document}); await tick(); assert.equal(current.attempts, 1);
+});
+test('normal opening jumps to first change after ready; focus and updates do not jump', async t => {
+  const {editor, uri, changed} = setup(t);
+  await editor.openPreview(uri); const panel = current.created[0];
+  assert.equal(panel.webview.messages.some(message => message.type === 'revealFirstChange'), false);
+  panel.received.fire({type: 'ready'}); await tick();
+  assert.equal(panel.webview.messages.filter(message => message.type === 'revealFirstChange').length, 1);
+  panel.changed.fire({webviewPanel: panel}); changed.fire(); await tick();
+  assert.equal(panel.webview.messages.filter(message => message.type === 'revealFirstChange').length, 1);
+  await editor.openPreview(uri);
+  assert.equal(panel.webview.messages.filter(message => message.type === 'revealFirstChange').length, 2);
+});
+
+test('an explicitly configured legacy true preserves once behavior without changing settings', async t => {
+  const {editor, document} = setup(t); current.previewOnOpen = true;
+  editor.autoPreview({document}); await tick();
+  editor.autoPreview(undefined);
+  editor.autoPreview({document: {uri: Uri.joinPath(current.workspace, 'notes.md')}});
+  editor.autoPreview({document}); await tick();
+  assert.equal(current.created[0].reveals, 1);
+  assert.equal(current.previewMode, undefined);
+  assert.equal(current.previewOnOpen, true);
+});
+
+test('toggling Quick Review in its active preview preserves position; revealing a hidden preview navigates', async t => {
+  const {editor, uri} = setup(t);
+  await editor.toggleQuickReview(uri);
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  await receive({type: 'ready'}); await receive({type: 'quickReviewState', enabled: true});
+  const count = () => panel.webview.messages.filter(message => message.type === 'revealFirstChange').length;
+  assert.equal(count(), 1);
+  await editor.toggleQuickReview(uri);
+  assert.equal(count(), 1, 'Disabling Quick Review must not jump to the first change');
+  assert.equal(panel.reveals, 1);
+  assert.deepEqual(panel.webview.messages.at(-1), {type: 'toggleQuickReview', enabled: false});
+  await receive({type: 'quickReviewState', enabled: false});
+  await editor.toggleQuickReview(uri);
+  assert.equal(count(), 1, 'Enabling the active preview also retains its position');
+  await receive({type: 'quickReviewState', enabled: true});
+  panel.active = false; // Focus is in the sidebar, while this remains the visible request.
+  await editor.toggleQuickReview(uri);
+  assert.equal(count(), 1, 'Sidebar focus must not turn disabling Quick Review into reopening');
+  assert.equal(panel.reveals, 2, 'The selected visible request still receives focus');
+  await receive({type: 'quickReviewState', enabled: false});
+  panel.active = false; panel.visible = false;
+  await editor.toggleQuickReview(uri);
+  assert.equal(count(), 2, 'Revealing a hidden preview is an ordinary reopening');
+  assert.equal(panel.reveals, 3);
 });

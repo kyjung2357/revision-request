@@ -25,7 +25,7 @@
     "request": {
       "type": "array",
       "maxItems": 10000,
-      "description": "Each entry is one atomic review decision. Group related contiguous changes in one entry; independent changes may remain separate. Consumed original line ranges cannot overlap. Empty arrays have no pending requests.",
+      "description": "Each entry is one atomic review decision. Group only consecutive changed lines; any unchanged line, including a blank line, comment, label, or delimiter, requires separate entries regardless of shared purpose. Keep matching context within changed lines. Single-line entries are appropriate for isolated edits. Entirely added/deleted blocks may remain multiline. This is authoring guidance; supplied boundaries are preserved. Consumed original line ranges cannot overlap. Empty arrays have no pending requests.",
       "items": {
         "type": "object",
         "additionalProperties": true,

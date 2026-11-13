@@ -204,3 +204,26 @@ h1, h2, h3, p { margin: 0; }
     grid-template-columns: 34px 18px var(--rr-code-width, minmax(0, 1fr)) minmax(0, 1fr) var(--rr-action-gutter);
   }
 }
+
+/* The floating actions menu never participates in source-row layout. */
+.review-menu-toggle { font-size: 18px; line-height: 1; }
+.review-action-menu { position: fixed; z-index: 110; box-sizing: border-box; overflow-y: auto; padding: 4px; border: 1px solid var(--vscode-menu-border, var(--rr-border)); border-radius: 5px; background: var(--vscode-menu-background, var(--rr-panel)); color: var(--vscode-menu-foreground, var(--rr-fg)); box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0,0,0,.3)); }
+.review-menu-item { display: block; width: 100%; border: 0; border-radius: 3px; margin: 0; padding: 7px 9px; text-align: left; color: inherit; background: transparent; font: inherit; font-size: 12px; line-height: 1.4; white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
+.review-menu-item:hover:not(:disabled), .review-menu-item:focus-visible { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground, #37373d)); outline: 1px solid var(--vscode-menu-selectionBorder, transparent); outline-offset: -1px; }
+.review-menu-item:disabled { color: var(--vscode-disabledForeground, var(--rr-muted)); cursor: default; }
+.review-menu-label, .review-menu-reason { display: block; }
+.review-menu-reason { font-size: 10px; margin-top: 2px; }
+.review-menu-setup { border-top: 1px solid var(--rr-border); border-radius: 0; margin-top: 4px; padding-top: 10px; }
+
+
+/* Quick Review shares the action gutter; counts stay on the bulk-action row. */
+.file-action-stack { display: flex; flex-direction: column; min-width: 0; gap: 5px; }
+.summary-row > .summary { align-self: end; }
+.quick-review-toggle { --rr-quick-yellow: #f2d64b; --rr-quick-dark: #3a3215; color: var(--rr-quick-yellow); background: var(--rr-quick-dark); border-color: var(--rr-quick-yellow); display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 24px; margin: 0 5px 0 14px; padding: 0 4px; font-size: 11px; line-height: 22px; }
+.quick-review-icon { width: 16px; height: 16px; flex: 0 0 16px; color: currentColor; fill: currentColor; stroke: none; stroke-linecap: round; stroke-linejoin: round; }
+.quick-review-toggle:hover:not(:disabled) { color: var(--rr-quick-yellow); background: #4b411d; }
+.quick-review-toggle.is-active { color: var(--rr-quick-dark); background: var(--rr-quick-yellow); border-color: var(--rr-quick-dark); }
+.quick-review-toggle.is-active:hover:not(:disabled) { color: var(--rr-quick-dark); background: #ffe575; }
+.quick-review-toggle:disabled { opacity: .45; }
+.inline-actions .quick-review-selected { outline: 2px solid var(--vscode-editorWarning-foreground, #cca700); outline-offset: 1px; }
+@media (max-width: 650px) { .quick-review-toggle { font-size: 10px; gap: 3px; } }

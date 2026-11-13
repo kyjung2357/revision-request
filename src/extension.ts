@@ -10,7 +10,10 @@ import { McpHost } from './mcpHost';
 import { startMcpBridge } from './mcpBridge';
 import { installMcpAdapter, createMcpConfiguration } from './mcpSetup';
 import { createRequestFromFiles } from './createRequestCommand';
+import { readGitOriginal, validateGitOriginalTarget, type GitOriginal } from './gitOriginal';
 import { collectMcpDiagnostics, formatMcpDiagnostics } from './mcpDiagnostics';
+import { applyReviewAction, getReviewActions, type ReviewAction, type ReviewActionInput } from './reviewActions';
+import { inspectReviewMacros, setupReviewMacros, type SetupImportPlan } from './reviewMacroSetup';
 
 const VIEW = 'revisionRequest.review';
 type Decisions = Record<string, Decision>;
@@ -131,16 +134,43 @@ export class ReviewService implements vscode.Disposable {
   private baselineKey(uri: vscode.Uri, generation: string, identity: string) {
     return this.reviewPrefix(uri) + 'baseline.' + requestFingerprint(generation) + '.' + identity;
   }
+  private gitOriginalKey(uri: vscode.Uri, generation: string) {
+    return this.reviewPrefix(uri) + 'git-original.' + requestFingerprint(generation);
+  }
+  /** Remember the creation baseline locally; the portable .rr format stays unchanged. */
+  async rememberGitOriginal(uri: vscode.Uri, selected: GitOriginal): Promise<void> {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before recording a Git original.');
+    const raw = await this.readRequest(uri);
+    const folder = vscode.workspace.getWorkspaceFolder(uri)!;
+    const target = await this.targetUri(uri, {path: raw.request.path, before: '', after: ''});
+    const selection = await validateGitOriginalTarget(folder.uri.fsPath, target.fsPath, selected);
+    const baseline = requestModelText(await readGitOriginal(selection));
+    if (raw.request.request.some(entry => entry.status !== 'pending')) throw new Error('A new Git request must contain only pending changes.');
+    resolveRequest(raw.request, '', baseline);
+    await this.assertRawRequest(uri, raw);
+    if (!vscode.workspace.isTrusted) throw new Error('The selected workspace is no longer trusted.');
+    await this.context.workspaceState.update(this.gitOriginalKey(uri, raw.generation), {
+      path: raw.request.path, hash: requestFingerprint(baseline), commit: selection.commit
+    });
+  }
   private async load(uri: vscode.Uri) {
     const raw = await this.readRequest(uri);
     const request = raw.request;
     try {
       const identity = proposalIdentity(request);
       const key = this.baselineKey(uri, raw.generation, identity);
-      const cached = this.context.workspaceState.get<string>(key);
+      const gitOriginal = this.context.workspaceState.get<{path: string; hash: string; commit: string}>(
+        this.gitOriginalKey(uri, raw.generation));
+      let cached = this.context.workspaceState.get<string>(key);
+      // A preview may have read the newly created file while its origin was being recorded.
+      if (gitOriginal && cached !== undefined && requestFingerprint(requestModelText(cached)) !== gitOriginal.hash) cached = undefined;
       const target = await this.targetUri(uri, {path: request.path, before: '', after: ''});
       const current = decode(await vscode.workspace.fs.readFile(target));
       const review = resolveRequest(request, current, cached);
+      if (gitOriginal && (gitOriginal.path !== request.path || requestFingerprint(requestModelText(review.baseline)) !== gitOriginal.hash)) {
+        throw new Error('This request uses Git commit ' + gitOriginal.commit.slice(0, 8) +
+          ' as its original. Review it in a workspace whose target matches that version.');
+      }
       if (cached === undefined) await this.context.workspaceState.update(key, review.baseline);
       const decisions: Decisions = {};
       for (const [hunk, decision] of Object.entries(review.decisions)) decisions[keyFor(request.path, hunk)] = decision;
@@ -517,6 +547,158 @@ export class ReviewService implements vscode.Disposable {
       await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, {[index]: 'pending'}), origin);
     });
   }
+  /** Review-menu operations return a local draft; they do not save either file. */
+  private async reviewActionContext(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before editing a proposal.');
+    if (typeof filePath !== 'string' || typeof hunkId !== 'string' || !hunkId || typeof draft !== 'string' || typeof revision !== 'string') {
+      throw new Error('Choose a pending change and provide its complete draft text.');
+    }
+    if (this.busy) throw new Error('Wait for the current review action to finish.');
+    const loaded = await this.load(uri);
+    if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before editing.');
+    const file = loaded.request.files.find(item => item.path === filePath);
+    if (!file) throw new Error('This file is not part of the request.');
+    const hunks = computeHunks(file), hunk = hunks.find(item => item.id === hunkId);
+    if (!hunk || (loaded.decisions[keyFor(file.path, hunk.id)] ?? 'pending') !== 'pending') {
+      throw new Error('Only pending changes can be edited.');
+    }
+    const target = await this.inspectTarget(uri, file, loaded.decisions);
+    // This validates Unicode, size, and entry boundaries without saving the draft.
+    editPendingRequest(loaded.savedText, loaded.resolved.review.baseline, hunkId, draft);
+    let start = hunk.start;
+    for (const previous of hunks) {
+      if (previous === hunk) break;
+      if (loaded.decisions[keyFor(file.path, previous.id)] === 'accepted') start += previous.after.length - previous.before.length;
+    }
+    const input: ReviewActionInput = {path: file.path,
+      before: hunk.before.replace(/\r\n|\r/g, '\n').replace(/\n$/, ''),
+      after: draft.replace(/\r\n|\r/g, '\n'), prefix: target.current.slice(0, start).replace(/^\uFEFF/, '').replace(/\r\n|\r/g, '\n')};
+    return {loaded, file, hunk, input, target};
+  }
+  private async actionAvailability(input: ReviewActionInput, targetUri: vscode.Uri) {
+    const actions = getReviewActions(input);
+    if (actions.some(action => action.id !== 'comment' && action.enabled)) {
+      const rememberedRoot = this.context.workspaceState.get<string>('revisionRequest.macroRoot.' + targetUri.toString());
+      const macros = await inspectReviewMacros(targetUri, rememberedRoot ? vscode.Uri.parse(rememberedRoot) : undefined);
+      if (!macros.ready) for (const action of actions) {
+        if (action.id !== 'comment' && action.enabled) {
+          action.enabled = false;
+          action.reason = (macros.reason || 'LaTeX review macros are not loaded.') + ' Use Set up LaTeX review macros, then Accept its import proposal.';
+        }
+      }
+    }
+    return actions;
+  }
+  async reviewActions(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
+    const context = await this.reviewActionContext(uri, filePath, hunkId, draft, revision);
+    const actions = await this.actionAvailability(context.input, context.target.uri);
+    await this.assertRawRequest(uri, context.loaded);
+    return actions;
+  }
+  async transformDraft(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string, action: ReviewAction) {
+    if (!['comment', 'markRemoved', 'markAdded'].includes(action)) throw new Error('Unknown proposal action.');
+    const context = await this.reviewActionContext(uri, filePath, hunkId, draft, revision);
+    const actions = await this.actionAvailability(context.input, context.target.uri);
+    const selected = actions.find(item => item.id === action)!;
+    if (!selected.enabled) throw new Error(selected.reason || 'This action is unavailable for this change.');
+    const transformed = applyReviewAction(context.input, action);
+    editPendingRequest(context.loaded.savedText, context.loaded.resolved.review.baseline, hunkId, transformed);
+    await this.assertRawRequest(uri, context.loaded);
+    return {draft: transformed, reviewActions: await this.actionAvailability({...context.input, after: transformed}, context.target.uri)};
+  }
+  /** Macro installation is explicit; the preamble change remains a pending RR entry. */
+  async setupMacros(uri: vscode.Uri, filePath: string, extensionUri: vscode.Uri) {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before setting up LaTeX review macros.');
+    const loaded = await this.load(uri), file = loaded.request.files.find(item => item.path === filePath);
+    if (!file || !/\.(?:tex|ltx)$/i.test(file.path)) throw new Error('Choose a LaTeX revision request.');
+    const target = await this.targetUri(uri, file);
+    let result: vscode.Uri | undefined;
+    const root = await setupReviewMacros(target, extensionUri, async plan => {
+      result = await this.queueMacroImport(uri, plan);
+    });
+    if (root) await this.context.workspaceState.update('revisionRequest.macroRoot.' + target.toString(), root.toString());
+    return result;
+  }
+  async queueMacroImport(requestUri: vscode.Uri, plan: SetupImportPlan): Promise<vscode.Uri> {
+    return this.runExclusive(async () => {
+      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before preparing the import proposal.');
+      const folder = vscode.workspace.getWorkspaceFolder(requestUri);
+      if (!folder || plan.rootUri.scheme !== 'file' || !inside(folder.uri.fsPath, plan.rootUri.fsPath)) {
+        throw new Error('The LaTeX root must be inside the request workspace.');
+      }
+      const relative = path.relative(folder.uri.fsPath, plan.rootUri.fsPath).split(path.sep).join('/');
+      const active = await this.load(requestUri);
+      const destination = active.resolved.request.path === relative ? requestUri : vscode.Uri.file(plan.rootUri.fsPath + '.rr');
+      const targetUri = await this.targetUri(requestUri, {path: relative, before: '', after: ''});
+      if (!Number.isSafeInteger(plan.line) || plan.line < 1 || plan.text !== '\\input{review-macro.tex}') throw new Error('Invalid macro import proposal.');
+      const dirty = vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty);
+      if (dirty || decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) throw new Error('The LaTeX root changed. Save it and try setup again.');
+      let exists = true;
+      try { await fs.lstat(destination.fsPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        exists = false;
+      }
+      const entry = {line: plan.line, before: null, after: plan.text, reason: 'Load the shared LaTeX review markup commands.', status: 'pending' as const};
+      if (exists) {
+        await this.prepareReview(destination);
+        const loaded = await this.load(destination);
+        const file = loaded.request.files[0]!;
+        const target = await this.inspectTarget(destination, file, loaded.decisions);
+        if (file.path !== relative || target.current !== plan.original) throw new Error('The LaTeX root or its request changed. Review it before setup.');
+        // Convert the current preamble line to the request's immutable original line.
+        let shift = 0;
+        for (const hunk of computeHunks(file)) {
+          if (loaded.decisions[keyFor(file.path, hunk.id)] !== 'accepted') continue;
+          const currentStart = hunk.oldStart + shift;
+          if (plan.line <= currentStart) break;
+          if (plan.line < currentStart + hunk.newLines) throw new Error('The import location is inside an accepted block. Undo that block or prepare the macros before creating this request.');
+          shift += hunk.newLines - hunk.oldLines;
+        }
+        entry.line -= shift;
+        if (loaded.resolved.request.request.some(item => item.before === null && item.after === entry.after && item.status === 'pending')) return destination;
+        const request = {...loaded.resolved.request, request: [...loaded.resolved.request.request, entry]};
+        const text = JSON.stringify(request, null, 2) + '\n';
+        const review = resolveRequest(parseRequestDocument(text), target.current, loaded.resolved.review.baseline);
+        if (review.expectedTarget !== target.current) throw new Error('Macro setup must preserve the original file.');
+        await this.commitReview(destination, loaded, text, 'user');
+      } else {
+        const request: RevisionRequest = {path: relative, time: new Date().toISOString(), request: [entry]};
+        const text = JSON.stringify(request, null, 2) + '\n';
+        resolveRequest(parseRequestDocument(text), plan.original);
+        const bytes = Buffer.from(text, 'utf8');
+        const parent = path.dirname(destination.fsPath);
+        const parentReal = await fs.realpath(parent);
+        if (path.relative(parentReal, path.resolve(parent)) !== '') throw new Error('The import request destination cannot use symbolic links.');
+        if (vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty) ||
+            decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) throw new Error('The LaTeX root changed before creating the import proposal.');
+        const handle = await fs.open(destination.fsPath, 'wx');
+        const created = await handle.stat();
+        let written: Awaited<ReturnType<typeof handle.stat>> | undefined;
+        try {
+          try { await handle.writeFile(bytes); } finally { written = await handle.stat(); await handle.close(); }
+          if (path.relative(parentReal, await fs.realpath(parent)) !== '' ||
+              vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty) ||
+              decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) {
+            throw new Error('The LaTeX root changed while preparing its import proposal.');
+          }
+        } catch (error) {
+          // Remove only this creation, including a partial write, while preserving concurrent edits/replacements.
+          try {
+            const current = await fs.lstat(destination.fsPath), contents = await fs.readFile(destination.fsPath);
+            if (written && current.isFile() && !current.isSymbolicLink() && current.dev === created.dev && current.ino === created.ino &&
+                current.birthtimeMs === created.birthtimeMs && current.mtimeMs === written.mtimeMs && current.size === written.size &&
+                contents.length <= bytes.length && bytes.subarray(0, contents.length).equals(contents)) {
+              const final = await fs.lstat(destination.fsPath);
+              if (final.dev === current.dev && final.ino === current.ino && final.birthtimeMs === current.birthtimeMs &&
+                  final.mtimeMs === current.mtimeMs && final.size === current.size) await fs.unlink(destination.fsPath);
+            }
+          } catch { /* Keep any file whose identity is no longer certain. */ }
+          throw error;
+        }
+      }
+      return destination;
+    });
+  }
   async editPending(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before editing a proposal.');
     if (typeof filePath !== 'string' || typeof hunkId !== 'string' || !hunkId || typeof draft !== 'string' || typeof revision !== 'string') {
@@ -661,12 +843,18 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
   readyCount = 0;
   activeUri: vscode.Uri | undefined;
   private sourceOnlyUri: string | undefined;
+  private sourceOnlyDocument: vscode.TextDocument | undefined;
+  private activeSourceDocument: vscode.TextDocument | undefined;
+  private autoPreviewTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly firstChangeRequested = new WeakSet<vscode.WebviewPanel>();
   private readonly seenSourceDocuments = new WeakSet<vscode.TextDocument>();
   private readonly panels = new Map<string, vscode.WebviewPanel>();
   private readonly unboundPanels = new Set<vscode.WebviewPanel>();
   private readonly opening = new Map<string, Promise<void>>();
+  private readonly quickReview = new Map<vscode.WebviewPanel, {ready: boolean; enabled: boolean; requested?: boolean; sent?: boolean}>();
   constructor(private readonly context: vscode.ExtensionContext, private readonly service: ReviewService, private readonly snapshots: SnapshotProvider) {}
   dispose() {
+    clearTimeout(this.autoPreviewTimer);
     for (const panel of this.panels.values()) panel.dispose();
     for (const panel of this.unboundPanels) panel.dispose();
   }
@@ -687,9 +875,9 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
       panel.webview.options = {enableScripts: false, localResourceRoots: []};
       panel.webview.html = getReviewRestoreErrorHtml();
       this.unboundPanels.add(panel);
-      if (panel.active) this.activeUri = undefined;
+      if (panel.active) { this.activeUri = undefined; this.syncQuickReviewContext(); }
       const viewListener = panel.onDidChangeViewState(event => {
-        if (event.webviewPanel.active) this.activeUri = undefined;
+        if (event.webviewPanel.active) { this.activeUri = undefined; this.syncQuickReviewContext(); }
       });
       panel.onDidDispose(() => { this.unboundPanels.delete(panel); viewListener.dispose(); });
       return;
@@ -710,6 +898,47 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
     if ([...this.unboundPanels].some(panel => panel.active)) return undefined;
     return [...this.panels].find(([, panel]) => panel.active);
   }
+  private syncQuickReviewContext() {
+    const panel = this.activeUri ? this.panels.get(this.activeUri.toString()) : undefined;
+    void vscode.commands.executeCommand('setContext', 'revisionRequest.quickReviewActive', Boolean(panel && this.quickReview.get(panel)?.enabled));
+  }
+  private async deliverFirstChange(panel: vscode.WebviewPanel) {
+    if (!this.quickReview.get(panel)?.ready || !this.firstChangeRequested.has(panel)) return;
+    this.firstChangeRequested.delete(panel);
+    await panel.webview.postMessage({type: 'revealFirstChange'});
+  }
+  private async deliverQuickReview(panel: vscode.WebviewPanel) {
+    const mode = this.quickReview.get(panel);
+    if (!mode?.ready || mode.requested === undefined) return;
+    mode.sent = true;
+    await panel.webview.postMessage({type: 'toggleQuickReview', enabled: mode.requested});
+  }
+  /** Sidebar focus does not change the last selected request. New previews start only after ready. */
+  async toggleQuickReview(uri?: vscode.Uri): Promise<void> {
+    let target = uri;
+    if (!target && this.activeUri && this.panels.has(this.activeUri.toString())) target = this.activeUri;
+    if (!target) target = (await vscode.window.showOpenDialog({
+      title: 'Open a request for Quick Review', openLabel: 'Quick Review',
+      filters: {'Revision Request': ['rr']}, canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
+    }))?.[0];
+    if (!target) return;
+    if (target.scheme !== 'file' || !target.path.endsWith('.rr') || !vscode.workspace.getWorkspaceFolder(target)) {
+      throw new Error('Choose a local .rr request inside an open workspace.');
+    }
+    const existing = this.panels.get(target.toString());
+    // Sidebar focus can make the selected preview inactive without hiding it.
+    // Return focus without treating a mode toggle as a fresh request opening.
+    const selectedVisible = existing && (existing.active || (existing.visible && this.activeUri?.toString() === target.toString()));
+    if (selectedVisible) {
+      if (!existing.active) existing.reveal(existing.viewColumn, false);
+    } else await this.openPreview(target);
+    const panel = this.panels.get(target.toString());
+    if (!panel) return;
+    const mode = this.quickReview.get(panel)!;
+    mode.requested = existing ? !(mode.requested ?? mode.enabled) : true;
+    mode.sent = false;
+    await this.deliverQuickReview(panel);
+  }
   async toggleLayout(uri?: vscode.Uri): Promise<void> {
     const active = this.activeReviewPanel();
     if (!active || (uri && uri.scheme !== 'file' && uri.scheme !== 'webview-panel') ||
@@ -723,7 +952,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
     const target = uri?.scheme === 'webview-panel' ? (activePanel ? vscode.Uri.parse(activePanel[0]) : undefined) : uri ?? this.activeUri;
     if (!target) return;
     if (target.scheme !== 'file' || !target.path.endsWith('.rr')) throw new Error('Choose a local .rr request.');
-    this.sourceOnlyUri = target.toString();
+    this.suppressSource(target);
     await vscode.window.showTextDocument(target, {viewColumn: vscode.ViewColumn.Active, preserveFocus: false, preview: false});
   }
   async openDiff(uri: vscode.Uri, filePath?: string, revision?: string) {
@@ -742,24 +971,55 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
       this.snapshots.put('proposed/' + name, content.after),
       'Revision Request: ' + filePath, {preview: true});
   }
+  private previewMode(uri: vscode.Uri): 'always' | 'once' | 'manual' {
+    const config = vscode.workspace.getConfiguration('revisionRequest', uri);
+    const explicit = (key: string) => {
+      const value = config.inspect(key);
+      return value && [value.globalValue, value.workspaceValue, value.workspaceFolderValue,
+        value.globalLanguageValue, value.workspaceLanguageValue, value.workspaceFolderLanguageValue]
+        .some(item => item !== undefined);
+    };
+    // Keep an explicitly chosen legacy workflow until the new setting is chosen.
+    if (!explicit('previewMode') && explicit('previewOnOpen')) {
+      return config.get<boolean>('previewOnOpen', true) ? 'once' : 'manual';
+    }
+    const mode = config.get<string>('previewMode', 'always');
+    return mode === 'once' || mode === 'manual' ? mode : 'always';
+  }
+  private suppressSource(uri: vscode.Uri) {
+    this.sourceOnlyUri = uri.toString();
+    this.sourceOnlyDocument = vscode.workspace.textDocuments.find(document => document.uri.toString() === this.sourceOnlyUri);
+  }
   autoPreview(editor: vscode.TextEditor | undefined) {
+    clearTimeout(this.autoPreviewTimer);
+    this.activeSourceDocument = editor?.document;
+    // Undefined accompanies focus moving into a webview or transient editor
+    // changes. It must not revoke an explicit Open RR as JSON escape.
     if (!editor) return;
-    const uri = editor.document.uri;
-    if (!uri.path.endsWith('.rr')) { this.sourceOnlyUri = undefined; return; }
-    // Auto-preview only the first activation of this opened document. Closing a
-    // preview or returning to its JSON source must not open another preview.
-    if (this.seenSourceDocuments.has(editor.document)) return;
+    const document = editor.document, uri = document.uri;
+    if (this.sourceOnlyUri !== uri.toString() || (this.sourceOnlyDocument && this.sourceOnlyDocument !== document)) {
+      this.sourceOnlyUri = undefined;
+      this.sourceOnlyDocument = undefined;
+    }
+    if (uri.scheme !== 'file' || !uri.path.endsWith('.rr')) return;
     if (this.sourceOnlyUri === uri.toString()) {
-      this.seenSourceDocuments.add(editor.document);
+      this.sourceOnlyDocument = document;
+      this.seenSourceDocuments.add(document);
       return;
     }
-    if (!vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('previewOnOpen', true)) return;
-    this.seenSourceDocuments.add(editor.document);
-    void this.openPreview(uri).catch(error => {
-      // A failed opening did not consume this document's one automatic preview.
-      this.seenSourceDocuments.delete(editor.document);
-      void vscode.window.showErrorMessage(failure(error));
-    });
+    // VS Code may activate the source before notifying that its preview closed.
+    // Let that handoff finish before deciding whether to open another preview.
+    this.autoPreviewTimer = setTimeout(() => {
+      this.autoPreviewTimer = undefined;
+      if (this.activeSourceDocument !== document || this.sourceOnlyUri === uri.toString()) return;
+      const mode = this.previewMode(uri);
+      if (mode === 'manual' || (mode === 'once' && this.seenSourceDocuments.has(document))) return;
+      this.seenSourceDocuments.add(document);
+      void this.openPreview(uri).catch(error => {
+        this.seenSourceDocuments.delete(document);
+        void vscode.window.showErrorMessage(failure(error));
+      });
+    }, 0);
   }
   async openPreview(uri: vscode.Uri): Promise<void> {
     const key = uri.toString();
@@ -773,6 +1033,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
     if (uri.scheme !== 'file' || !uri.path.endsWith('.rr')) throw new Error('Choose a local .rr request.');
     this.activeUri = uri;
     this.sourceOnlyUri = undefined;
+    this.sourceOnlyDocument = undefined;
     const key = uri.toString();
     let panel = this.panels.get(key);
     try {
@@ -786,6 +1047,8 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
         this.connect(uri, panel);
       }
       panel.reveal(panel.viewColumn, false);
+      this.firstChangeRequested.add(panel);
+      await this.deliverFirstChange(panel);
     } catch (error) {
       if (panel && this.panels.get(key) === panel) this.panels.delete(key);
       panel?.dispose();
@@ -800,6 +1063,8 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
   }
   private connect(uri: vscode.Uri, panel: vscode.WebviewPanel) {
     this.rememberSourceDocument(uri);
+    this.quickReview.set(panel, {ready: false, enabled: false});
+    this.syncQuickReviewContext();
     let generation = 0;
     let disposed = false;
     let actionError: string | undefined;
@@ -848,22 +1113,60 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
           panel.dispose();
         }
       }),
-      panel.onDidChangeViewState(event => { if (event.webviewPanel.active) this.activeUri = uri; }),
+      panel.onDidChangeViewState(event => {
+        if (event.webviewPanel.active) { this.activeUri = uri; this.syncQuickReviewContext(); }
+      }),
       panel.webview.onDidReceiveMessage(async message => {
         if (!message || typeof message.type !== 'string') return;
+        if (message.type === 'quickReviewState') {
+          if (typeof message.enabled !== 'boolean' || Object.keys(message).some(key => !['type', 'enabled', 'initial'].includes(key)) ||
+              (message.initial !== undefined && (message.initial !== true || message.enabled !== false))) return;
+          const mode = this.quickReview.get(panel);
+          if (mode) {
+            mode.enabled = message.enabled;
+            if (message.initial === true) {
+              // A reloaded webview starts disarmed. A sidebar request may have
+              // reached its old context, so retain it for delivery after ready.
+              mode.ready = false; mode.sent = false;
+            } else if (mode.sent) { mode.requested = undefined; mode.sent = false; }
+            if (this.activeUri?.toString() === uri.toString()) this.syncQuickReviewContext();
+          }
+          return;
+        }
+        if (message.type === 'reviewActions' || message.type === 'transformDraft') {
+          const response = {type: message.type === 'transformDraft' ? 'transformResult' : 'reviewActionsResult', editId: message.editId};
+          try {
+            const allowed = ['type', 'filePath', 'hunkId', 'draft', 'revision', 'editId', ...(message.type === 'transformDraft' ? ['action'] : [])];
+            if (typeof message.editId !== 'string' || Object.keys(message).some(key => !allowed.includes(key))) throw new Error('Invalid proposal menu action.');
+            const result = message.type === 'transformDraft'
+              ? await this.service.transformDraft(uri, message.filePath, message.hunkId, message.draft, message.revision, message.action)
+              : {reviewActions: await this.service.reviewActions(uri, message.filePath, message.hunkId, message.draft, message.revision)};
+            if (!disposed) await panel.webview.postMessage({...response, ...result});
+          } catch (error) {
+            if (!disposed) await panel.webview.postMessage({...response, error: failure(error)});
+          }
+          return; // A local draft must not trigger a preview refresh or any file write.
+        }
         let editResult: Awaited<ReturnType<ReviewService['editPending']>> | undefined;
         let decisionResult: Awaited<ReturnType<ReviewService['decide']>>;
         let completionSucceeded = false;
+        let quickDecisionSucceeded = false;
         try {
           actionError = undefined;
           switch (message.type) {
-            case 'ready': this.readyCount++; break;
+            case 'ready':
+              this.readyCount++;
+              this.quickReview.get(panel)!.ready = true;
+              break;
             case 'decide':
             case 'decideFile':
               if (typeof message.filePath !== 'string' || typeof message.revision !== 'string' ||
                   (message.decision !== 'accepted' && message.decision !== 'ignored') ||
-                  (message.type === 'decide' && typeof message.hunkId !== 'string')) throw new Error('Invalid review action.');
+                  (message.type === 'decide' && typeof message.hunkId !== 'string') ||
+                  (message.quickDecisionId !== undefined && (message.type !== 'decide' || typeof message.quickDecisionId !== 'string' ||
+                    !message.quickDecisionId || message.quickDecisionId.length > 128))) throw new Error('Invalid review action.');
               decisionResult = await this.service.decide(uri, message.filePath, message.type === 'decide' ? message.hunkId : undefined, message.decision, message.revision);
+              quickDecisionSucceeded = true;
               break;
             case 'undo':
               if (typeof message.filePath !== 'string' || typeof message.revision !== 'string' ||
@@ -898,6 +1201,12 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               await this.service.resolveCompletion(uri, message.completionId, message.revision, message.deleteRequest, message.rememberChoice);
               completionSucceeded = true;
               break;
+            case 'setupReviewMacros': {
+              if (typeof message.filePath !== 'string') throw new Error('Choose a LaTeX file from this request.');
+              const prepared = await this.service.setupMacros(uri, message.filePath, this.context.extensionUri);
+              if (prepared && prepared.toString() !== uri.toString()) await this.openPreview(prepared);
+              break;
+            }
             case 'deleteRequest': await this.service.deleteRequest(uri); break;
             case 'openTarget': await this.service.openTarget(uri, message.filePath, {preserveFocus: false}); break;
             case 'openSource': await this.openSource(uri); break;
@@ -905,10 +1214,18 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
             default: return;
           }
         } catch (error) { actionError = failure(error); }
+        if (message.type === 'decide' && typeof message.quickDecisionId === 'string' && !disposed) {
+          await panel.webview.postMessage({type: 'quickDecisionResult', quickDecisionId: message.quickDecisionId,
+            filePath: message.filePath, hunkId: message.hunkId, decision: message.decision,
+            success: quickDecisionSucceeded, error: actionError});
+        }
         if (['editPending', 'editAndAccept', 'ignoreEdited'].includes(message.type) && !disposed) {
           await panel.webview.postMessage({type: 'editResult', editId: message.editId, filePath: message.filePath,
             hunkId: message.hunkId, success: editResult !== undefined, error: actionError, ...editResult});
           actionError = undefined; // The draft editor owns edit errors and keeps the draft.
+        }
+        if (message.type === 'setupReviewMacros' && !disposed) {
+          await panel.webview.postMessage({type: 'macroSetupResult', error: actionError});
         }
         if (message.type === 'resolveCompletion' && !disposed) {
           await panel.webview.postMessage({type: 'completionResult', completionId: message.completionId, revision: message.revision,
@@ -917,6 +1234,10 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
         }
         // Actions join their final refresh; readiness and errors need a new delivery.
         await update(message.type === 'ready' || actionError !== undefined);
+        if (message.type === 'ready' && !disposed) {
+          await this.deliverFirstChange(panel);
+          await this.deliverQuickReview(panel);
+        }
         if (decisionResult?.completionPrompt && !disposed) {
           await panel.webview.postMessage({type: 'completionPrompt', ...decisionResult.completionPrompt});
         }
@@ -927,9 +1248,16 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
       disposed = true;
       ++generation;
       if (this.panels.get(uri.toString()) === panel) {
+        // Closing a preview may expose its source tab. Keep that viewing session
+        // as JSON; a subsequent activation after switching away can open again.
+        const hasSource = vscode.workspace.textDocuments.some(document => document.uri.toString() === uri.toString());
+        if (hasSource && (panel.active || this.activeSourceDocument?.uri.toString() === uri.toString() ||
+            (!this.activeSourceDocument && this.activeUri?.toString() === uri.toString()))) this.suppressSource(uri);
         if (this.activeUri?.toString() === uri.toString()) this.activeUri = undefined;
         this.panels.delete(uri.toString());
       }
+      this.quickReview.delete(panel);
+      this.syncQuickReviewContext();
       disposables.forEach(item => item.dispose());
     });
     panel.webview.html = getReviewHtml(panel.webview, this.context.extensionUri, uri);
@@ -1029,6 +1357,11 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewPanelSerializer(VIEW, editor),
     vscode.window.onDidChangeActiveTextEditor(active => editor.autoPreview(active)),
     vscode.workspace.registerTextDocumentContentProvider('rr-snapshot', snapshots),
+    // A separate empty view keeps its welcome action visible even when requests exist.
+    vscode.window.createTreeView('revisionRequest.create', {treeDataProvider: {
+      getChildren: () => [],
+      getTreeItem: () => new vscode.TreeItem('Create Revision Request')
+    }}),
     vscode.window.createTreeView('revisionRequest.requests', {treeDataProvider: tree}),
     requests.onDidCreate(changed), requests.onDidDelete(changed), requests.onDidChange(changed),
     targets.onDidChange(changed), targets.onDidDelete(changed),
@@ -1075,12 +1408,35 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('revisionRequest.createRequest', async () => {
       try {
-        const uri = await createRequestFromFiles(context.extensionUri, action => service.runExclusive(action));
-        if (!uri) return;
+        const created = await createRequestFromFiles(context.extensionUri, action => service.runExclusive(action),
+          (uri, original) => service.rememberGitOriginal(uri, original));
+        if (!created) return;
         tree.refresh();
-        await editor.openPreview(uri);
+        if (created.fromGit) {
+          const choice = await vscode.window.showInformationMessage(
+            'Created ' + path.basename(created.uri.fsPath) + ' from a Git commit. Review it against a file matching that commit.',
+            'Open RR as JSON');
+          if (choice === 'Open RR as JSON') await editor.openSource(created.uri);
+        } else await editor.openPreview(created.uri);
       } catch (error) { void vscode.window.showErrorMessage(failure(error)); }
     }),
+    vscode.commands.registerCommand('revisionRequest.setupReviewMacros', async () => {
+      try {
+        const active = vscode.window.activeTextEditor?.document.uri;
+        const uri = active?.path.endsWith('.rr') ? active : editor.activeUri;
+        if (!uri) throw new Error('Open a LaTeX revision request before setting up its review macros.');
+        const state = await service.getState(uri);
+        const file = state.files[0];
+        if (!file) throw new Error(state.error || 'Open a valid LaTeX revision request.');
+        const prepared = await service.setupMacros(uri, file.path, context.extensionUri);
+        if (prepared) {tree.refresh(); await editor.openPreview(prepared);}
+      } catch (error) { void vscode.window.showErrorMessage(failure(error)); }
+    }),
+    ...['revisionRequest.toggleQuickReview', 'revisionRequest.enableQuickReview', 'revisionRequest.disableQuickReview'].map(command =>
+      vscode.commands.registerCommand(command, async () => {
+        try { await editor.toggleQuickReview(); }
+        catch (error) { void vscode.window.showErrorMessage(failure(error)); }
+      })),
     vscode.commands.registerCommand('revisionRequest.refresh', () => {tree.refresh(); service.changed(true);}),
     vscode.commands.registerCommand('revisionRequest.showRequests', () => vscode.commands.executeCommand('revisionRequest.requests.focus')),
     vscode.commands.registerCommand('revisionRequest.openRequest', async (uri?: vscode.Uri) => {

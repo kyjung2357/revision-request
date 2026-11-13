@@ -6,6 +6,8 @@
   const root = document.getElementById('app');
   const restored = vscode.getState() || {};
   let openWhy = typeof restored.openWhy === 'string' ? restored.openWhy : null;
+  let openMenu = null;
+  let menuSequence = 0;
   const dismissedErrors = new Set(Array.isArray(restored.dismissedErrors) ? restored.dismissedErrors.filter(message => typeof message === 'string') : []);
   const savedEdit = restored.editing;
   let editing = savedEdit && typeof savedEdit.filePath === 'string' && typeof savedEdit.hunkId === 'string'
@@ -23,11 +25,138 @@
   let awaitingDecision = false;
   let decisionFocus = null;
   let viewport = restored.viewport && Number.isFinite(restored.viewport.top) ? restored.viewport : {top: 0};
+  // Opening a request always starts at its first pending change, not a saved scroll position.
+  let firstChangeNavigationPending = true;
+  let openingDecision = null;
+  let openingChange = null;
   let viewRows = [];
   let overview = null;
   let scrollFrame = 0;
   let fontMetricKey = null;
   let contextRowCache = {path: null, before: null, rows: new Map()};
+
+
+  // Session-local: reloading a preview never arms approval keys.
+  let quickReview=false, quickSelection=null, quickPending=null, quickSequence=0;
+  let pendingQuickMode=null, quickFocusRequested=false, quickScrollRequested=false, quickRendering=false;
+  function quickCandidates() {
+    return (state?.files || []).flatMap(file=>file.hunks.filter(hunk=>decisionOf(hunk)==='pending')
+      .map(hunk=>({filePath:file.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart})));
+  }
+  function matchesQuickDecision(message, pending) {
+    return Boolean(pending && message.quickDecisionId === pending.id && message.hunkId === pending.hunkId &&
+      message.filePath === pending.filePath && message.decision === pending.decision);
+  }
+  function quickAllowed() {
+    return Boolean(state?.trusted && !state.closed && quickCandidates().length && !state.files.some(file=>file.issue));
+  }
+  function quickPaused() {return Boolean(editing || openMenu || openWhy || completion || splitDrag);}
+  function quickControl(selection=quickSelection) {
+    return selection?root.querySelector('button[data-hunk="'+CSS.escape(selection.hunkId)+'"][data-quick-decision="'+selection.decision+'"]'):null;
+  }
+  function chooseVisibleQuickCandidate() {
+    const candidates=quickCandidates(), scroll=root.querySelector('[data-scroll-area]');
+    if (!scroll) return candidates[0];
+    const visible=scroll.getBoundingClientRect();
+    let nearest=null,distance=Infinity;
+    const blocks=new Map(Array.from(root.querySelectorAll('[data-overview-hunk]'),node=>[node.dataset.overviewHunk,node]));
+    for (const item of candidates) {
+      const block=blocks.get(item.hunkId);
+      if (!block) continue;
+      const rect=block.getBoundingClientRect();
+      if (rect.bottom>visible.top && rect.top<visible.bottom) return item;
+      const gap=rect.top>=visible.bottom?rect.top-visible.bottom:visible.top-rect.bottom;
+      if (gap<distance) {nearest=item;distance=gap;}
+    }
+    return nearest || candidates[0];
+  }
+  function setQuickReview(enabled) {
+    if (!state) {pendingQuickMode=Boolean(enabled);return;}
+    quickReview=Boolean(enabled && quickAllowed() && !editing && !completion && !state.busy && !awaitingDecision);
+    post({type:'quickReviewState',enabled:quickReview});
+    if (quickReview) {
+      closeActionMenu();closeExplanation();
+      const item=chooseVisibleQuickCandidate();
+      quickSelection=item?{...item,decision:'accepted'}:null;
+      quickFocusRequested=true;
+      const scroll=root.querySelector('[data-scroll-area]');
+      quickScrollRequested=!(openingChange?.hunkId===item?.hunkId && scroll && Math.abs(scroll.scrollTop-openingChange.top)<1);
+      openingChange=null;
+    } else {quickSelection=null;quickPending=null;quickFocusRequested=false;quickScrollRequested=false;}
+    render();
+  }
+  function updateQuickPresentation() {
+    root.querySelector('.review-app')?.classList.toggle('quick-review-active',quickReview);
+    root.querySelector('.review-app')?.classList.toggle('quick-review-suspended',quickPaused());
+    const selected=quickReview && !quickPaused()?quickControl():null;
+    for (const node of root.querySelectorAll('.quick-review-selected')) {
+      if (node!==selected) {node.classList.remove('quick-review-selected');node.removeAttribute('aria-current');}
+    }
+    if (selected) {selected.classList.add('quick-review-selected');selected.setAttribute('aria-current','true');}
+    for (const control of root.querySelectorAll('.quick-review-toggle')) {
+      control.setAttribute('aria-pressed',String(quickReview));control.classList.toggle('is-active',quickReview);
+      control.setAttribute('aria-label',quickReview?'Disable Quick Review':'Enable Quick Review');
+      control.title=quickReview?'Disable Quick Review (Escape)':'Enable Quick Review: Left/Right switches Accept and Ignore; Tab confirms';
+    }
+  }
+  function focusQuickSelection(scrollIntoView=false) {
+    updateQuickPresentation();
+    if (!quickReview || quickPaused() || state?.busy || awaitingDecision) return;
+    const control=quickControl();if (!control || control.disabled) return;
+    if (scrollIntoView) {
+      const scroll=root.querySelector('[data-scroll-area]');
+      if (scroll) {
+        const view=scroll.getBoundingClientRect(),controlRect=control.getBoundingClientRect();
+        const block=control.closest('[data-overview-hunk]'),blockRect=block?.getBoundingClientRect();
+        if (blockRect && blockRect.height<=view.height-16) {
+          if (blockRect.top<view.top+8) scroll.scrollTop+=blockRect.top-view.top-8;
+          else if (blockRect.bottom>view.bottom-8) scroll.scrollTop+=blockRect.bottom-view.bottom+8;
+        } else if (blockRect && blockRect.height>view.height-16) {
+          // A large unified hunk cannot show both versions at once; begin at its proposed action row.
+          scroll.scrollTop+=controlRect.top-view.top-8;
+        } else {
+          if (controlRect.top<view.top+8) scroll.scrollTop+=controlRect.top-view.top-8;
+          else if (controlRect.bottom>view.bottom-8) scroll.scrollTop+=controlRect.bottom-view.bottom+8;
+        }
+        onComparisonScroll();
+      }
+    }
+    control.focus({preventScroll:true});quickFocusRequested=false;quickScrollRequested=false;
+  }
+  function reconcileQuickReview() {
+    if (!quickReview) return;
+    if (!quickAllowed()) {
+      quickReview=false;quickSelection=null;quickPending=null;quickFocusRequested=false;quickScrollRequested=false;
+      post({type:'quickReviewState',enabled:false});return;
+    }
+    const candidates=quickCandidates();
+    if (quickPending) {
+      if (quickPending.success!==true) return;
+      const resolved=(state.files || []).flatMap(file=>file.hunks).find(hunk=>hunk.id===quickPending.hunkId);
+      if (resolved && decisionOf(resolved)==='pending') return;
+      if (!resolved && state.revision===quickPending.revision) return;
+      const order=quickPending.order,at=order.indexOf(quickPending.hunkId),byId=new Map(candidates.map(item=>[item.hunkId,item]));
+      const next=order.slice(at+1).concat(order.slice(0,at)).map(id=>byId.get(id)).find(Boolean) ||
+        candidates.find(item=>item.index>=quickPending.index) || candidates[0];
+      quickSelection=next?{...next,decision:'accepted'}:null;quickPending=null;
+      quickFocusRequested=true;quickScrollRequested=true;return;
+    }
+    if (!candidates.some(item=>item.hunkId===quickSelection?.hunkId && item.filePath===quickSelection?.filePath)) {
+      const next=candidates.find(item=>item.index>=(quickSelection?.index ?? 0)) || candidates[0];
+      quickSelection=next?{...next,decision:'accepted'}:null;
+      // External edits may reconcile selection, but never execute or force scrolling.
+    }
+  }
+  function quickReviewButton(disabled) {
+    const control=button('','button button-secondary quick-review-toggle',()=>setQuickReview(!quickReview),
+      {disabled,key:'quick-review',label:quickReview?'Disable Quick Review':'Enable Quick Review'});
+    const icon=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    icon.setAttribute('viewBox','0 0 16 16');icon.setAttribute('aria-hidden','true');icon.classList.add('quick-review-icon');
+    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d','M9.5 1.5 3.5 9h4l-1 5.5 6-7.5h-4l1-5.5Z');
+    icon.append(path);control.append(icon,element('span','','Quick Review'));
+    control.setAttribute('aria-pressed',String(quickReview));return control;
+  }
 
   function saveViewState() { vscode.setState({ requestUri: root.dataset.requestUri || restored.requestUri, openWhy, splitRatio, ...(layout ? {layout} : {}), viewport, dismissedErrors: [...dismissedErrors], editing: editing ? { ...editing, saving: false, editId: null } : null }); }
   function element(tag, className, text) {
@@ -49,11 +178,20 @@
   }
   function post(message) { vscode.postMessage(message); }
   function decide(message) {
-    if (!state || state.busy || awaitingDecision || editing) return;
+    if (!state || state.busy || awaitingDecision || quickPending || editing) return;
     message.revision = state.revision;
+    if (quickReview && message.type==='decide') {
+      const item=quickCandidates().find(candidate=>candidate.hunkId===message.hunkId && candidate.filePath===message.filePath);
+      if (!item) return;
+      quickSelection={...item,decision:message.decision};
+      quickPending={...item,decision:message.decision,revision:state.revision,success:null,
+        order:quickCandidates().map(candidate=>candidate.hunkId),id:'quick-'+Date.now()+'-'+(++quickSequence)};
+      message.quickDecisionId=quickPending.id;updateQuickPresentation();
+    }
     awaitingDecision = true;
     dismissedErrors.clear();
     if (message.type === 'decideFile' || message.hunkId === openWhy) openWhy = null;
+    closeActionMenu();
     saveViewState();
     lockReviewControls();
     post(message);
@@ -136,21 +274,28 @@
             title: decision === 'accepted' && file.issue ? file.issue : 'Restore this change to pending review' }));
       return actions;
     }
-    const hasExplanation = typeof hunk.explanation === 'string' && hunk.explanation.trim().length > 0;
-    const why = button('Why', 'button button-ghost button-inline why-toggle', event => {
-      event.stopPropagation();
-      openWhy = openWhy === hunk.id ? null : hunk.id;
-      saveViewState();
-      render();
-      if (openWhy) root.querySelector('.why-popover')?.focus({ preventScroll: true });
-    }, { disabled: !hasExplanation || (editor ? editing.saving : Boolean(editing)), key: key + ':why', hunk: hunk.id,
-      label: 'Why change ' + (hunk.index + 1),
-      title: hasExplanation ? 'Show the explanation for this change' : 'No explanation provided' });
-    if (!hasExplanation) { why.classList.add('why-unavailable'); why.setAttribute('aria-hidden', 'true'); }
-    why.dataset.whyId = hunk.id;
-    why.setAttribute('aria-expanded', String(hasExplanation && openWhy === hunk.id));
-    why.setAttribute('aria-controls', 'rr-explanation');
-    actions.append(why);
+    if (!editor) {
+      for (const [index, decision] of ['accepted','ignored'].entries()) {
+        const control=actions.children[index];control.dataset.quickDecision=decision;
+        control.addEventListener('focus',()=>{
+          if (!quickReview || quickPending || quickPaused() || quickRendering) return;
+          quickSelection={filePath:file.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart,decision};
+          updateQuickPresentation();
+        });
+      }
+    }
+    const more = button('⋯', 'button button-ghost button-inline why-toggle review-menu-toggle', event => {
+      event.stopPropagation(); toggleActionMenu(file, hunk);
+    }, { disabled: busy || (editor ? editing.saving : Boolean(editing)), key: key + ':why', hunk: hunk.id,
+      label: 'More actions for change ' + (hunk.index + 1), title: 'More actions' });
+    more.dataset.whyId = hunk.id;
+    more.setAttribute('aria-haspopup', 'menu');
+    more.setAttribute('aria-expanded', String(openMenu?.hunkId === hunk.id));
+    more.setAttribute('aria-controls', 'rr-actions');
+    more.addEventListener('keydown', event => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); if (!openMenu) toggleActionMenu(file, hunk); focusMenuItem(event.key === 'ArrowUp'); }
+    });
+    actions.append(more);
     return actions;
   }
   function editorAnchor(edit) {
@@ -174,10 +319,11 @@
   }
   function openEditor(file, hunk, rowIndex, columnOffset = 0, directInput = null) {
     if (editing) { root.querySelector('.pending-editor textarea')?.focus({ preventScroll: true }); return; }
-    if (!state || state.busy || awaitingDecision || !state.trusted || decisionOf(hunk) !== 'pending') return;
+    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted || decisionOf(hunk) !== 'pending') return;
+    if (quickReview && quickSelection?.hunkId!==hunk.id) quickSelection={filePath:file.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart,decision:'accepted'};
     const draft = hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g, '\n').replace(/\n$/, '');
     const offset = draft.split('\n').slice(0, rowIndex).reduce((sum, line) => sum + line.length + 1, 0) + columnOffset;
-    openWhy = null;
+    openWhy = null; closeActionMenu();
     editHistory = { undo: [], redo: [] };
     editing = { filePath: file.path, hunkId: hunk.id, revision: state.revision, draft,
       hadProposedLine: hunk.newLines > 0, rightStart: Number(directInput?.closest('.code-side').dataset.proposedLine) || hunk.oldStart,
@@ -200,7 +346,7 @@
       for (const input of root.querySelectorAll('.direct-editor-input')) {
         if (input !== directInput) input.readOnly = true;
       }
-      captureEditor(); saveViewState(); sizeEditor();
+      captureEditor(); saveViewState(); sizeEditor(); updateQuickPresentation();
       return;
     }
     saveViewState(); render();
@@ -211,7 +357,8 @@
     const previous = editing; editing = null;
     editHistory = { undo: [], redo: [] };
     saveViewState(); render();
-    (editorAnchor(previous) || root.querySelector('.filename-link'))?.focus({ preventScroll: true });
+    if (quickReview) focusQuickSelection();
+    else (editorAnchor(previous) || root.querySelector('.filename-link'))?.focus({ preventScroll: true });
   }
   function editorAcceptSetting() {
     const value = state?.acceptShortcut;
@@ -237,7 +384,7 @@
     if (staleEditor() || (type === 'editAndAccept' && state.files.find(file => file.path === editing.filePath)?.issue)) { render(); return; }
     editing.saving = true; editing.error = null;
     editing.editId = 'edit-' + Date.now() + '-' + (++editSequence);
-    dismissedErrors.clear(); openWhy = null; saveViewState();
+    dismissedErrors.clear(); openWhy = null; closeActionMenu(); saveViewState();
     const message = {type, filePath:editing.filePath, hunkId:editing.hunkId,
       ...(type === 'editAndAccept' ? {draft:editing.draft} : {}), revision:editing.revision, editId:editing.editId};
     render(); post(message);
@@ -822,6 +969,100 @@
     }
     return documentView;
   }
+
+  const fallbackActions = [
+    {id:'comment',label:'Comment out changed lines'},
+    {id:'markRemoved',label:'Mark removed text in red'},
+    {id:'markAdded',label:'Mark added text in blue'}
+  ];
+  function actionMenuAnchor() { return openMenu ? whyAnchor(openMenu.hunkId) : null; }
+  function closeActionMenu(focusAnchor = false) {
+    const anchor = actionMenuAnchor(); openMenu = null;
+    root.querySelector('.review-action-menu')?.remove();
+    if (anchor) { anchor.setAttribute('aria-expanded','false'); if (focusAnchor) anchor.focus({preventScroll:true}); }
+    updateQuickPresentation();
+    if (focusAnchor && quickReview && !editing && !openWhy) focusQuickSelection();
+  }
+  function focusMenuItem(last = false) {
+    const items = Array.from(root.querySelectorAll('.review-action-menu [role="menuitem"]:not(:disabled)'));
+    (last ? items.at(-1) : items[0])?.focus({preventScroll:true});
+  }
+  function toggleActionMenu(file, hunk) {
+    if (openMenu?.hunkId === hunk.id) { closeActionMenu(true); return; }
+    captureEditor(); closeExplanation(); closeActionMenu();
+    const requestId = 'menu-' + Date.now() + '-' + (++menuSequence);
+    const draft = editing?.draft ?? hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g,'\n').replace(/\n$/,'');
+    openMenu = {filePath:file.path,hunkId:hunk.id,revision:state.revision,requestId,loading:true,actions:hunk.reviewActions};
+    render(); focusMenuItem();
+    post({type:'reviewActions',filePath:file.path,hunkId:hunk.id,revision:state.revision,draft,editId:requestId});
+  }
+  function transformDraft(file, hunk, action) {
+    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted) return;
+    closeActionMenu(); closeExplanation();
+    if (!editing) openEditor(file,hunk,0);
+    if (!editing || editing.saving || staleEditor()) return;
+    captureEditor();
+    const area = root.querySelector('.pending-editor textarea');
+    editing.transformSnapshot = area ? editorSnapshot(area) : {value:editing.draft,selections:[{start:0,end:0,direction:'none'}]};
+    editing.saving = true; editing.error = null;
+    editing.editId = 'transform-' + Date.now() + '-' + (++editSequence);
+    const message = {type:'transformDraft',filePath:editing.filePath,hunkId:editing.hunkId,
+      revision:editing.revision,draft:editing.draft,action,editId:editing.editId};
+    saveViewState(); render(); post(message);
+  }
+  function renderActionMenu(app, file) {
+    if (!openMenu || !file) return;
+    const hunk = file.hunks.find(item => item.id === openMenu.hunkId);
+    if (!hunk || decisionOf(hunk) !== 'pending' || openMenu.revision !== state.revision || !actionMenuAnchor()) { closeActionMenu(); return; }
+    const menu = element('section','review-action-menu');
+    menu.id = 'rr-actions'; menu.setAttribute('role','menu'); menu.setAttribute('aria-label','Change actions');
+    const hasReason = typeof hunk.explanation === 'string' && Boolean(hunk.explanation.trim());
+    const why = button('Why','review-menu-item review-action-why',() => {
+      const id = hunk.id; closeActionMenu(); openWhy = id; saveViewState(); render();
+      root.querySelector('.why-popover')?.focus({preventScroll:true});
+    },{disabled:!hasReason,label:'Why',key:'menu:why',title:hasReason?'Show the explanation for this change':'No explanation provided'});
+    why.setAttribute('role','menuitem'); menu.append(why);
+    for (const fallback of fallbackActions) {
+      const item = openMenu.actions?.find(action => action.id === fallback.id) || {...fallback,enabled:false,reason:'This action is unavailable for this change.'};
+      const reason = openMenu.loading ? 'Checking this draft…' : !state.trusted ? 'Trust this workspace to edit proposals.' : openMenu.error || item.reason;
+      const enabled = !openMenu.loading && !openMenu.error && item.enabled === true && state.trusted && !state.busy && !awaitingDecision;
+      const control = button('', 'review-menu-item',()=>transformDraft(file,hunk,item.id),
+        {disabled:!enabled,label:item.label || fallback.label,key:'menu:'+item.id,title:reason});
+      control.dataset.reviewAction = item.id; control.setAttribute('role','menuitem');
+      control.append(element('span','review-menu-label',item.label || fallback.label));
+      if (!enabled && reason) control.append(element('span','review-menu-reason',reason));
+      menu.append(control);
+    }
+    if (/\.(tex|ltx)$/i.test(file.path)) {
+      const setup = button('Set up LaTeX review macros…','review-menu-item review-menu-setup',()=>{
+        closeActionMenu(true); post({type:'setupReviewMacros',filePath:file.path});
+      },{disabled:Boolean(editing) || !state.trusted || state.busy || awaitingDecision,label:'Set up LaTeX review macros',key:'menu:setup',
+        title:editing?'Finish or discard the draft before setting up macros':'Prepare review macros for this project'});
+      setup.setAttribute('role','menuitem'); menu.append(setup);
+    }
+    menu.addEventListener('keydown',event=>{
+      const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
+      if (event.key === 'Escape') {event.preventDefault();event.stopPropagation();closeActionMenu(true);return;}
+      if (event.key === 'Tab') {event.stopPropagation();closeActionMenu();return;}
+      if (!['ArrowDown','ArrowUp','Home','End'].includes(event.key)) return;
+      event.preventDefault(); const index = items.indexOf(document.activeElement);
+      const next = event.key==='Home'?0:event.key==='End'?items.length-1:(index+(event.key==='ArrowDown'?1:-1)+items.length)%items.length;
+      items[next]?.focus({preventScroll:true});
+    });
+    app.append(menu);
+  }
+  function positionActionMenu() {
+    const anchor = actionMenuAnchor(), menu = root.querySelector('.review-action-menu'), scroll = root.querySelector('[data-scroll-area]');
+    if (!anchor || !menu || !scroll) return;
+    const rect = anchor.getBoundingClientRect(), visible = scroll.getBoundingClientRect();
+    if (rect.bottom <= visible.top || rect.top >= visible.bottom) {closeActionMenu();return;}
+    const width = Math.min(320,window.innerWidth-16);
+    menu.style.width = width+'px'; menu.style.maxHeight = Math.max(60,window.innerHeight-16)+'px';
+    menu.style.left = Math.max(8,Math.min(window.innerWidth-width-8,rect.right-width))+'px';
+    const height = menu.offsetHeight, below = window.innerHeight-rect.bottom-8;
+    menu.style.top = Math.max(8,Math.min(window.innerHeight-height-8,below>=height || rect.top<height+8?rect.bottom+5:rect.top-height-5))+'px';
+  }
+
   function whyAnchor(id) {
     return Array.from(root.querySelectorAll('[data-why-id]')).find(node => node.dataset.whyId === id);
   }
@@ -836,6 +1077,8 @@
       anchor.setAttribute('aria-expanded', 'false');
       if (focusAnchor) anchor.focus({ preventScroll: true });
     }
+    updateQuickPresentation();
+    if (focusAnchor && quickReview && !editing && !openMenu) focusQuickSelection();
   }
   function renderExplanation(app, file) {
     if (!openWhy || !file) return;
@@ -933,7 +1176,7 @@
       decisionFocus = {key: active.dataset.focusKey, hunk: active.dataset.hunk};
     }
     root.querySelector('.review-app')?.setAttribute('aria-busy', 'true');
-    for (const control of root.querySelectorAll('.inline-actions button,.file-actions button')) control.disabled = true;
+    for (const control of root.querySelectorAll('.inline-actions button,.file-actions button,.quick-review-toggle')) control.disabled = true;
     for (const input of root.querySelectorAll('.pending-editor-textarea')) input.readOnly = true;
     closeExplanation();
   }
@@ -961,8 +1204,41 @@
       : viewport.top;
     updateOverviewThumb();
   }
+  function revealFirstChange() {
+    if (!firstChangeNavigationPending || !state || state.busy || awaitingDecision || quickPending || openingDecision ||
+        editing?.saving || completion) return;
+    const scroll = root.querySelector('[data-scroll-area]');
+    if (!scroll) return;
+    const block = scroll.querySelector('.hunk-pending');
+    // In unified view the first removed row can be far above the Accept button.
+    const row = block?.querySelector('.diff-row') || block;
+    scroll.scrollTop = row
+      ? scroll.scrollTop + row.getBoundingClientRect().top - scroll.getBoundingClientRect().top - 8
+      : 0;
+    const focused = document.activeElement;
+    const focusedBlock = focused?.closest?.('.hunk');
+    if (focusedBlock && scroll.contains(focused)) {
+      const focusedRect = focused.getBoundingClientRect(), visible = scroll.getBoundingClientRect();
+      if (focusedBlock !== block || focusedRect.bottom <= visible.top || focusedRect.top >= visible.bottom) {
+        // Keep unsaved drafts, but never leave an old, hidden approval target armed.
+        scroll.tabIndex = -1;
+        scroll.focus({preventScroll: true});
+        decisionFocus = null;
+      }
+    }
+    firstChangeNavigationPending = false;
+    openingChange = block ? {hunkId: block.dataset.overviewHunk, top: scroll.scrollTop} : null;
+    if (quickReview) {
+      const item = quickCandidates().find(candidate => candidate.hunkId === block?.dataset.overviewHunk);
+      quickSelection = item ? {...item, decision: 'accepted'} : null;
+      quickFocusRequested = Boolean(item);
+      quickScrollRequested = false;
+    }
+    captureViewport();
+    updateOverviewThumb();
+  }
   function onComparisonScroll() {
-    updateOverviewThumb(); positionExplanation();
+    updateOverviewThumb(); positionExplanation(); positionActionMenu();
     if (!scrollFrame) scrollFrame = requestAnimationFrame(() => {
       scrollFrame = 0; captureViewport(); saveViewState();
     });
@@ -1111,7 +1387,7 @@
       const gutter = parseFloat(css.getPropertyValue('--rr-gutter')) || 66;
       const actions = parseFloat(css.getPropertyValue('--rr-action-gutter')) || 152;
       root.style.setProperty('--rr-code-width', Math.max(0, comparison.clientWidth - 15 - gutter - actions) + 'px');
-      sizeEditor(); positionExplanation(); refreshOverview();
+      sizeEditor(); positionExplanation(); positionActionMenu(); refreshOverview();
       return;
     }
     const metrics = splitMetrics();
@@ -1133,7 +1409,7 @@
       separator.setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
       separator.setAttribute('aria-valuetext', 'Original ' + Math.round(ratio * 100) + '%, Revision ' + Math.round((1 - ratio) * 100) + '%');
     }
-    sizeEditor(); positionExplanation(); refreshOverview();
+    sizeEditor(); positionExplanation(); positionActionMenu(); refreshOverview();
   }
   function setSplitRatio(value, persist = true) {
     const metrics = splitMetrics();
@@ -1232,6 +1508,7 @@
   }
   function render() {
     if (!state) return;
+    quickRendering=true;
     endSplitDrag(false, false);
     captureEditor();
     captureViewport();
@@ -1243,7 +1520,8 @@
     const file = files[0];
     const closed = state.closed === true;
     const totals = counts(file ? file.hunks : []);
-    const busy = Boolean(state.busy || awaitingDecision || editing || completion);
+    reconcileQuickReview();
+    const busy = Boolean(state.busy || awaitingDecision || quickPending || editing || completion);
     const rawOpacity = typeof state.unchangedOpacity === 'number' && Number.isFinite(state.unchangedOpacity) ? state.unchangedOpacity : 20;
     root.style.setProperty('--rr-context-opacity', String(Math.min(100, Math.max(0, rawOpacity)) / 100));
     const app = root.querySelector('.review-app') || element('div', 'review-app');
@@ -1279,7 +1557,9 @@
             () => decide({ type: 'decideFile', filePath: file.path, decision: 'ignored' }),
             { disabled: busy || !state.trusted || !totals.pending, key: file.path + ':ignoreFile' })
         );
-        summaryRow.append(actions);
+        const stack=element('div','file-action-stack');
+        stack.append(quickReviewButton(busy || !quickAllowed()),actions);
+        summaryRow.append(stack);
       }
       proposed.append(summaryRow);
       header.append(original, proposed);
@@ -1333,7 +1613,7 @@
     }
     if (root.firstElementChild !== app) root.replaceChildren(app);
     viewRows = Array.from(root.querySelectorAll('[data-row-key]'));
-    renderExplanation(app, file); renderCompletion(app);
+    renderExplanation(app, file); renderActionMenu(app, file); renderCompletion(app);
     updateLayout(); restoreViewport();
     let replacement = activeKey
       ? Array.from(root.querySelectorAll('[data-focus-key]')).find(node => node.dataset.focusKey === activeKey && !node.disabled)
@@ -1352,13 +1632,41 @@
       const pending = focusFile?.hunks.filter(hunk => decisionOf(hunk) === 'pending') || [];
       const hunk = pending.find(item => item.oldStart === focusAfterEdit.oldStart) || pending.find(item => item.index === focusAfterEdit.index) || pending[0];
       const source = hunk ? editorAnchor({hunkId: hunk.id, anchorIndex: 0}) : null;
-      (source || root.querySelector('.filename-link'))?.focus({preventScroll: true}); focusAfterEdit = null;
+      if (quickReview && hunk) {
+        quickSelection={filePath:focusFile.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart,decision:'accepted'};
+        quickFocusRequested=true;quickScrollRequested=true;
+      } else (source || root.querySelector('.filename-link'))?.focus({preventScroll:true});
+      focusAfterEdit = null;
     }
+    revealFirstChange();
+    quickRendering=false;
+    updateQuickPresentation();
+    if (quickFocusRequested) focusQuickSelection(quickScrollRequested);
     saveViewState();
   }
   window.addEventListener('message', event => {
     const message = event.data;
     if (!message) return;
+    if (message.type === 'revealFirstChange') {
+      firstChangeNavigationPending = true;
+      if (quickPending && quickPending.success !== true) openingDecision = quickPending;
+      if (state) render();
+      return;
+    }
+    if (message.type === 'toggleQuickReview') {
+      setQuickReview(typeof message.enabled==='boolean'?message.enabled:!quickReview);return;
+    }
+    if (message.type === 'quickDecisionResult') {
+      const openingResult = matchesQuickDecision(message, openingDecision);
+      if (openingResult) openingDecision = null;
+      if (!matchesQuickDecision(message, quickPending)) {
+        if (openingResult) render();
+        return;
+      }
+      if (message.success===true) quickPending.success=true;
+      else {quickPending=null;quickFocusRequested=true;quickScrollRequested=false;}
+      render();return;
+    }
     if (message.type === 'toggleLayout') {
       if (!layout) { pendingLayoutToggle = !pendingLayoutToggle; return; }
       captureEditor(); captureViewport();
@@ -1367,7 +1675,7 @@
       return;
     }
     if (message.type === 'busy') {
-      if (state && message.busy === true) { state.busy = true; lockReviewControls(); }
+      if (state && message.busy === true) { state.busy = true; closeActionMenu(); lockReviewControls(); }
       return;
     }
     if (message.type === 'completionPrompt') {
@@ -1376,7 +1684,7 @@
       completion = {completionId: message.completionId, revision: message.revision,
         requestName: typeof message.requestName === 'string' ? message.requestName : 'Revision request',
         resolving: false, rememberChoice: false, error: null};
-      openWhy = null; saveViewState(); render();
+      openWhy = null; closeActionMenu(); saveViewState(); render();
       root.querySelector('[data-focus-key="completion:no"]')?.focus({preventScroll: true});
       return;
     }
@@ -1388,6 +1696,28 @@
       (root.querySelector('[data-focus-key="completion:no"]') || root.querySelector('.filename-link') || root.querySelector('[data-focus-key="empty:source"]'))?.focus({preventScroll: true});
       return;
     }
+    if (message.type === 'reviewActionsResult') {
+      if (!openMenu || message.editId !== openMenu.requestId) return;
+      openMenu.loading = false; openMenu.actions = Array.isArray(message.reviewActions) ? message.reviewActions : [];
+      openMenu.error = typeof message.error === 'string' ? message.error : null;
+      render(); focusMenuItem(); return;
+    }
+    if (message.type === 'transformResult') {
+      if (!editing || !editing.saving || message.editId !== editing.editId) return;
+      captureEditor();
+      if (typeof message.draft === 'string' && !message.error) {
+        const previous = editing.transformSnapshot;
+        if (previous && previous.value !== message.draft) recordEditorUndo(previous);
+        editing.draft = message.draft; editing.secondarySelections = [];
+        editing.selectionStart = editing.selectionEnd = Math.min(editing.selectionStart || 0,message.draft.length);
+        editing.error = null;
+        const area = root.querySelector('.pending-editor textarea');
+        if (area) {area.value=editing.draft;area.setSelectionRange(editing.selectionStart,editing.selectionEnd);}
+      } else editing.error = typeof message.error === 'string' ? message.error : 'The action could not be applied. Your draft is kept.';
+      editing.saving = false; editing.editId = null; delete editing.transformSnapshot;
+      saveViewState(); render(); root.querySelector('.pending-editor textarea')?.focus({preventScroll:true}); return;
+    }
+
     if (message.type === 'editResult') {
       if (!editing || !editing.saving || message.editId !== editing.editId || message.filePath !== editing.filePath || message.hunkId !== editing.hunkId) return;
       captureEditor();
@@ -1413,24 +1743,42 @@
     saveViewState();
     awaitingDecision = false;
     render();
+    if (pendingQuickMode!==null) {const enabled=pendingQuickMode;pendingQuickMode=null;setQuickReview(enabled);}
   });
   window.addEventListener('pointerdown', event => {
+    if (openMenu && !event.target?.closest?.('.review-action-menu,.review-menu-toggle')) closeActionMenu();
     if (!openWhy) return;
     const target = event.target;
     if (target && typeof target.closest === 'function' && target.closest('.why-popover, .why-toggle')) return;
     closeExplanation();
   });
   window.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && openMenu) { event.preventDefault(); event.stopPropagation(); closeActionMenu(true); return; }
     if (event.key === 'Escape' && splitDrag) { event.preventDefault(); endSplitDrag(true); return; }
     if (event.key === 'Escape' && completion) { event.preventDefault(); resolveCompletion(false, false); return; }
     if (event.key === 'Escape' && openWhy) {
       event.preventDefault();
       closeExplanation(true);
+      return;
     }
+    if (!quickReview || event.defaultPrevented || event.isComposing || event.keyCode===229 || quickPaused()) return;
+    if (event.target?.closest?.('textarea,input,select,[contenteditable="true"],.pane-splitter,.change-scrollbar')) return;
+    if (event.key==='Escape') {event.preventDefault();setQuickReview(false);return;}
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || !['ArrowLeft','ArrowRight','Tab'].includes(event.key)) return;
+    event.preventDefault();
+    if (event.repeat || state?.busy || awaitingDecision || quickPending) return;
+    reconcileQuickReview();if (!quickReview || !quickSelection) return;
+    if (event.key==='ArrowLeft' || event.key==='ArrowRight') {
+      quickSelection.decision=quickSelection.decision==='accepted'?'ignored':'accepted';
+      focusQuickSelection();return;
+    }
+    const control=quickControl();
+    if (control && !control.disabled) decide({type:'decide',filePath:quickSelection.filePath,hunkId:quickSelection.hunkId,decision:quickSelection.decision});
   });
   window.addEventListener('blur', () => endSplitDrag(true, false));
   window.addEventListener('pagehide', () => { endSplitDrag(false, false); captureEditor(); captureViewport(); saveViewState(); });
   if (typeof ResizeObserver === 'function') new ResizeObserver(updateLayout).observe(root);
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { fontMetricKey = null; updateLayout(); });
+  post({type:'quickReviewState',enabled:false,initial:true});
   post({ type: 'ready' });
 })();

@@ -626,3 +626,154 @@ test('preview preserves string and comment context that begins outside a pending
     assert.equal(await read(item.target),item.before);
   }
 });
+
+test('Git creation baselines block duplicate additions and survive restart, CRLF review and Undo', async () => {
+  const run = require('node:util').promisify(require('node:child_process').execFile);
+  const {listGitFileHistory} = require('../src/gitOriginal.ts');
+  const env={...process.env};for(const key of Object.keys(env))if(key.startsWith('GIT_'))delete env[key];
+  for(const ending of ['\n','\r\n']) {
+    const baseline='start'+ending+'end'+ending, modified='start'+ending+'new'+ending+'end'+ending;
+    const item=await fixture(modified,[{line:2,before:null,after:'new',status:'pending'}]);
+    const repository=path.dirname(item.target.fsPath);
+    const git=async(...args)=>(await run('git',['-C',repository,'-c','core.autocrlf=false',...args],
+      {encoding:'utf8',windowsHide:true,timeout:10000,env})).stdout;
+    await git('init','-q');await git('config','user.name','Revision Test');await git('config','user.email','test@example.invalid');
+    await fs.writeFile(item.target.fsPath,'start\nend\n');
+    await git('add','--',path.basename(item.target.fsPath));await git('commit','-q','-m','Original baseline');
+    await fs.writeFile(item.target.fsPath,modified);
+    const [original]=await listGitFileHistory(scratch,item.target.fsPath);
+    assert.ok(original);
+    const first=service();
+    // Simulate a read that races creation metadata; it must not establish a wrong permanent baseline.
+    const premature=await ready(first.api,item), id=premature.files[0].hunks[0].id;
+    await first.api.rememberGitOriginal(item.request,original);
+    const blocked=await first.api.getState(item.request);
+    assert.equal(blocked.verified,false);assert.match(blocked.error,/Git commit.*matches that version/);
+    const writes=sourceWrites.length;
+    await assert.rejects(first.api.decide(item.request,item.relative,id,'accepted',blocked.revision),/Git commit/);
+    assert.equal(sourceWrites.length,writes);assert.equal(await read(item.target),modified);
+    const restarted=service(first.state);
+    assert.equal((await restarted.api.getState(item.request)).verified,false,'Origin guard persists through extension restart');
+    await fs.writeFile(item.target.fsPath,baseline);
+    let state=await ready(restarted.api,item);
+    const currentId=state.files[0].hunks[0].id;
+    await restarted.api.decide(item.request,item.relative,currentId,'accepted',state.revision);
+    assert.equal(await read(item.target),modified,'The added line appears exactly once with actual target line endings');
+    state=await ready(restarted.api,item);
+    await restarted.api.undo(item.request,item.relative,currentId,state.revision);
+    assert.equal(await read(item.target),baseline);
+    const pending=await ready(restarted.api,item);
+    await restarted.api.editPending(item.request,item.relative,pending.files[0].hunks[0].id,'other',pending.revision);
+    await ready(restarted.api,item);
+    await restarted.api.deleteRequest(item.request);
+    assert.deepEqual(first.state.workspaceState.keys(),[],'Deletion removes both baseline and Git-origin records');
+    assert.equal(await read(item.target),baseline);
+  }
+});
+
+test('review menu transforms a Python draft without saving and Accept is the only source write', async () => {
+  const item = await fixture('value = 1\n', [{line:1,before:'1',after:'2',status:'pending'}], true, 'py');
+  const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const originalRequest = await read(item.request), writeCount = sourceWrites.length;
+  const capabilities = await api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision);
+  assert.equal(capabilities.find(item => item.id === 'comment').enabled,true);
+  assert.equal(capabilities.find(item => item.id === 'markAdded').enabled,false);
+  const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment');
+  assert.equal(result.draft,'# value = 2');
+  assert.equal(await read(item.request),originalRequest);
+  assert.equal(await read(item.target),item.before); assert.equal(sourceWrites.length,writeCount);
+  await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+  assert.equal(await read(item.target),'# value = 2\n');
+  assert.deepEqual(await statuses(item),['accepted']);
+});
+test('review menu refuses stale, resolved, unsupported and untrusted operations without writes', async () => {
+  const item = await fixture('value = 1\n', [{line:1,before:'1',after:'2',status:'pending'}], true, 'py');
+  const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0], raw = await read(item.request);
+  await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2','stale','comment'),/request changed/i);
+  await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'markAdded'),/LaTeX|support|available/i);
+  await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'invented'),/Unknown/);
+  vscode.workspace.isTrusted = false;
+  try { await assert.rejects(api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision),/Trust/); }
+  finally {vscode.workspace.isTrusted = true;}
+  assert.equal(await read(item.request),raw); assert.equal(await read(item.target),item.before);
+  await api.decide(item.request,item.relative,hunk.id,'ignored',state.revision);
+  const ignored = await ready(api,item);
+  await assert.rejects(api.reviewActions(item.request,item.relative,ignored.files[0].hunks[0].id,'value = 2',ignored.revision),/pending/);
+});
+test('TeX review colors require loaded macros and setup queues a separate pending import', async () => {
+  const original = '\\documentclass{article}\n% packages\n\\begin{document}\nThe value is old.\n\\end{document}\n';
+  const item = await fixture(original,[{line:4,before:'old',after:'new',status:'pending'}],true,'tex');
+  const {api} = service(); let state = await ready(api,item), hunk = state.files[0].hunks[0];
+  let actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
+  assert.equal(actions.find(action => action.id === 'markAdded').enabled,false);
+  const macro = await fs.readFile(path.join(root,'media','review-macro.tex'),'utf8');
+  await fs.writeFile(path.join(path.dirname(item.target.fsPath),'review-macro.tex'),macro);
+  await api.queueMacroImport(item.request,{rootUri:item.target,original,line:3,text:'\\input{review-macro.tex}'});
+  assert.equal(await read(item.target),original,'Setup cannot modify the original');
+  let request = JSON.parse(await read(item.request));
+  assert.deepEqual(request.request.map(entry => entry.status),['pending','pending']);
+  assert.equal(request.request[1].line,3);
+  state = await ready(api,item);
+  const imported = state.files[0].hunks.find(part => part.draftAfter === '\\input{review-macro.tex}');
+  assert.ok(imported);
+  await api.decide(item.request,item.relative,imported.id,'accepted',state.revision);
+  state = await ready(api,item); hunk = state.files[0].hunks.find(part => part.decision === 'pending');
+  actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
+  assert.equal(actions.find(action => action.id === 'markAdded').enabled,true,JSON.stringify(actions));
+  const marked = await api.transformDraft(item.request,item.relative,hunk.id,'The value is new.',state.revision,'markAdded');
+  assert.match(marked.draft,/\\reviewadd\{new\}/);
+  assert.match(await read(item.target),/The value is old\./);
+});
+test('macro import maps accepted line insertions back to the immutable request baseline', async () => {
+  const original = '\\documentclass{article}\n% packages\n\\begin{document}\nold\n\\end{document}\n';
+  const item = await fixture(original,[{line:2,before:null,after:'% first\n% second',status:'pending'},{line:4,before:'old',after:'new',status:'pending'}],true,'tex');
+  const {api} = service(); let state = await ready(api,item);
+  await api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision);
+  const current = await read(item.target);
+  await api.queueMacroImport(item.request,{rootUri:item.target,original:current,line:5,text:'\\input{review-macro.tex}'});
+  const request = JSON.parse(await read(item.request));
+  assert.equal(request.request.at(-1).line,3); assert.equal(await read(item.target),current);
+  assert.deepEqual(request.request.map(entry => entry.status),['accepted','pending','pending']);
+  await ready(api,item);
+  await assert.rejects(api.queueMacroImport(item.request,{rootUri:item.target,original,line:3,text:'\\input{review-macro.tex}'}),/changed/i);
+});
+
+test('fragment setup creates a new root import request without changing either source', async () => {
+  const item = await fixture('old\n',[{line:1,before:'old',after:'new',status:'pending'}],true,'tex');
+  const {api} = service(); await ready(api,item);
+  const rootUri = Uri.file(path.join(path.dirname(item.target.fsPath),'main.tex'));
+  const original = '\\documentclass{article}\n\\begin{document}\n\\input{source.tex}\n\\end{document}\n';
+  await fs.writeFile(rootUri.fsPath,original);
+  const output = await api.queueMacroImport(item.request,{rootUri,original,line:2,text:'\\input{review-macro.tex}'});
+  assert.equal(output.fsPath,rootUri.fsPath+'.rr');
+  assert.equal(await read(rootUri),original); assert.equal(await read(item.target),item.before);
+  const generated = JSON.parse(await read(output));
+  assert.equal(generated.request[0].status,'pending'); assert.equal(generated.request[0].line,2);
+  const state = await api.getState(output);
+  assert.equal(state.verified,true,state.error); assert.equal(state.files[0].hunks.length,1);
+});
+
+test('menu actions remember an explicitly selected root for a fragment with existing macros', async () => {
+  const item = await fixture('The value is old.\n',[{line:1,before:'old',after:'new',status:'pending'}],true,'tex');
+  const {api,state:contextState} = service(); const state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const rootUri = Uri.file(path.join(path.dirname(item.target.fsPath),'main.tex'));
+  await fs.writeFile(rootUri.fsPath,'\\documentclass{article}\n\\input{review-macro.tex}\n\\begin{document}\n\\input{source.tex}\n\\end{document}\n');
+  await fs.copyFile(path.join(root,'media','review-macro.tex'),path.join(path.dirname(item.target.fsPath),'review-macro.tex'));
+  const open = vscode.window.showOpenDialog, information = vscode.window.showInformationMessage;
+  vscode.window.showOpenDialog = async () => [rootUri];
+  vscode.window.showInformationMessage = async () => undefined;
+  try { await api.setupMacros(item.request,item.relative,Uri.file(root)); }
+  finally {vscode.window.showOpenDialog = open; vscode.window.showInformationMessage = information;}
+  assert.equal(contextState.workspaceState.get('revisionRequest.macroRoot.'+item.target.toString()),rootUri.toString());
+  const actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
+  assert.equal(actions.find(action => action.id === 'markAdded').enabled,true,JSON.stringify(actions));
+  assert.equal(await read(item.target),item.before);
+});
+test('first-line comment draft preserves UTF-8 BOM when accepted', async () => {
+  const item = await fixture('\uFEFFvalue = 1\n',[{line:1,before:'1',after:'2',status:'pending'}],true,'py');
+  const {api} = service(); const state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment');
+  assert.equal(result.draft,'# value = 2'); assert.equal(await read(item.target),item.before);
+  await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+  assert.equal(await read(item.target),'\uFEFF# value = 2\n');
+});

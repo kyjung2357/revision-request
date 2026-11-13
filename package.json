@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -108,6 +108,24 @@
       {
         "command": "revisionRequest.copyMcpConfiguration",
         "title": "Revision Request: Copy MCP Configuration"
+      },
+      {
+        "command": "revisionRequest.setupReviewMacros",
+        "title": "Revision Request: Set up LaTeX Review Macros"
+      },
+      {
+        "command": "revisionRequest.toggleQuickReview",
+        "title": "Revision Request: Toggle Quick Review"
+      },
+      {
+        "command": "revisionRequest.enableQuickReview",
+        "title": "Enable Quick Review",
+        "icon": "media/quick-review-off.svg"
+      },
+      {
+        "command": "revisionRequest.disableQuickReview",
+        "title": "Disable Quick Review",
+        "icon": "media/quick-review-on.svg"
       }
     ],
     "viewsContainers": {
@@ -122,12 +140,22 @@
     "views": {
       "revisionRequest": [
         {
+          "id": "revisionRequest.create",
+          "name": "Create",
+          "initialSize": 1
+        },
+        {
           "id": "revisionRequest.requests",
-          "name": "Requests"
+          "name": "Requests",
+          "initialSize": 4
         }
       ]
     },
     "viewsWelcome": [
+      {
+        "view": "revisionRequest.create",
+        "contents": "[Create Revision Request](command:revisionRequest.createRequest)"
+      },
       {
         "view": "revisionRequest.requests",
         "contents": "No revision request in this workspace.\nAsk your agent to create a .rr file with the original text and proposed text. Requests appear here automatically.\n[Open a request](command:revisionRequest.openRequest)"
@@ -135,6 +163,16 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "revisionRequest.enableQuickReview",
+          "when": "view == revisionRequest.requests && !revisionRequest.quickReviewActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "revisionRequest.disableQuickReview",
+          "when": "view == revisionRequest.requests && revisionRequest.quickReviewActive",
+          "group": "navigation@1"
+        },
         {
           "command": "revisionRequest.refresh",
           "when": "view == revisionRequest.requests",
@@ -174,28 +212,73 @@
           "when": "resourceExtname == .rr",
           "group": "navigation@3"
         }
+      ],
+      "commandPalette": [
+        {
+          "command": "revisionRequest.enableQuickReview",
+          "when": "false"
+        },
+        {
+          "command": "revisionRequest.disableQuickReview",
+          "when": "false"
+        }
       ]
     },
     "configuration": {
       "title": "Revision Request",
       "properties": {
+        "revisionRequest.previewMode": {
+          "type": "string",
+          "enum": [
+            "always",
+            "once",
+            "manual"
+          ],
+          "enumDescriptions": [
+            "Automatically open the preview whenever an opened .rr source is selected. Open RR as JSON keeps the current source viewing session editable.",
+            "Automatically open the preview only on the first activation of each opened .rr document.",
+            "Open .rr files as JSON. Use Open Preview or the Requests sidebar to review them."
+          ],
+          "default": "always",
+          "scope": "resource",
+          "description": "Choose when .rr files open their visual preview. Closing a preview keeps the revealed JSON source open until you select another document."
+        },
         "revisionRequest.previewOnOpen": {
           "type": "boolean",
           "default": true,
-          "description": "Open the comparison preview automatically when you open a .rr file. Turn off to open JSON first. Open RR as JSON always opens the source."
+          "description": "Open the comparison preview automatically when you open a .rr file. Turn off to open JSON first. Open RR as JSON always opens the source.",
+          "deprecationMessage": "Use Revision Request: Preview Mode instead. An explicitly configured legacy value is honored only when Preview Mode is not explicitly set: true means once, false means manual."
         },
         "revisionRequest.defaultLayout": {
           "type": "string",
-          "enum": ["unified", "sideBySide"],
-          "enumDescriptions": ["Removed and added lines in one column.", "Original and proposed text in separate columns."],
+          "enum": [
+            "unified",
+            "sideBySide"
+          ],
+          "enumDescriptions": [
+            "Removed and added lines in one column.",
+            "Original and proposed text in separate columns."
+          ],
           "default": "unified",
           "scope": "resource",
           "description": "Initial layout for new previews. Each preview keeps its restored or toggled layout until it is closed."
         },
         "revisionRequest.acceptShortcut": {
           "type": "string",
-          "enum": ["ctrlEnter", "altEnter", "tab", "shiftTab", "none"],
-          "enumDescriptions": ["Ctrl+Enter (also Cmd+Enter on macOS).", "Alt+Enter.", "Tab instead of inserting a tab while editing.", "Shift+Tab instead of moving focus while editing.", "Use the Accept button only."],
+          "enum": [
+            "ctrlEnter",
+            "altEnter",
+            "tab",
+            "shiftTab",
+            "none"
+          ],
+          "enumDescriptions": [
+            "Ctrl+Enter (also Cmd+Enter on macOS).",
+            "Alt+Enter.",
+            "Tab instead of inserting a tab while editing.",
+            "Shift+Tab instead of moving focus while editing.",
+            "Use the Accept button only."
+          ],
           "default": "ctrlEnter",
           "scope": "resource",
           "description": "Shortcut to accept the currently edited pending block, applying its current text to the original. Only active inside the proposal editor."
@@ -254,7 +337,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/reviewMacroSetup.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",

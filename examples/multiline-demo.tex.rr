@@ -11,9 +11,21 @@
     },
     {
       "line": 15,
-      "before": "approximation is written as an exact equality:\n\\[\n  f(x+h)=f(x)+f'(x)h.\n\\]\nThe remainder is omitted from this draf",
-      "after": "first-order expansion includes a remainder:\n\\begin{align*}\n  f(x+h) &= f(x)+f'(x)h+r(h), \\\\\n  \\frac{r(h)}{h} &\\longrightarrow 0\n  \\qquad (h\\to0).\n\\end{align*}\nThus the error becomes small relative to the incremen",
-      "reason": "Keep the expansion and its remainder condition in one review decision.",
+      "before": "approximation is written as an exact equality:",
+      "after": "first-order expansion includes a remainder:",
+      "status": "pending"
+    },
+    {
+      "line": 16,
+      "before": "\\[\n  f(x+h)=f(x)+f'(x)h.\n\\]",
+      "after": "\\begin{align*}\n  f(x+h) &= f(x)+f'(x)h+r(h), \\\\\n  \\frac{r(h)}{h} &\\longrightarrow 0\n  \\qquad (h\\to0).\n\\end{align*}",
+      "reason": "Include the remainder and its limiting condition.",
+      "status": "pending"
+    },
+    {
+      "line": 19,
+      "before": "The remainder is omitted from this draf",
+      "after": "Thus the error becomes small relative to the incremen",
       "status": "pending"
     },
     {
@@ -32,7 +44,31 @@
     {
       "line": 31,
       "before": null,
-      "after": "The full calculation can be reviewed as one insertion:\n\\begin{align*}\n  f(x+h)-f(x)\n    &= (x+h)^2-x^2 \\\\\n    &= 2xh+h^2, \\\\\n  f(x+h)-f(x)-f'(x)h\n    &= h^2.\n\\end{align*}\nFor nonzero \\(h\\), divide the remainder by the increment:\n\\[\n  \\frac{h^2}{h}=h\\longrightarrow0.\n\\]\nThe same limit holds for increments of either sign.\nAt \\(h=0\\), the original difference is exactly zero.\nNo additional assumption on the sign of \\(x\\) is needed.\n",
+      "after": "The full calculation can be reviewed as one insertion:",
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": null,
+      "after": "\\begin{align*}\n  f(x+h)-f(x)\n    &= (x+h)^2-x^2 \\\\\n    &= 2xh+h^2, \\\\\n  f(x+h)-f(x)-f'(x)h\n    &= h^2.\n\\end{align*}",
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": null,
+      "after": "For nonzero \\(h\\), divide the remainder by the increment:",
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": null,
+      "after": "\\[\n  \\frac{h^2}{h}=h\\longrightarrow0.\n\\]",
+      "status": "pending"
+    },
+    {
+      "line": 31,
+      "before": null,
+      "after": "The same limit holds for increments of either sign.\nAt \\(h=0\\), the original difference is exactly zero.\nNo additional assumption on the sign of \\(x\\) is needed.\n",
       "status": "pending"
     },
     {

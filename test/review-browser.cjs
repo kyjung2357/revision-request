@@ -79,6 +79,7 @@ function mockScript() {
     `window.__setReview = next => { window.__review = structuredClone(next); window.dispatchEvent(new MessageEvent('message', { data: window.__review })); };\n` +
     `window.acquireVsCodeApi = () => ({ getState: () => window.__savedState, setState: value => { window.__savedState = value; sessionStorage.setItem('rr-view-state', JSON.stringify(value)); }, postMessage: message => {\n` +
     `window.__messages.push(structuredClone(message));\n` +
+    `if (message.type === 'reviewActions' && !window.__deferReviewActions) { queueMicrotask(()=>window.dispatchEvent(new MessageEvent('message',{data:{type:'reviewActionsResult',editId:message.editId,reviewActions:[{id:'comment',label:'Comment out changed lines',enabled:true},{id:'markRemoved',label:'Mark removed text in red',enabled:false,reason:'Test setup requires macros.'},{id:'markAdded',label:'Mark added text in blue',enabled:false,reason:'Test setup requires macros.'}]}}))); }\n` +
     `if (message.type === 'decide' || message.type === 'decideFile' || message.type === 'undo') {\n` +
     `if (window.__deferDecisions) return;\n` +
     `const next = structuredClone(window.__review); const file = next.files.find(item => item.path === message.filePath);\n` +
@@ -86,7 +87,7 @@ function mockScript() {
     `if (message.type === 'undo') { const hunk = file.hunks.find(item => item.id === message.hunkId); if (!hunk || hunk.decision === 'pending') throw new Error('Invalid undo transport'); hunk.decision = 'pending'; }\n` +
     `else for (const hunk of file.hunks) if (hunk.decision === 'pending' && (message.type === 'decideFile' || hunk.id === message.hunkId)) hunk.decision = message.decision;\n` +
     `if (next.closed && file.hunks.some(hunk => hunk.decision === 'pending')) next.closed = false;\n` +
-    `window.__setReview(next); }\n` +
+    `window.__setReview(next); if(message.quickDecisionId && !window.__deferQuickAck) queueMicrotask(()=>window.dispatchEvent(new MessageEvent("message",{data:{type:"quickDecisionResult",quickDecisionId:message.quickDecisionId,filePath:message.filePath,hunkId:message.hunkId,decision:message.decision,success:true}}))); }\n` +
     `} });\n`;
 }
 
@@ -330,7 +331,7 @@ async function inlinePresentation() {
       rowHighlight: document.querySelector('.review-app').classList.contains('highlight-changed-lines'),
       onlyChanged: document.querySelector('.review-app').classList.contains('show-only-changed-text'),
       code: document.querySelector('.paired-document').textContent,
-      injected: document.querySelectorAll('#app img,#app svg,#app script').length, xss: window.__xss };
+      injected: Array.from(document.querySelectorAll('#app img,#app svg,#app script')).filter(node=>!node.matches('.quick-review-toggle > svg.quick-review-icon')).length, xss: window.__xss };
   })()`);
 }
 function inlineRects(snapshot) {
@@ -390,11 +391,11 @@ async function clickUndo(id) {
   assert.deepEqual(message, { type: 'undo', filePath: fixture.files[0].path, hunkId: id, revision: fixture.revision });
 }
 async function clickWhy(id) {
-  await cdp.evaluate(`(() => {
-    const button = Array.from(document.querySelectorAll('.why-toggle')).find(item => item.dataset.whyId === ${JSON.stringify(id)});
-    if (!button || button.disabled) throw new Error('Expected enabled Why button');
-    button.click();
-  })()`);
+  await cdp.evaluate('(() => { const existing=document.querySelector(".why-popover"); if(existing){existing.querySelector(".why-close").click();return;} const toggle=Array.from(document.querySelectorAll(".why-toggle")).find(item=>item.dataset.whyId==='+JSON.stringify(id)+'); if(!toggle || toggle.disabled)throw Error("Expected enabled actions button");toggle.click(); document.querySelector(".review-action-why")?.click(); })()');
+  await settle();
+}
+async function clickMore(id) {
+  await cdp.evaluate('(() => { const toggle=Array.from(document.querySelectorAll(".review-menu-toggle")).find(item=>item.dataset.whyId==='+JSON.stringify(id)+');if(!toggle || toggle.disabled)throw Error("Expected enabled actions button");toggle.click(); })()');
   await settle();
 }
 async function assertNoLayoutShift(before) {
@@ -479,7 +480,7 @@ function assertInlineEditor(snapshot, width) {
   assert.ok(snapshot.rect.x >= width / 2 - 10 && snapshot.rect.right <= width + 0.6, 'Editor stays in the proposed pane');
   assert.ok(snapshot.area.x >= snapshot.rect.x && snapshot.area.right <= snapshot.gutter.x + 0.6, 'Draft text ends before the action rail');
   assert.ok(snapshot.area.scrollWidth <= snapshot.area.width + 1, 'The draft is fully readable without horizontal scrolling');
-  assert.deepEqual([...snapshot.buttons].sort(), ['Accept', 'Ignore', 'Why'], 'Editing keeps the normal decision controls');
+  assert.deepEqual([...snapshot.buttons].sort(), ['Accept', 'Ignore', '⋯'], 'Editing keeps the normal decision controls');
 }
 async function originalProjection() {
   return cdp.evaluate("Array.from(document.querySelectorAll('.code-side.left[data-line] .code-text'),node=>node.textContent.replace(/\u200b/g,'')).join('\\n')");
@@ -872,6 +873,350 @@ async function runEditorDecisionTests(width) {
     await resetFixture(width);
   });
 }
+
+async function runReviewActionTests(width) {
+  await runTest(width+'px: More actions floats without starting an editor and supports keyboard navigation',async()=>{
+    await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+    const before=await geometry();await clickMore('grow');await assertNoLayoutShift(before);
+    const request=await cdp.evaluate("window.__messages.filter(m=>m.type==='reviewActions').at(-1)");
+    assert.equal(request.hunkId,'grow');assert.equal(request.draft,fixture.files[0].hunks[0].after.replace(/\n$/,''));
+    assert.equal(await cdp.evaluate('Boolean(document.querySelector(".pending-editor"))'),false);
+    const menu=await cdp.evaluate('(() => {const m=document.querySelector(".review-action-menu"),r=m.getBoundingClientRect();return {role:m.getAttribute("role"),x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight};})()');
+    assert.equal(menu.role,'menu');assert.ok(menu.x>=0&&menu.y>=0&&menu.right<=menu.width+1&&menu.bottom<=menu.height+1);
+    await screenshot('review-actions-'+width);
+    await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}))');
+    assert.equal(await cdp.evaluate('document.activeElement.dataset.reviewAction'),'comment');
+    await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await settle();
+    assert.equal(await cdp.evaluate('Boolean(document.querySelector(".review-action-menu"))'),false);
+    assert.equal(await cdp.evaluate('document.activeElement.dataset.whyId'),'grow');
+  });
+  await runTest(width+'px: actions transform only the draft, retain Accept, and support local Undo',async()=>{
+    await resetFixture(width);await clickMore('grow');
+    const before=await cdp.evaluate('JSON.stringify(window.__review)');
+    await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
+    const sent=await cdp.evaluate("window.__messages.filter(m=>m.type==='transformDraft').at(-1)");
+    assert.equal(sent.action,'comment');assert.equal(sent.revision,fixture.revision);
+    const draft='% '+sent.draft;
+    await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'transformResult',editId:sent.editId,draft})+'}))');await settle();
+    assert.equal((await editSnapshot()).draft,draft);assert.deepEqual((await editSnapshot()).buttons.sort(),['Accept','Ignore','⋯']);
+    assert.equal(await cdp.evaluate('JSON.stringify(window.__review)'),before);
+    assert.equal(await cdp.evaluate("window.__messages.filter(m=>['editPending','editAndAccept','decide'].includes(m.type)).length"),0);
+    await editorKey('z',{ctrlKey:true});assert.equal((await editSnapshot()).draft,sent.draft);
+    await clickMore('grow');const capabilities=await cdp.evaluate("window.__messages.filter(m=>m.type==='reviewActions').at(-1)");assert.equal(capabilities.draft,sent.draft);
+    assert.equal(await cdp.evaluate('document.querySelector(".review-menu-setup").disabled'),true);
+    await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await editorKey('Escape');await resetFixture(width);
+  });
+  await runTest(width+'px: failed transforms keep draft and stale responses cannot overwrite it',async()=>{
+    await resetFixture(width);await clickMore('grow');await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
+    const sent=await cdp.evaluate("window.__messages.filter(m=>m.type==='transformDraft').at(-1)");
+    await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'transformResult',editId:'stale',draft:'wrong'})+'}))');await settle();
+    assert.equal((await editSnapshot()).draft,sent.draft);
+    await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'transformResult',editId:sent.editId,error:'Cannot transform this syntax.'})+'}))');await settle();
+    assert.equal((await editSnapshot()).draft,sent.draft);assert.equal(await cdp.evaluate('document.querySelector(".pending-editor-error").textContent'),'Cannot transform this syntax.');
+    await editorKey('Escape');await resetFixture(width);
+  });
+}
+
+
+function quickFixture() {
+  const filePath='examples/quick-review.tex',positions=[5,45,90,130];
+  const lines=Array.from({length:150},(_,index)=>'Context line '+String(index+1).padStart(3,'0')+'.');
+  for(const line of positions)lines[line-1]='Original item '+line+'.';
+  const baseline=lines.join('\n')+'\n';
+  const request=parseRequestDocument(JSON.stringify({path:filePath,request:positions.map(line=>({
+    line,before:'Original',after:'Revised',reason:'Explain the change at line '+line+'.',status:'pending'}))}));
+  const review=resolveRequest(request,baseline,baseline);
+  return {...structuredClone(fixture),revision:'quick-fixture',requestName:'quick-review.tex.rr',
+    files:[{path:filePath,before:baseline,hunks:review.hunks.map((hunk,index)=>({...hunk,decision:'pending',
+      explanation:request.request[index].reason,inlineChanges:computeInlineChanges(hunk,40,filePath)}))}]};
+}
+async function resetQuick(width,unified=false) {
+  await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:{type:"toggleQuickReview",enabled:false}}));window.__deferDecisions=false;window.__deferQuickAck=false');
+  await resetFixture(width);if((await unifiedSnapshot()).unified!==unified)await toggleLayout();
+  const next=quickFixture();
+  await cdp.evaluate('window.__messages=[];window.__setReview('+JSON.stringify(next)+');document.querySelector("[data-scroll-area]").scrollTop=0');
+  await settle();return next;
+}
+async function quickSnapshot() {
+  return cdp.evaluate(`(() => {
+    const rect=node=>{if(!node)return null;const r=node.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:r.width,height:r.height};};
+    const toggle=document.querySelector('.quick-review-toggle'),selected=[...document.querySelectorAll('.quick-review-selected')];
+    const scroll=document.querySelector('[data-scroll-area]'),bulk=[...document.querySelectorAll('.file-actions > button')];
+    return {enabled:toggle?.getAttribute('aria-pressed')==='true',disabled:toggle?.disabled,
+      selected:selected.map(node=>({id:node.dataset.hunk,decision:node.dataset.quickDecision,key:node.dataset.focusKey,rect:rect(node)})),
+      focused:{id:document.activeElement.dataset.hunk,decision:document.activeElement.dataset.quickDecision,key:document.activeElement.dataset.focusKey},
+      colors:toggle?{text:getComputedStyle(toggle).color,background:getComputedStyle(toggle).backgroundColor,icon:getComputedStyle(toggle.querySelector('svg')).color,fill:getComputedStyle(toggle.querySelector('svg')).fill,border:getComputedStyle(toggle).borderTopColor}:null,
+      toggle:rect(toggle),bulk:bulk.map(rect),badges:[...document.querySelectorAll('.summary .badge')].map(rect),
+      left:rect(document.querySelector('.pane-banner.left')),right:rect(document.querySelector('.pane-banner.right')),
+      scroll:{top:scroll.scrollTop,total:scroll.scrollHeight,rect:rect(scroll)},menu:Boolean(document.querySelector('.review-action-menu')),why:Boolean(document.querySelector('.why-popover')),
+      decisions:window.__messages.filter(message=>message.type==='decide'),modeMessages:window.__messages.filter(message=>message.type==='quickReviewState')};
+  })()`);
+}
+async function quickToggle(enabled) {
+  if(enabled===undefined)await cdp.evaluate('document.querySelector(".quick-review-toggle").click()');
+  else await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'toggleQuickReview',enabled})+'}))');
+  await settle();
+}
+async function quickKey(key,modifiers=0) {
+  const code={ArrowLeft:37,ArrowRight:39,Tab:9,Escape:27,Enter:13}[key];
+  await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key,code:key,windowsVirtualKeyCode:code,nativeVirtualKeyCode:code,modifiers});
+  await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',key,code:key,windowsVirtualKeyCode:code,nativeVirtualKeyCode:code,modifiers});await settle();
+}
+async function quickAck(message,success=true,error) {
+  const response={type:'quickDecisionResult',quickDecisionId:message.quickDecisionId,filePath:message.filePath,hunkId:message.hunkId,decision:message.decision,success,...(error?{error}:{})};
+  await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify(response)+'}))');await settle();
+}
+async function quickResolve(message) {
+  await cdp.evaluate('(()=>{const next=structuredClone(window.__review),file=next.files.find(file=>file.path==='+JSON.stringify(message.filePath)+');file.hunks.find(hunk=>hunk.id==='+JSON.stringify(message.hunkId)+').decision='+JSON.stringify(message.decision)+';next.revision+="-decided";next.closed=file.hunks.every(hunk=>hunk.decision!=="pending");window.__setReview(next);})()');await settle();
+}
+
+function openingFixture() {
+  const filePath='examples/open-review.txt';
+  const lines=Array.from({length:230},(_,index)=>'Original source line '+String(index+1).padStart(3,'0')+'.');
+  const baseline=lines.join('\n')+'\n';
+  const request=parseRequestDocument(JSON.stringify({path:filePath,request:[
+    {line:45,before:lines.slice(44,89).join('\n'),after:'First replacement line.\nSecond replacement line.',status:'pending'},
+    {line:130,before:'Original',after:'Revised',status:'pending'},
+    {line:190,before:'Original',after:'Revised',status:'pending'}
+  ]}));
+  const review=resolveRequest(request,baseline,baseline);
+  return {...structuredClone(fixture),revision:'opening-fixture',requestName:'open-review.txt.rr',
+    files:[{path:filePath,before:baseline,hunks:review.hunks.map(hunk=>({...hunk,decision:'pending',
+      inlineChanges:computeInlineChanges(hunk,40,filePath)}))}]};
+}
+async function freshOpeningFixture(width,unified,stateOverride,messagesBeforeState=[]) {
+  await cdp.send('Emulation.setDeviceMetricsOverride',{width,height:850,deviceScaleFactor:1,mobile:false});
+  const next=stateOverride || openingFixture();
+  const saved={layout:unified?'unified':'sideBySide',viewport:{top:4800},splitRatio:.5};
+  await cdp.evaluate('window.addEventListener("pagehide",()=>sessionStorage.setItem("rr-view-state",'+JSON.stringify(JSON.stringify(saved))+'),{once:true})');
+  await reloadPreview(next,messagesBeforeState);
+  return next;
+}
+async function revealOpeningChange() {
+  await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:{type:"revealFirstChange"}}))');await settle();
+}
+async function clickOpeningAction(id,action) {
+  await cdp.evaluate('(()=>{const key=window.__review.files[0].path+":"+'+JSON.stringify(id)+'+":"+'+JSON.stringify(action)+';const button=[...document.querySelectorAll("[data-focus-key]")].find(node=>node.dataset.focusKey===key);if(!button||button.disabled)throw Error("Expected enabled "+key);button.focus({preventScroll:true});button.click();})()');await settle();
+}
+async function openingSnapshot() {
+  return cdp.evaluate(String.raw`(() => {
+    const scroll=document.querySelector('[data-scroll-area]'),block=scroll?.querySelector('.hunk-pending');
+    const first=block?.querySelector('.diff-row'),view=scroll?.getBoundingClientRect();
+    return {top:scroll?.scrollTop,id:block?.dataset.overviewHunk,
+      firstOffset:first?.getBoundingClientRect().top-view?.top,
+      firstRemoved:Boolean(first?.querySelector('.removed')),
+      selected:[...document.querySelectorAll('.quick-review-selected')].map(node=>({id:node.dataset.hunk,decision:node.dataset.quickDecision})),
+      focused:document.activeElement?.dataset.focusKey,
+      decisions:window.__messages.filter(message=>['decide','decideFile','undo'].includes(message.type))};
+  })()`);
+}
+async function assertOpeningChange(id,unified) {
+  const view=await openingSnapshot();
+  assert.equal(view.id,id);
+  assert.ok(view.top>500,'Skip the long unchanged introduction');
+  assert.ok(Math.abs(view.firstOffset-8)<1.1,'The first changed row starts just below the viewport top');
+  if(unified)assert.equal(view.firstRemoved,true,'A unified replacement begins with removed text, not its Accept row');
+  return view;
+}
+async function runOpenNavigationTests(width) {
+  for(const unified of [false,true]) {
+    const label=width+'px '+(unified?'unified':'side-by-side')+' opening';
+    await runTest(label+': initial and reloaded previews reveal the first changed row instead of saved scroll',async()=>{
+      const next=await freshOpeningFixture(width,unified),first=next.files[0].hunks[0].id;
+      let view=await assertOpeningChange(first,unified);assert.equal(view.selected.length,0);assert.equal(view.decisions.length,0);
+      await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop=4000');await settle();
+      await reloadPreview(next);view=await assertOpeningChange(first,unified);assert.equal(view.decisions.length,0);
+    });
+    await runTest(label+': an early reveal waits for a ready, nonbusy comparison',async()=>{
+      const next=openingFixture(),first=next.files[0].hunks[0].id;
+      await freshOpeningFixture(width,unified,{...next,busy:true},[{type:'revealFirstChange'}]);
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();
+      await assertOpeningChange(first,unified);
+    });
+    await runTest(label+': Accept, Undo, settings, errors and ordinary state updates preserve the viewport',async()=>{
+      const next=await freshOpeningFixture(width,unified),first=next.files[0].hunks[0].id;
+      await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop=3900');await settle();
+      let before=await viewportSnapshot();await clickOpeningAction(first,'accept');await assertViewportPreserved(before);
+      before=await viewportSnapshot();await clickOpeningAction(first,'undo');await assertViewportPreserved(before);
+      before=await viewportSnapshot();
+      await cdp.evaluate('window.__setReview({...structuredClone(window.__review),unchangedOpacity:45,error:"Temporary review error."})');await settle();await assertViewportPreserved(before);
+      await cdp.evaluate('(()=>{const next=structuredClone(window.__review);delete next.error;window.__setReview(next);})()');await settle();await assertViewportPreserved(before);
+    });
+    await runTest(label+': explicit reopen selects first Accept in Quick Review without hiding the removed rows',async()=>{
+      const next=await freshOpeningFixture(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await cdp.evaluate('[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(ids[2])+').scrollIntoView({block:"start"})');await settle();
+      await quickToggle(true);await quickKey('ArrowRight');assert.equal((await quickSnapshot()).selected[0].id,ids[2]);
+      await revealOpeningChange();let view=await assertOpeningChange(ids[0],unified);
+      assert.deepEqual(view.selected,[{id:ids[0],decision:'accepted'}]);assert.equal(view.decisions.length,0);
+      assert.equal((await quickSnapshot()).focused.id,ids[0]);
+      await revealOpeningChange();view=await assertOpeningChange(ids[0],unified);assert.equal(view.decisions.length,0);
+      await quickToggle(false);await revealOpeningChange();await quickToggle(true);
+      await assertOpeningChange(ids[0],unified);assert.equal((await quickSnapshot()).selected[0].id,ids[0]);
+    });
+    await runTest(label+': reopening keeps drafts but disarms offscreen editor and decision focus',async()=>{
+      let next=await freshOpeningFixture(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await openEdit(ids[2]);await writeDraft('Retained local draft.');
+      await revealOpeningChange();await assertOpeningChange(ids[0],unified);
+      assert.equal((await editSnapshot()).draft,'Retained local draft.','Opening navigation retains the unsaved proposal');
+      assert.equal(await cdp.evaluate('document.activeElement===document.querySelector("[data-scroll-area]")'),true);
+      await editorKey('Enter',{ctrlKey:true});await quickKey('Enter');
+      assert.equal(await cdp.evaluate('window.__messages.filter(message=>["decide","undo","editAndAccept","ignoreEdited"].includes(message.type)).length'),0,'A hidden draft cannot be approved by the old shortcut');
+      for(const action of ['accept','undo']) {
+        next=await freshOpeningFixture(width,unified);ids=next.files[0].hunks.map(h=>h.id);
+        if(action==='undo')await clickOpeningAction(ids[2],'accept');
+        await cdp.evaluate('(()=>{const key=window.__review.files[0].path+":"+'+JSON.stringify(ids[2])+'+":"+'+JSON.stringify(action)+';const button=[...document.querySelectorAll("[data-focus-key]")].find(node=>node.dataset.focusKey===key);button.scrollIntoView({block:"nearest"});button.focus({preventScroll:true});})()');await settle();
+        const count=(await openingSnapshot()).decisions.length;
+        await revealOpeningChange();await assertOpeningChange(ids[0],unified);
+        assert.equal(await cdp.evaluate('document.activeElement===document.querySelector("[data-scroll-area]")'),true);
+        await quickKey('Enter');assert.equal((await openingSnapshot()).decisions.length,count,'Enter cannot trigger the previous '+action+' button');
+      }
+    });
+    await runTest(label+': reopening during a quick decision waits for both result and state',async()=>{
+      const next=await freshOpeningFixture(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await cdp.evaluate('[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(ids[1])+').scrollIntoView({block:"start"})');await settle();
+      await quickToggle(true);await cdp.evaluate('window.__deferDecisions=true;window.__deferQuickAck=true');await quickKey('Tab');
+      const message=(await quickSnapshot()).decisions.at(-1);assert.equal(message.hunkId,ids[1]);
+      const before=await viewportSnapshot();await revealOpeningChange();await assertViewportPreserved(before);
+      await quickResolve(message);await assertViewportPreserved(before);
+      await quickAck(message);const view=await assertOpeningChange(ids[0],unified);
+      assert.deepEqual(view.selected,[{id:ids[0],decision:'accepted'}]);assert.equal(view.decisions.length,1);
+      const last=openingFixture();last.files[0].hunks.slice(0,2).forEach(h=>h.decision='ignored');
+      await freshOpeningFixture(width,unified,last);await quickToggle(true);
+      await cdp.evaluate('window.__deferDecisions=true;window.__deferQuickAck=true');await quickKey('Tab');
+      const finalMessage=(await quickSnapshot()).decisions.at(-1),finalBefore=await viewportSnapshot();
+      await revealOpeningChange();await quickResolve(finalMessage);await assertViewportPreserved(finalBefore);
+      await quickAck(finalMessage);assert.equal((await openingSnapshot()).top,0,'A final decision also waits for its acknowledgement before reopening at the top');
+    });
+    await runTest(label+': a reopen after acknowledgement waits only for the remaining state',async()=>{
+      const next=await freshOpeningFixture(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await cdp.evaluate('[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(ids[1])+').scrollIntoView({block:"start"})');await settle();
+      await quickToggle(true);await cdp.evaluate('window.__deferDecisions=true;window.__deferQuickAck=true');await quickKey('Tab');
+      const message=(await quickSnapshot()).decisions.at(-1);assert.equal(message.hunkId,ids[1]);
+      await quickAck(message);
+      const before=await viewportSnapshot();await revealOpeningChange();await assertViewportPreserved(before);
+      await quickResolve(message);const view=await assertOpeningChange(ids[0],unified);
+      assert.deepEqual(view.selected,[{id:ids[0],decision:'accepted'}]);assert.equal(view.decisions.length,1);
+    });
+    await runTest(label+': resolved changes are skipped and completed requests open at the top',async()=>{
+      const next=openingFixture(),ids=next.files[0].hunks.map(h=>h.id);next.files[0].hunks[0].decision='accepted';
+      await freshOpeningFixture(width,unified,next);await assertOpeningChange(ids[1],unified);
+      const closed=structuredClone(next);closed.files[0].hunks.forEach(h=>h.decision='ignored');closed.closed=true;closed.files[0].currentText=closed.files[0].before;
+      await freshOpeningFixture(width,unified,closed);assert.equal((await openingSnapshot()).top,0);
+      await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop=2000');await settle();
+      await revealOpeningChange();assert.equal((await openingSnapshot()).top,0);assert.equal((await openingSnapshot()).decisions.length,0);
+    });
+  }
+  await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+}
+
+async function runQuickReviewTests(width) {
+  for(const unified of [false,true]) {
+    const label=width+'px '+(unified?'unified':'side-by-side');
+    await runTest(label+': Quick Review is a yellow toggle above aligned bulk actions and defaults off',async()=>{
+      await resetQuick(width,unified);const view=await quickSnapshot();
+      assert.equal(view.enabled,false);assert.equal(view.disabled,false);assert.equal(view.selected.length,0);assert.equal(view.bulk.length,2);
+      assert.ok(view.toggle.bottom<=view.bulk[0].y+.6,'Quick Review sits above the bulk row');
+      assert.ok(Math.abs(view.toggle.x-view.bulk[0].x)<.7,'Same left edge as Accept all');
+      assert.ok(Math.abs(view.toggle.right-view.bulk[1].right)<.7,'Spans both bulk buttons');
+      for(const badge of view.badges) {assert.ok(Math.abs(badge.height-view.bulk[0].height)<.7);assert.ok(Math.abs(badge.y-view.bulk[0].y)<.7,'Counters stay on lower bulk row');}
+      if(!unified) {assert.ok(Math.abs(view.left.y-view.right.y)<.6);assert.ok(Math.abs(view.left.height-view.right.height)<.6,'Banner heights remain equal');}
+      const prevented=await cdp.evaluate('(()=>{const event=new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true});document.body.dispatchEvent(event);return event.defaultPrevented;})()');
+      assert.equal(prevented,false,'Off mode does not intercept ordinary keys');assert.equal((await quickSnapshot()).decisions.length,0);
+      await screenshot('quick-review-'+width+'-'+(unified?'unified':'split')+'-off');
+    });
+    await runTest(label+': either arrow toggles only Accept and Ignore and Tab waits for acknowledged success',async()=>{
+      const next=await resetQuick(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      const offColors=(await quickSnapshot()).colors;await quickToggle();let view=await quickSnapshot();
+      assert.equal(view.colors.text,offColors.background,'On text uses the off background color');assert.equal(view.colors.background,offColors.text,'On background uses the off text color');assert.equal(view.colors.icon,view.colors.text);assert.equal(offColors.icon,offColors.text);assert.equal(view.colors.fill,view.colors.text,'Enabled bolt is filled');assert.equal(offColors.fill,offColors.text,'Disabled bolt is filled');
+      assert.equal(view.enabled,true);assert.equal(view.selected.length,1);assert.equal(view.selected[0].id,ids[0]);assert.equal(view.selected[0].decision,'accepted');
+      assert.equal(view.modeMessages.at(-1).enabled,true);
+      for(const [key,wanted] of [['ArrowRight','ignored'],['ArrowRight','accepted'],['ArrowLeft','ignored'],['ArrowLeft','accepted']]) {
+        await quickKey(key);view=await quickSnapshot();assert.equal(view.selected.length,1);assert.equal(view.selected[0].decision,wanted);
+        assert.equal(view.focused.decision,wanted);assert.equal(view.selected[0].id,ids[0]);
+      }
+      await cdp.evaluate('window.__deferDecisions=true');await quickKey('Tab');view=await quickSnapshot();assert.equal(view.decisions.length,1);
+      const sent=view.decisions[0];assert.equal(sent.hunkId,ids[0]);assert.equal(sent.decision,'accepted');assert.equal(typeof sent.quickDecisionId,'string');
+      await quickKey('Tab');await quickKey('ArrowRight');
+      await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",repeat:true,bubbles:true,cancelable:true}))');
+      assert.equal((await quickSnapshot()).decisions.length,1,'Waiting and held Tab cannot submit twice');
+      await quickResolve(sent);await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,1,'State alone cannot authorize advancement');
+      await cdp.evaluate('(()=>{const control=[...document.querySelectorAll("button[data-quick-decision=accepted]")].find(node=>node.dataset.hunk==='+JSON.stringify(ids[1])+');control.click();})()');
+      assert.equal((await quickSnapshot()).decisions.length,1,'A mouse decision also waits for the first acknowledgement');
+      await quickAck(sent);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[1]);assert.equal(view.selected[0].decision,'accepted');assert.equal(view.focused.id,ids[1]);
+      assert.ok(view.selected[0].rect.y>=view.scroll.rect.y-.7&&view.selected[0].rect.bottom<=view.scroll.rect.bottom+.7,'Next controls are visible');
+      assert.ok(view.scroll.top<view.scroll.total-view.scroll.rect.height-50,'Advancement does not jump to the bottom');
+      await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",repeat:true,bubbles:true,cancelable:true}))');
+      assert.equal((await quickSnapshot()).decisions.length,1,'Held Tab cannot approve the newly focused item');
+      await quickKey('ArrowRight');await quickKey('Tab');const ignored=(await quickSnapshot()).decisions.at(-1);assert.equal(ignored.decision,'ignored');
+      await quickAck(ignored);assert.notEqual((await quickSnapshot()).selected[0]?.id,ids[2],'Ack alone waits for the state');
+      await quickResolve(ignored);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[2]);assert.equal(view.selected[0].decision,'accepted','Next item resets to Accept');
+      await screenshot('quick-review-'+width+'-'+(unified?'unified':'split')+'-on');
+    });
+
+    await runTest(label+': advancing reveals the full next multiline block when it fits the viewport',async()=>{
+      const next=await resetQuick(width,unified),filePath=next.files[0].path;
+      const request=parseRequestDocument(JSON.stringify({path:filePath,request:[
+        {line:5,before:'Original item 5.',after:'Revised item 5.',status:'pending'},
+        {line:45,before:'Original item 45.',after:'New line one.\nNew line two.\nNew line three.',status:'pending'}
+      ]}));
+      const review=resolveRequest(request,next.files[0].before,next.files[0].before);
+      next.files[0].hunks=review.hunks.map(hunk=>({...hunk,decision:'pending',inlineChanges:computeInlineChanges(hunk,40,filePath)}));
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();await quickToggle(true);await quickKey('Tab');await settle();
+      const view=await quickSnapshot();assert.equal(view.selected[0].id,review.hunks[1].id);
+      const block=await cdp.evaluate('(()=>{const node=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(review.hunks[1].id)+');const r=node.getBoundingClientRect();return{top:r.top,bottom:r.bottom,height:r.height};})()');
+      assert.ok(block.height<view.scroll.rect.height,'The complete next block fits');
+      assert.ok(block.top>=view.scroll.rect.y-.7&&block.bottom<=view.scroll.rect.bottom+.7,'All proposed lines, not only the Accept button, must be visible');
+    });
+
+    await runTest(label+': errors preserve the item and selection, and mode exits after all decisions',async()=>{
+      const next=await resetQuick(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await quickToggle(true);await quickKey('ArrowLeft');await cdp.evaluate('window.__deferDecisions=true');await quickKey('Tab');
+      const failed=(await quickSnapshot()).decisions.at(-1);assert.equal(failed.decision,'ignored','Ignore was selected before the failed request');await quickAck({...failed,quickDecisionId:'obsolete'},true);
+      assert.equal((await quickSnapshot()).selected[0]?.id,ids[0]);
+      await quickAck(failed,false,'The source changed. Review again.');
+      await cdp.evaluate('window.__setReview({...structuredClone(window.__review),error:"The source changed. Review again."})');await settle();
+      let view=await quickSnapshot();assert.equal(view.selected[0].id,ids[0]);assert.equal(view.selected[0].decision,'ignored');assert.equal(view.decisions.length,1);
+      await cdp.evaluate('(()=>{const next=structuredClone(window.__review);delete next.error;window.__setReview(next);window.__deferDecisions=false;})()');await settle();
+      for(let i=0;i<ids.length;i++){await quickKey('Tab');await settle();}
+      view=await quickSnapshot();assert.equal(view.enabled,false);assert.equal(view.selected.length,0);assert.equal(view.modeMessages.at(-1).enabled,false);
+      assert.deepEqual(await cdp.evaluate('window.__review.files[0].hunks.map(h=>h.decision)'),['ignored','accepted','accepted','accepted']);assert.equal(view.decisions.length,5);
+    });
+    await runTest(label+': menus, explanations and direct editing suspend quick shortcuts',async()=>{
+      const next=await resetQuick(width,unified),id=next.files[0].hunks[0].id;await quickToggle(true);await clickMore(id);
+      assert.equal((await quickSnapshot()).menu,true);await quickKey('ArrowRight');await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,0);assert.equal((await quickSnapshot()).enabled,true);
+      if(!(await quickSnapshot()).menu)await clickMore(id);
+      await quickKey('Escape');let view=await quickSnapshot();assert.equal(view.menu,false);assert.equal(view.enabled,true);assert.equal(view.selected[0].id,id);
+      await clickWhy(id);assert.equal((await quickSnapshot()).why,true);await quickKey('ArrowRight');await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,0);
+      await quickKey('Escape');assert.equal((await quickSnapshot()).why,false);assert.equal((await quickSnapshot()).enabled,true);
+      await openEdit(id);assert.ok(await editSnapshot());await quickKey('ArrowRight');await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,0);
+      assert.ok(await editSnapshot(),'Tab remains an editor key');await editorKey('Escape');assert.equal(await editSnapshot(),null);assert.equal((await quickSnapshot()).enabled,true);
+      await quickKey('Escape');assert.equal((await quickSnapshot()).enabled,false);
+    });
+    await runTest(label+': visible activation, external changes, layout changes and reloads never approve implicitly',async()=>{
+      const next=await resetQuick(width,unified),ids=next.files[0].hunks.map(h=>h.id);
+      await cdp.evaluate('(()=>{const row=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(ids[2])+');row.scrollIntoView({block:"start"});})()');await settle();
+      const before=(await quickSnapshot()).scroll.top;await quickToggle(true);let view=await quickSnapshot();
+      assert.equal(view.selected[0].id,ids[2]);assert.ok(Math.abs(view.scroll.top-before)<=12,'Activation allows only the small focus visibility inset');
+      await toggleLayout();view=await quickSnapshot();assert.equal(view.enabled,true);assert.equal(view.selected[0].id,ids[2]);await toggleLayout();
+      if(!unified) {const selection=view.selected[0].decision;await splitKey('ArrowRight');assert.equal((await quickSnapshot()).selected[0].decision,selection,'Divider arrows retain their own function');}
+      await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.files[0].hunks=next.files[0].hunks.filter(h=>h.id!=='+JSON.stringify(ids[2])+');next.revision+="-external";window.__setReview(next);})()');await settle();
+      view=await quickSnapshot();assert.equal(view.decisions.length,0);assert.ok(!view.selected.some(item=>item.id===ids[2]));
+      await reloadPreview(next);view=await quickSnapshot();assert.equal(view.enabled,false);assert.equal(view.selected.length,0);assert.equal(view.decisions.length,0);
+      await quickToggle(true);await cdp.evaluate('window.__setReview({...structuredClone(window.__review),trusted:false})');await settle();
+      view=await quickSnapshot();assert.equal(view.enabled,false);assert.equal(view.disabled,true);assert.equal(view.decisions.length,0);
+    });
+    await runTest(label+': completion dialogs own Tab navigation and never submit a quick decision',async()=>{
+      await resetQuick(width,unified);await quickToggle(true);
+      const prompt={type:'completionPrompt',completionId:'quick-prompt',revision:'quick-fixture',requestName:'quick-review.tex.rr'};
+      await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify(prompt)+'}))');await settle();
+      assert.ok(await completionSnapshot());await quickKey('Tab');await quickKey('ArrowRight');assert.equal((await quickSnapshot()).decisions.length,0);
+      await quickKey('Escape');const response=await cdp.evaluate('window.__messages.filter(m=>m.type==="resolveCompletion").at(-1)');
+      assert.equal(response.deleteRequest,false);await completionAck(prompt,{success:true});await quickToggle(false);assert.equal((await quickSnapshot()).enabled,false);
+    });
+  }
+  await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+}
+
 async function runEditorButtonTests(width) {
   await runTest(width+'px: editing keeps Accept, Ignore and Why in the same button slots and text metrics',async()=>{
     for(const unified of [false,true])for(const direct of [false,true]) {
@@ -1060,7 +1405,7 @@ async function assertMatchingContextWraps() {
     }
   }
 }
-async function reloadPreview(stateOverride) {
+async function reloadPreview(stateOverride,messagesBeforeState=[]) {
   await cdp.evaluate('window.__reloadMarker=true');
   await cdp.send('Page.reload',{ignoreCache:true});
   const deadline=Date.now()+6000;
@@ -1068,6 +1413,7 @@ async function reloadPreview(stateOverride) {
     if(await cdp.evaluate("Boolean(!window.__reloadMarker&&window.__messages?.some(message=>message.type==='ready'))"))break;
     await delay(40);
   }
+  for(const message of messagesBeforeState)await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify(message)+'}))');
   await cdp.evaluate(stateOverride ? "window.__setReview("+JSON.stringify(stateOverride)+")" : "window.__setReview(structuredClone(window.__fixture))"); await settle();
 }
 async function runSplitterTests(width) {
@@ -1171,7 +1517,7 @@ async function runGroupedRequestTests(width) {
         inlineChanges:computeInlineChanges(preview, 40, fixture.files[0].path)};})}]};
     await cdp.evaluate('window.__setReview('+JSON.stringify(state)+')');await settle();
     const controls=id=>cdp.evaluate(`(() => {const block=Array.from(document.querySelectorAll('[data-overview-hunk]')).find(node=>node.dataset.overviewHunk===${JSON.stringify(id)});const why=block.querySelector('.why-toggle');return {accept:block.querySelectorAll('.button-accept').length,ignore:Array.from(block.querySelectorAll('button')).filter(button=>button.textContent==='Ignore').length,undo:Array.from(block.querySelectorAll('button')).filter(button=>button.textContent==='Undo').length,rows:block.querySelectorAll('.diff-row').length,height:block.getBoundingClientRect().height,why:why?{disabled:why.disabled,visibility:getComputedStyle(why).visibility,color:getComputedStyle(why).color,background:getComputedStyle(why).backgroundColor}:null};})()`);
-    for(const hunk of state.files[0].hunks){const buttons=await controls(hunk.id);assert.equal(buttons.accept,1);assert.equal(buttons.ignore,1);assert.ok(buttons.rows>=2,'A multiline group has several source rows but one decision pair');if(!hunk.explanation)assert.deepEqual(buttons.why,{disabled:true,visibility:'visible',color:'rgba(0, 0, 0, 0)',background:'rgba(0, 0, 0, 0)'},'Omitted and empty multiline reasons retain a fully transparent disabled Why button');}
+    for(const hunk of state.files[0].hunks){const buttons=await controls(hunk.id);assert.equal(buttons.accept,1);assert.equal(buttons.ignore,1);assert.ok(buttons.rows>=2,'A multiline group has several source rows but one decision pair');if(!hunk.explanation){assert.equal(buttons.why.disabled,false);assert.equal(buttons.why.visibility,'visible');assert.notEqual(buttons.why.color,'rgba(0, 0, 0, 0)');}}
     await assertTextProjection();assertAligned(await geometry());await assertMatchingContextWraps();
     const inserted=state.files[0].hunks.find(hunk=>resolved.entryIndexByHunkId[hunk.id]===1);
     const beforeEdit=await controls(inserted.id);
@@ -1392,8 +1738,9 @@ async function runCreateRequestTests() {
     const set=async fields=>{await cdp.evaluate('window.__setCreate('+JSON.stringify({type:'state',busy:false,selecting:false,...fields})+')');await settle();};
     const snapshot=()=>cdp.evaluate(`(() => {const ids=['select-original','select-proposed','create-request','cancel'];return {title:document.querySelector('h1').textContent,steps:document.querySelectorAll('.steps li').length,body:document.body.textContent,
       original:document.getElementById('original-path').textContent,proposed:document.getElementById('proposed-path').textContent,output:document.getElementById('output-path').textContent,
+      revision:document.getElementById('original-revision').textContent,revisionHidden:document.getElementById('original-revision').hidden,gitNoticeHidden:document.getElementById('git-notice').hidden,
       error:document.getElementById('error-message').textContent,errorHidden:document.getElementById('error-message').hidden,
-      buttons:Object.fromEntries(ids.map(id=>{const button=document.getElementById(id),r=button.getBoundingClientRect();return[id,{disabled:button.disabled,label:button.textContent,x:r.x,right:r.right,height:r.height}];})),
+      buttons:Object.fromEntries(ids.map(id=>{const button=document.getElementById(id),r=button.getBoundingClientRect();return[id,{disabled:button.disabled,label:button.textContent,x:r.x,right:r.right,height:r.height,background:getComputedStyle(button).backgroundColor}];})),
       width:innerWidth,scrollWidth:document.documentElement.scrollWidth,injected:document.querySelectorAll('.path-display img,.path-display svg,.error img').length,xss:window.__xss,messages:window.__createMessages};})()`);
     const click=async id=>{const point=await cdp.evaluate(`(() => {const button=document.getElementById(${JSON.stringify(id)});button.scrollIntoView({block:'nearest'});const r=button.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await settle();};
     const selected={original:'C:/workspace/'+('long folder/').repeat(8)+'original <img src=x onerror="window.__xss=99">.tex',proposed:'C:/copies/modified & revised.tex',output:'C:/workspace/original.tex.rr'};
@@ -1407,6 +1754,23 @@ async function runCreateRequestTests() {
       for(const button of Object.values(view.buttons)){assert.ok(button.x>=0&&button.right<=width);assert.ok(button.height>=30);}
       await set({original:'C:/workspace/manuscript.tex',proposed:'C:/copies/manuscript-revised.tex',output:'C:/workspace/manuscript.tex.rr'});
       await cdp.evaluate('window.scrollTo(0,0)');await settle();await screenshot('create-request-'+width+'-ready');
+    });
+    await runTest(width+'px: blue file selectors and Git baseline details retain layout and escaped text',async()=>{
+      await set(selected);
+      let view=await snapshot();
+      for(const id of ['select-original','select-proposed']) {
+        assert.ok(['rgb(14, 99, 156)','rgb(17, 119, 187)'].includes(view.buttons[id].background),'File selectors use the primary blue theme color');
+      }
+      assert.equal(view.revisionHidden,true);assert.equal(view.gitNoticeHidden,true);
+      const revision='a1b2c3d4 · 2026-11-12 · '+('Long commit description ').repeat(8)+'<img src=x onerror="window.__xss=97">';
+      await set({...selected,proposed:selected.original,originalMode:'git',originalRevision:revision});
+      view=await snapshot();assert.equal(view.revision,revision);assert.equal(view.revisionHidden,false);assert.equal(view.gitNoticeHidden,false);
+      assert.equal(view.proposed,selected.original);assert.equal(view.buttons['create-request'].disabled,false);
+      assert.equal(view.xss,0);assert.ok(view.scrollWidth<=width,'Long commit descriptions wrap within the creation form');
+      assert.equal(await cdp.evaluate('document.querySelectorAll("#original-revision img").length'),0);
+      await set({original:'C:/workspace/manuscript.tex',proposed:'C:/workspace/manuscript.tex',output:'C:/workspace/manuscript.tex.rr',originalMode:'git',originalRevision:'a1b2c3d4 · 2026-11-12 · Clarify the estimate'});
+      await cdp.evaluate('window.scrollTo(0,0)');await settle();await screenshot('create-request-'+width+'-git');
+      await set(selected);view=await snapshot();assert.equal(view.revisionHidden,true);assert.equal(view.gitNoticeHidden,true);
     });
     await runTest(width+'px: selecting and creating block duplicate commands while inline errors keep the form reusable',async()=>{
       for(const field of ['selecting','busy']) {
@@ -1508,6 +1872,7 @@ async function runLayoutTests() {
     await runEditorTests(width);
     await runMulticursorTests(width);
     await runEditorButtonTests(width);
+    await runReviewActionTests(width);
     await runEditorDecisionTests(width);
     await runGroupedRequestTests(width);
     await runUnterminatedAppendTests(width);
@@ -1604,7 +1969,7 @@ async function runLayoutTests() {
       }))()`);
       assert.equal(controls.obsolete, 0, 'No separate hunk heading or banner explanation remains'); assert.equal(controls.rows.length, 4);
       for (const row of controls.rows) {
-        assert.equal(row.first, true); assert.deepEqual(row.labels, ['Accept', 'Ignore', 'Why']);
+        assert.equal(row.first, true); assert.deepEqual(row.labels, ['Accept', 'Ignore', '⋯']);
         assert.ok(row.actionY >= row.y - 0.6 && row.actionY + row.actionHeight <= row.y + row.height + 0.6, 'Controls fit within their source row');
         assert.ok(row.gap >= 0 && row.gap <= 12, 'Controls sit at the far right of the proposed pane');
         assert.ok(row.sourceEnd <= row.actionStart + 0.6, 'Source text wraps before controls');
@@ -1627,7 +1992,7 @@ async function runLayoutTests() {
       assert.deepEqual(actual.message, { type: 'openTarget', filePath: fixture.files[0].path });
     });
     await runTest(width + 'px: hostile request strings render literally without injected elements', async () => {
-      const actual = await cdp.evaluate(`({ xss: window.__xss, injected: document.querySelectorAll('#app img, #app svg, #app script').length,
+      const actual = await cdp.evaluate(`({ xss: window.__xss, injected: Array.from(document.querySelectorAll('#app img, #app svg, #app script')).filter(node=>!node.matches('.quick-review-toggle > svg.quick-review-icon')).length,
         titleElements: document.querySelectorAll('.request-title').length, titleVisible: document.getElementById('app').textContent.includes(window.__fixture.title),
         descriptionVisible: document.getElementById('app').textContent.includes(window.__fixture.description),
         code: document.querySelector('.code-side.left .code-text').textContent })`);
@@ -1662,20 +2027,16 @@ async function runLayoutTests() {
       });
     }
     await cdp.evaluate('window.__setReview({ ...window.__review, unchangedOpacity: 20 })'); await settle();
-    await runTest(width + 'px: Why keeps a transparent disabled button for blank or missing explanations', async () => {
-      const states = await cdp.evaluate(`Array.from(document.querySelectorAll('.why-toggle'), button => ({
-        id: button.dataset.whyId, disabled: button.disabled, visibility:getComputedStyle(button).visibility, color:getComputedStyle(button).color, background:getComputedStyle(button).backgroundColor, pointerEvents:getComputedStyle(button).pointerEvents, hidden:button.getAttribute('aria-hidden'), width:button.getBoundingClientRect().width, title: button.title
-      }))`);
-      assert.equal(states.length, 4);
-      for (const state of states) {
-        const enabled = state.id === 'grow' || state.id === 'insert';
-        assert.equal(state.disabled, !enabled);
-        assert.ok(state.width>0,'Unavailable Why retains the reserved action slot');
-        assert.equal(state.visibility,'visible','The button remains in the layout');
-        if(!enabled){assert.equal(state.color,'rgba(0, 0, 0, 0)');assert.equal(state.background,'rgba(0, 0, 0, 0)');assert.equal(state.pointerEvents,'none');assert.equal(state.hidden,'true');}
+    await runTest(width + 'px: More actions remains visible with disabled Why for missing reasons', async () => {
+      const originalTop=(await viewportSnapshot()).top;
+      for (const id of ['delete','shrink']) {
+        await cdp.evaluate('document.querySelector("[data-why-id='+id+']").scrollIntoView({block:"nearest"})');await settle();
+        const before=await geometry(); await clickMore(id);
+        const menu=await cdp.evaluate('(() => {const toggle=document.querySelector("[data-why-id='+id+']"),why=document.querySelector(".review-action-why"); return {text:toggle.textContent,disabled:toggle.disabled,width:toggle.getBoundingClientRect().width,whyDisabled:why.disabled,title:why.title};})()');
+        assert.equal(menu.text,'⋯');assert.equal(menu.disabled,false);assert.ok(menu.width>0);assert.equal(menu.whyDisabled,true);assert.equal(menu.title,'No explanation provided');
+        await assertNoLayoutShift(before);await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await settle();
       }
-      await cdp.evaluate('document.querySelector("[data-why-id=delete]").click(); document.querySelector("[data-why-id=shrink]").click()');
-      assert.equal(await cdp.evaluate('Boolean(document.querySelector(".why-popover"))'), false);
+      await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop='+originalTop);await settle();
     });
     await runTest(width + 'px: Why popover renders safe text without moving comparison rows', async () => {
       const before = await geometry(); await clickWhy('grow'); await assertNoLayoutShift(before);
@@ -1759,7 +2120,7 @@ async function runLayoutTests() {
         await assertViewportPreserved(priorScroll);
         await assertTextProjection();
         const restored = await inspectHunkActions(action.id);
-        assert.deepEqual(restored.buttons, ['Accept', 'Ignore', 'Why']);
+        assert.deepEqual(restored.buttons, ['Accept', 'Ignore', '⋯']);
         assert.equal(restored.changedSpans, pendingActions.changedSpans, 'Undo restores the original character highlights');
         assert.ok(restored.changedSpans > 0);
         assert.equal(await cdp.evaluate('document.activeElement.dataset.focusKey'), fixture.files[0].path + ':' + action.id + ':accept', 'Undo restores focus to pending Accept');
@@ -1848,11 +2209,20 @@ async function main() {
   await startBrowser(executable, url);
   if (process.env.RR_UI_TEST_GROUP === 'highlight') {
     for (const width of [1200, 620]) {await runLanguageHighlightTests(width);await runProgrammingHighlightTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'actions') {
+    for (const width of [1200,620]) await runReviewActionTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'navigation') {
+    for (const width of [1200,620]) {await runOpenNavigationTests(width);await runNavigationTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'quick') {
+    for (const width of [1200,620]) await runQuickReviewTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'create') {
+    await runCreateRequestTests();
   } else if (process.env.RR_UI_TEST_GROUP === 'multicursor') {
     for (const width of [1600, 620]) {await runMulticursorTests(width);await runEditorDecisionTests(width);}
   } else {
     await runDefaultLayoutTests();
     await runLayoutTests();
+    for (const width of [1200,620]) {await runQuickReviewTests(width);await runOpenNavigationTests(width);}
     await runCreateRequestTests();
   }
   assert.equal(cdp.exceptions.length, 0, 'Production JavaScript must not throw browser exceptions');

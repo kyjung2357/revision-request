@@ -10,7 +10,7 @@ Each `.rr` file contains a revision request for one existing UTF-8 text file (fo
 ![Revision Request demo](media/intro.gif)
 <!-- demo:end -->
 
-## Installation 
+## Installation
 
 - Search for `revision request` in the Extensions view in VS Code.
 - Download via [marketplace](https://marketplace.visualstudio.com/items?itemName=kyjung2357.revision-request).
@@ -18,8 +18,8 @@ Each `.rr` file contains a revision request for one existing UTF-8 text file (fo
 ## Review a revision request
 
 1. Open the project folder containing the original file in VS Code, and place the `.rr` request inside that workspace.
-2. Open the `.rr` file. Its preview opens automatically by default; if needed, right-click the request in Explorer and choose **Open Preview**.
-3. Compare the original and proposed text, then use **Accept** or **Ignore** for each change.
+2. Open the `.rr` file. By default, its preview opens automatically at the first pending change. Use **Open RR as JSON** to inspect the source, or **Open Preview** to return to the review. [Preview Mode](docs/SETTINGS.md) offers **Always** (default), **Once**, and **Manual**.
+3. Compare the removed and proposed text in the default unified view, or switch to side-by-side columns. Use **Accept** or **Ignore** for each change; ordinary decisions keep your scroll position.
 4. When finished, keep the `.rr` file to retain available Undo controls, or delete it. By default, **Accept all** and **Ignore all** ask whether to delete the request when they complete the review.
 
 Try the [example requests](examples/README.md) for replacements, added and deleted lines, an empty starting file, and clearing all content.
@@ -30,17 +30,18 @@ Accepting changes requires workspace trust. Unsaved or conflicting changes to th
 
 - **Accept**: Apply and save the selected change to the original file.
 - **Ignore**: Record the decision without changing the original.
+- **Quick Review**: Use the button above **Accept all / Ignore all**, or the sidebar lightning icon. Either Left or Right arrow switches between Accept and Ignore; Tab applies the choice and moves to the next pending change. Escape exits. See [keyboard review](docs/REVIEW_ACTIONS.md#quick-review).
 - **Accept all / Ignore all**: Decide all remaining pending changes in the request.
 - **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and the original still matches the recorded changes.
-- **Why**: Show the change's explanation in a popover. Without an explanation, the button stays disabled and its text blends into the background.
-- **ORIGINAL**: Click the filename beneath this label to open the editable original file.
+- **Change menu (⋯)**: Open **Why**, **Comment out changed lines**, **Mark removed text in red**, or **Mark added text in blue**. Missing explanations disable Why; unsupported actions show why they are unavailable. Transformations edit the pending draft only. **Accept** saves it to the original, and Escape discards the draft. See [language actions](docs/REVIEW_ACTIONS.md).
+- **File link**: Click the filename beneath **FILE** (unified) or **ORIGINAL** (side-by-side) to open the editable target file.
 - **Toggle Comparison Layout**: Use the preview title-bar button to switch between side-by-side columns and a unified view with removed text followed by added text. Unified is the default; choose another default in Settings. The preview remembers your choice.
 - **Native diff**: Use this Explorer context-menu command on a `.rr` file to open VS Code's built-in comparison.
-- **Open RR as JSON**: Use this Explorer context-menu command to inspect the stored request without automatically opening its preview.
+- **Open RR as JSON**: Use the preview title-bar button or Explorer context menu to edit the stored request. This keeps the current JSON viewing session open in every preview mode.
 
 ## Create a request with an AI agent
 
-Ask your AI agent to create a `.rr` request without modifying the original. The [request format](docs/FORMAT.md) explains the JSON structure and includes examples for replacements, insertions, and deletions.
+Ask your AI agent to create a `.rr` request without modifying the original. Group consecutive changed lines when they form one reviewable change; an unchanged line between edits always separates them. Isolated single-line changes are valid. The [request format](docs/FORMAT.md) explains the JSON structure and replacements, insertions, and deletions.
 
 MCP lets the agent read the original, create requests, open previews, and check your review decisions through the extension. Open and trust your local workspace in VS Code with Revision Request enabled, then ask your agent:
 
@@ -52,15 +53,17 @@ For the desktop plugin with bundled skills and an MCP launcher, see [plugin setu
 
 ## Create a request from your own edits
 
-Use this workflow when you have edited a copy yourself and want someone else to review the changes.
+Use this workflow when you have made your own edits and want someone else to review them.
 
-1. Keep the original file, such as `paper/section.tex`, and make your edits in a separate copy, such as `paper/section.proposed.tex`.
-2. Open and trust the workspace containing the original in VS Code. Save both files.
-3. Run **Revision Request: Create Revision Request** from the Command Palette. The creation window explains the workflow and the two file roles.
-4. Use **Select original** and **Select modified copy**, check the selected paths, then click **Create Revision Request**. The extension creates `paper/section.tex.rr` beside the original and opens its preview. Both input files remain unchanged, and an existing request is never overwritten.
-5. Send the generated `.rr` file, with its changes still pending, to the reviewer.
+1. Open and trust the workspace containing the target file in VS Code. Save your files.
+2. Click **Create Revision Request** in the sidebar's **Create** section, or run **Revision Request: Create Revision Request** from the Command Palette. The **Requests** section below lists existing requests.
+3. Click **Select original**. Choose **Workspace file** for a saved original, or **Git commit** to select a file and one of its latest 100 commits at its current path on the current branch. Renamed paths are not followed. The commit picker shows the message, date, and short hash.
+4. Select the saved **Modified copy**. Git mode initially uses the current saved target file; you can choose a different copy.
+5. Click **Create Revision Request** to save `original.ext.rr` beside the target. Neither input is changed, and an existing request is never overwritten. Send the generated request, with its changes still pending, to the reviewer.
 
-The reviewer needs Revision Request and a copy of the original with the same contents at the request's workspace-relative `path`. If they already have that original, you only need to send the `.rr` file. An agent can also compare two saved workspace files through [`rr_create_request_from_files`](docs/MCP.md#create-a-request-from-two-saved-files).
+A request made from two saved files opens in the review preview. A Git-based request shows a creation message with **Open RR as JSON** instead: the current file may already contain the proposed changes. This workspace remembers the selected baseline and blocks reviewing it against a different starting file.
+
+The reviewer needs Revision Request and a copy of the original with the same contents at the request's workspace-relative `path`. For a Git-based request, that means the selected commit's file contents. If they already have that original, you only need to send the `.rr` file. Git selection reads committed content without switching commits, staging, or changing working files. An agent can also compare two saved workspace files through [`rr_create_request_from_files`](docs/MCP.md#create-a-request-from-two-saved-files).
 
 ### Using the repository CLI
 
@@ -72,17 +75,15 @@ npm run request -- --workspace . --original paper/section.tex --proposed paper/s
 
 This creates `paper/section.tex.rr` without changing either input. Optional `--output proposals/section.tex.rr` selects another existing folder inside the workspace; keep the filename `section.tex.rr`. Existing requests are never overwritten. Run `npm run request -- --help` for all options.
 
-Both creation methods preserve the original line endings and UTF-8 BOM. Changes that line entries cannot represent, such as line-ending-only or final-newline-only changes, are rejected.
+Saved-file and CLI comparisons preserve line endings and the UTF-8 BOM. Git comparisons ignore CRLF/LF differences introduced by checkout; the resulting request preserves the reviewer's file line endings. Changes that entries cannot represent, such as a final-newline-only change, are rejected.
 
-## Other functions 
+## Other functions
 
-- **Navigate changes**: The 15px scrollbar shows red/green markers for pending changes. Click a marker to jump to it, or drag the thumb to scroll. It sits between the columns in side-by-side view and at the right edge in unified view. Accept and Undo preserve your place.
+- **Navigate changes**: Opening or reopening a preview moves to its first pending change, or the top when none remain. The 15px scrollbar marks pending changes in red/green; click a marker to jump or drag the thumb to scroll. It sits between side-by-side columns or at the right edge in unified view. Accept, Ignore, Undo, and ordinary refreshes preserve your place; Quick Review advances after each decision.
 
 - **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 
-- **Edit proposal**: Click pending code to edit it directly in place. Alt+click adds cursors within that block for simultaneous typing, deletion, and pasting. **Accept** applies the current edited text immediately; no separate Save step is needed. Ctrl+Enter (also Cmd+Enter on macOS) does the same; change or disable it with `revisionRequest.acceptShortcut`. **Ignore** discards the draft and ignores the proposal. Escape cancels the draft; with multiple cursors, the first Escape returns to one cursor. Accepting text restored to the original removes that entry without changing the original. Undo resolved entries before editing them.
-
-
+- **Edit proposal**: Click pending code to edit it in place; Alt+click adds cursors within the block. **Accept** applies the edited text, and **Ignore** discards the draft and ignores the proposal. Ctrl+Enter (also Cmd+Enter on macOS) accepts; configure it with `revisionRequest.acceptShortcut`. Escape cancels the draft. See [editing and shortcuts](docs/REVIEW_ACTIONS.md).
 
 ## Settings
 

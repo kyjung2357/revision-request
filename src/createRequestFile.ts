@@ -1,6 +1,7 @@
 import { readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequestFromSnapshots } from './createRequest';
+import { readGitOriginal, validateGitOriginalTarget, type GitOriginal } from './gitOriginal';
 
 export interface CreateRequestFileOptions {
   workspace: string;
@@ -8,6 +9,7 @@ export interface CreateRequestFileOptions {
   proposed: string;
   output?: string;
   reason?: string;
+  gitOriginal?: GitOriginal;
   assertReady?: () => void | Promise<void>;
 }
 
@@ -71,13 +73,19 @@ export async function createRequestFile(options: CreateRequestFileOptions): Prom
   const [before, after] = await Promise.all([
     readSnapshot(original, 'Original file'), readSnapshot(proposed, 'Proposed file'),
   ]);
-  if (original === proposed || (before.info.dev === after.info.dev && before.info.ino === after.info.ino)) {
+  if (!options.gitOriginal && (original === proposed || (before.info.dev === after.info.dev && before.info.ino === after.info.ino))) {
     throw new Error('Proposed must be a separate modified copy, not the original file or a hard link to it.');
   }
-  if (before.bytes.equals(after.bytes)) {
-    throw new Error('The proposed file is identical to the original; there are no changes to review.');
+  const gitOriginal = options.gitOriginal ? await validateGitOriginalTarget(root, original, options.gitOriginal) : undefined;
+  // Git stores LF blobs even when a working tree uses CRLF. The request contains
+  // logical line fragments and preserves the recipient's existing line endings.
+  const beforeText = gitOriginal ? (await readGitOriginal(gitOriginal)).replace(/\r\n|\r/g, '\n') : before.text;
+  const afterText = gitOriginal ? after.text.replace(/\r\n|\r/g, '\n') : after.text;
+  if (beforeText === afterText) {
+    throw new Error(gitOriginal ? 'The proposed file is identical to the Git original; there are no content changes to review.'
+      : 'The proposed file is identical to the original; there are no changes to review.');
   }
-  const request = createRequestFromSnapshots(originalArg, before.text, after.text, { reason: options.reason });
+  const request = createRequestFromSnapshots(originalArg, beforeText, afterText, { reason: options.reason });
   const serialized = JSON.stringify(request, null, 2) + '\n';
 
   // Recheck editor state and the saved inputs before committing the request.
@@ -97,6 +105,7 @@ export async function createRequestFile(options: CreateRequestFileOptions): Prom
       throw new Error('An input file changed while preparing the request. Save both files and try again.');
     }
   }
+  if (gitOriginal) await validateGitOriginalTarget(root, original, gitOriginal);
   // Recheck cancellation, workspace trust, and editor state after the final reads.
   await options.assertReady?.();
   try {

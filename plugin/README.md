@@ -36,7 +36,7 @@ Adding this repository as a local marketplace does not publish it to the public 
    Get-Clipboard -Raw | node "<plugin-root>/scripts/configure.cjs" --stdin
    ```
 
-4. Reconnect the plugin's `revision_request` MCP server and keep the VS Code window open. Ask the agent to call `rr_list_requests` to verify live workspace access. An empty list is a successful check.
+4. Reconnect the plugin's `revision_request` MCP server and keep the VS Code window open. Call `rr_diagnose`, then `rr_get_format` to load the current guide. Call `rr_list_requests` from the agent to verify live workspace access. An empty list is a successful check.
 
 The helper saves the validated generated configuration in `~/.revision-request/mcp.json`. It preserves the extension's command, arguments, environment, and selected workspace. The launcher starts that adapter over stdio without a shell. It does not search for workspaces or guess extension paths.
 
@@ -68,7 +68,11 @@ For repository development, run `npm run sync:plugin` to regenerate release file
 
 > Use Revision Request to propose these changes and open the preview for my review.
 
-The authoring skill reads the exact target and hash, creates a pending request, opens its preview, and reports the request for review. It can later check `rr_get_request_status` to distinguish accepted, ignored, pending, stale, and unavailable results. A missing `.rr` file is not evidence of acceptance.
+The authoring skill reads the exact target and hash, creates a pending request, opens its preview, and reports the request for review. When a separately edited copy already exists, it can use `rr_create_request_from_files` to compare the two saved workspace files. Both workflows leave the source unchanged.
+
+Entries follow the changed lines: even one unchanged line between edits requires separate entries. Consecutive changed lines may share one decision; a wholly inserted or deleted block can stay together. Shared subject matter or an enclosing LaTeX environment does not justify including unchanged lines. Reasons are optional.
+
+After handing off the preview, use `rr_get_request_status` to check decisions without reopening the review or moving the user's viewport. Report the returned pending, accepted, and ignored counts and any stale or unavailable status. A missing `.rr` file is not evidence of acceptance.
 
 Accept, Ignore, and Undo belong to the user by default. Agent decision tools require explicit authorization and the VS Code User setting `revisionRequest.mcp.allowAgentDecisions` already enabled. Plugin setup leaves that setting unchanged.
 
@@ -76,6 +80,16 @@ If connection setup is needed, run the plugin's setup workflow. It uses the conf
 
 For direct `.rr` authoring without a live connection, the skill includes the same format guide and JSON schema shipped with the extension. Live previews and review-status checks still require VS Code.
 
-See the [MCP guide](https://github.com/kyjung2357/revision-request/blob/main/docs/MCP.md) and [format reference](https://github.com/kyjung2357/revision-request/blob/main/docs/FORMAT.md) for full extension details.
+## The user's review UI
+
+Opening or reopening a preview moves to the first pending change; a request with none starts at the top. Ordinary Accept, Ignore, Undo, and refreshes keep the review position. Automatic opening uses `revisionRequest.previewMode`: `always` by default, `once` for the first activation of each opened document, or `manual`. **Open RR as JSON** keeps the current source-editing session open, and closing a preview does not cause an immediate reopen loop. See [Settings](https://github.com/kyjung2357/revision-request/blob/main/docs/SETTINGS.md) for legacy-setting compatibility and other options.
+
+- **Quick Review** is a human keyboard workflow. Its button sits above **Accept all / Ignore all**, with another entry in the Requests sidebar. Left or Right switches Accept/Ignore, Tab confirms and advances, and Escape exits. It starts off; menus and code editing pause its review keys.
+- **⋯** contains **Why** and supported language actions. Missing reasons disable Why. Commenting or adding LaTeX red/blue review markup changes the pending draft; **Accept** applies it. **Set up LaTeX review macros…** reuses working imports, or copies the bundled macro file if needed and proposes its import for review. See [Review actions](https://github.com/kyjung2357/revision-request/blob/main/docs/REVIEW_ACTIONS.md).
+- **Create Revision Request** is available in the sidebar and Command Palette. Its **Select original → Git commit** option compares a committed file with a saved modified copy without checkout. The recipient must have the matching baseline at the request's path. Git selection is a VS Code UI feature; `rr_create_request_from_files` accepts saved workspace files, not a commit identifier.
+
+These UI features do not grant agents permission to make review decisions or bypass the default MCP restriction.
+
+See the [MCP guide](https://github.com/kyjung2357/revision-request/blob/main/docs/MCP.md) and [format reference](https://github.com/kyjung2357/revision-request/blob/main/docs/FORMAT.md) for tool arguments and JSON rules.
 
 MIT licensed; see [LICENSE](LICENSE).
