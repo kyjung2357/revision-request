@@ -42,7 +42,7 @@ async function main() {
   }
   // Keep the README GIF for both GitHub and the Marketplace.
   await fs.access(path.join(stage, 'media', 'intro.gif'));
-  for (const name of ['extension.js', 'mcp-server.cjs']) {
+  for (const name of ['extension.js', 'mcp-server.cjs', 'review-highlight.js']) {
     await fs.copyFile(path.join(root, '.codex-build', name), path.join(stage, 'dist', name));
   }
   await fs.copyFile(path.join(root, '.codex-build', 'THIRD_PARTY_NOTICES.txt'), path.join(stage, 'THIRD_PARTY_NOTICES.txt'));

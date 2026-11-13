@@ -12,6 +12,9 @@ async function buildAll() {
       outfile: path.join(root, '.codex-build/extension.js'), external: ['vscode'] }),
     build({ ...common, entryPoints: [path.join(root, 'src/mcpServer.ts')],
       outfile: path.join(root, '.codex-build/mcp-server.cjs'), loader: { '.md': 'text' } }),
+    build({ ...common, platform: 'browser', format: 'iife', globalName: 'RRHighlight',
+      entryPoints: [path.join(root, 'src/reviewHighlight.ts')],
+      outfile: path.join(root, '.codex-build/review-highlight.js') }),
   ]);
   await writeThirdPartyNotices({ root, outDir: path.join(root, '.codex-build'), metafiles: results.map(result => result.metafile) });
 }

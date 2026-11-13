@@ -154,7 +154,7 @@ Decision calls must use the current raw JSON revision returned by the server. Ac
 
 Automatic source opening offers **Always** (default), **Once**, and **Manual** modes. **Open RR as JSON** keeps the current JSON editing session open in every mode, and closing a preview does not immediately reopen it in a loop. Accept, Ignore, Undo, and ordinary refreshes retain the current position. See [Settings](SETTINGS.md).
 
-The user can edit pending text directly, review with **Quick Review**, or use **⋯** for explanations and supported language actions. LaTeX macro setup proposes an import for review before color actions become available. These are VS Code UI features, not additional MCP tools. See [review actions](REVIEW_ACTIONS.md).
+The user can edit pending text directly, review with **Quick Review**, or use **⋯** for **Show change explanation** and **Keep original as comments**. The latter preserves the original complete lines as comments before the active proposed text in a pending draft; only **Accept** writes it to the original. These are VS Code UI features, not additional MCP tools. See [review actions](REVIEW_ACTIONS.md).
 
 ## Built-in resources
 
@@ -167,7 +167,7 @@ These are bundled local instructions. They do not require a model service, API k
 
 ## Completion, deletion, and Undo
 
-Both `revisionRequest.autoDeleteCompleted` and `revisionRequest.skipCompletedDeleteConfirmation` default to **false**. When a user finishes the remaining entries with **Accept all** or **Ignore all**, the preview asks whether to delete the `.rr` file. **Yes** deletes only the request, using the system Recycle Bin/Trash when available; **No**, close, or Escape keeps it. “Remember my choice and don’t ask again” stores the chosen deletion policy and skips future prompts. When confirmation is skipped, `autoDeleteCompleted` determines whether completed requests are kept or deleted. MCP decisions do not open this interactive confirmation; they follow the automatic-deletion setting.
+Both `revisionRequest.autoDeleteCompleted` and `revisionRequest.skipCompletedDeleteConfirmation` default to **false**. When a user's **Accept** or **Ignore** finishes the last pending entry, the preview asks **Delete this .rr file?**. This includes individual decisions, edited proposals, Quick Review, and **Accept all / Ignore all**. **Yes** deletes only the request, using the system Recycle Bin/Trash when available; **No**, close, or Escape keeps it. “Remember my choice and don’t ask again” stores the chosen deletion policy and skips future prompts. When confirmation is skipped, `autoDeleteCompleted` determines whether completed requests are kept or deleted. MCP decisions do not open this interactive confirmation; they follow the automatic-deletion setting.
 
 A retained request with no pending entries shows **This revision request is closed.** In side-by-side view, the left shows the actual current file without change highlights, while the right keeps the recorded accepted/ignored results and badges. The selected comparison layout and available Undo controls remain usable.
 

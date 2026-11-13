@@ -20,7 +20,7 @@ Each `.rr` file contains a revision request for one existing UTF-8 text file (fo
 1. Open the project folder containing the original file in VS Code, and place the `.rr` request inside that workspace.
 2. Open the `.rr` file. By default, its preview opens automatically at the first pending change. Use **Open RR as JSON** to inspect the source, or **Open Preview** to return to the review. [Preview Mode](docs/SETTINGS.md) offers **Always** (default), **Once**, and **Manual**.
 3. Compare the removed and proposed text in the default unified view, or switch to side-by-side columns. Use **Accept** or **Ignore** for each change; ordinary decisions keep your scroll position.
-4. When finished, keep the `.rr` file to retain available Undo controls, or delete it. By default, **Accept all** and **Ignore all** ask whether to delete the request when they complete the review.
+4. When finished, keep the `.rr` file to retain available Undo controls, or delete it. By default, **Accept** or **Ignore** asks whether to delete the request when it completes the review, including individual decisions, edited proposals, Quick Review, and **Accept all / Ignore all**.
 
 Try the [example requests](examples/README.md) for replacements, added and deleted lines, an empty starting file, and clearing all content.
 
@@ -30,10 +30,10 @@ Accepting changes requires workspace trust. Unsaved or conflicting changes to th
 
 - **Accept**: Apply and save the selected change to the original file.
 - **Ignore**: Record the decision without changing the original.
-- **Quick Review**: Use the button above **Accept all / Ignore all**, or the sidebar lightning icon. Either Left or Right arrow switches between Accept and Ignore; Tab applies the choice and moves to the next pending change. Escape exits. See [keyboard review](docs/REVIEW_ACTIONS.md#quick-review).
+- **Quick Review**: Use the button in the preview action row, or the sidebar lightning icon. Either Left or Right arrow switches between Accept and Ignore; Tab applies the choice and moves to the next pending change. Escape exits. See [keyboard review](docs/REVIEW_ACTIONS.md#quick-review).
 - **Accept all / Ignore all**: Decide all remaining pending changes in the request.
 - **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and the original still matches the recorded changes.
-- **Change menu (⋯)**: Open **Why**, **Comment out changed lines**, **Mark removed text in red**, or **Mark added text in blue**. Missing explanations disable Why; unsupported actions show why they are unavailable. Transformations edit the pending draft only. **Accept** saves it to the original, and Escape discards the draft. See [language actions](docs/REVIEW_ACTIONS.md).
+- **Change menu (⋯)**: Open **Show change explanation** or **Keep original as comments**. The latter preserves the original complete lines as comments before the active proposed text. Unsupported contexts and pure insertions disable it. It edits the pending draft only; **Accept** saves it to the original. Escape discards the draft, and the editor undo shortcut reverses the transformation. See [language actions](docs/REVIEW_ACTIONS.md).
 - **File link**: Click the filename beneath **FILE** (unified) or **ORIGINAL** (side-by-side) to open the editable target file.
 - **Toggle Comparison Layout**: Use the preview title-bar button to switch between side-by-side columns and a unified view with removed text followed by added text. Unified is the default; choose another default in Settings. The preview remembers your choice.
 - **Native diff**: Use this Explorer context-menu command on a `.rr` file to open VS Code's built-in comparison.
@@ -83,7 +83,7 @@ Saved-file and CLI comparisons preserve line endings and the UTF-8 BOM. Git comp
 
 - **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 
-- **Edit proposal**: Click pending code to edit it in place; Alt+click adds cursors within the block. **Accept** applies the edited text, and **Ignore** discards the draft and ignores the proposal. Ctrl+Enter (also Cmd+Enter on macOS) accepts; configure it with `revisionRequest.acceptShortcut`. Escape cancels the draft. See [editing and shortcuts](docs/REVIEW_ACTIONS.md).
+- **Edit proposal**: Click pending code to edit it in place; Alt+click adds cursors within the block. Original and proposed highlights update as you type, using the same language-specific rules as the preview. **Accept** applies the edited text, and **Ignore** discards the draft and ignores the proposal. Ctrl+Enter (also Cmd+Enter on macOS) accepts; configure it with `revisionRequest.acceptShortcut`. Escape cancels the draft. See [editing and shortcuts](docs/REVIEW_ACTIONS.md).
 
 ## Settings
 
@@ -108,7 +108,7 @@ Press **F5** to launch an Extension Development Host. Test Accept against dispos
 
 Additional checks: `npm run test:extension`, `npm run test:mcp`, and `npm run test:ui` (Edge or Chrome required).
 
-Run `npm run package` to create a VSIX; its path is printed. Install it with **Extensions → Install from VSIX...**.
+Run `npm run package` to create a VSIX and a matching plugin ZIP; their paths are printed. Install the VSIX with **Extensions → Install from VSIX...**.
 
 Run `npm run test:plugin` for the plugin connection checks and `npm run package:plugin` to create its ZIP package. The repo marketplace in `.agents/plugins/marketplace.json` also supports local installation directly from `plugin/`.
 

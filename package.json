@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -108,10 +108,6 @@
       {
         "command": "revisionRequest.copyMcpConfiguration",
         "title": "Revision Request: Copy MCP Configuration"
-      },
-      {
-        "command": "revisionRequest.setupReviewMacros",
-        "title": "Revision Request: Set up LaTeX Review Macros"
       },
       {
         "command": "revisionRequest.toggleQuickReview",
@@ -293,13 +289,13 @@
         "revisionRequest.autoDeleteCompleted": {
           "type": "boolean",
           "default": false,
-          "description": "Delete completed .rr requests when no confirmation is shown. Turn off to keep them. Accept all and Ignore all ask first unless Skip Completed Delete Confirmation is enabled. Uses the system trash when available.",
+          "description": "Delete completed .rr requests when no confirmation is shown. Turn off to keep them. Completing the last pending change asks first unless Skip Completed Delete Confirmation is enabled. Uses the system trash when available.",
           "scope": "resource"
         },
         "revisionRequest.skipCompletedDeleteConfirmation": {
           "type": "boolean",
           "default": false,
-          "description": "Do not ask whether to delete the .rr file after Accept all or Ignore all. Use Auto Delete Completed to choose deletion or preservation. Turn off to ask again.",
+          "description": "Do not ask whether to delete the .rr file when the last pending change is accepted or ignored, individually or all at once. Use Auto Delete Completed to choose deletion or preservation. Turn off to ask again.",
           "scope": "resource"
         },
         "revisionRequest.highlightChangedLines": {
@@ -337,7 +333,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/reviewMacroSetup.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/reviewHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",

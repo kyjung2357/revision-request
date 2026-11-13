@@ -6,6 +6,7 @@ export function getReviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri,
   const nonce = randomBytes(24).toString('base64');
   const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'review.css'));
   const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'review.js'));
+  const highlightUri = webview.asWebviewUri(vscode.Uri.joinPath(vscode.Uri.file(__dirname), 'review-highlight.js'));
   const escapes: Record<string, string> = { '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
   const attr = (value: string): string => value.replace(/[&"<>]/g, character => escapes[character] ?? character);
 
@@ -26,6 +27,7 @@ export function getReviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri,
       <p>Your original files stay unchanged until you accept a revision.</p>
     </main>
   </div>
+  <script nonce="${nonce}" src="${attr(highlightUri.toString())}"></script>
   <script nonce="${nonce}" src="${attr(scriptUri.toString())}"></script>
 </body>
 </html>`;

@@ -146,7 +146,14 @@ test('restored Python panel rebinds the saved request and is reused without dupl
   assert.deepEqual(current.requests, [uri.toString()]);
   assert.equal(restored.title, 'inventory_report.py.rr — Preview');
   assert.equal(restored.webview.options.enableScripts, true);
-  assert.equal(restored.webview.options.localResourceRoots.length, 1);
+  assert.deepEqual(restored.webview.options.localResourceRoots.map(uri => uri.fsPath),
+    [path.resolve(__dirname, '../media'), path.resolve(__dirname, '../src')]);
+  const scripts = [...restored.webview.html.matchAll(/<script nonce="([^"]+)" src="([^"]+)"><\/script>/g)];
+  assert.equal(scripts.length, 2);
+  assert.equal(scripts[0][2], Uri.file(path.resolve(__dirname, '../src/review-highlight.js')).toString());
+  assert.equal(scripts[1][2], Uri.file(path.resolve(__dirname, '../media/review.js')).toString());
+  assert.equal(scripts[0][1], scripts[1][1]);
+  assert.ok(restored.webview.html.includes("script-src 'nonce-" + scripts[0][1] + "'"));
   assert.equal(editor.activeUri.toString(), uri.toString());
   assert.match(restored.webview.html, /data-request-uri="[^"]*inventory_report\.py\.rr"/);
   await editor.openPreview(uri); assert.equal(current.created.length, 0); assert.equal(restored.reveals, 1);
@@ -363,6 +370,7 @@ test('edited Accept routes one guarded action and acknowledges only its correlat
   const failed=panel.webview.messages.find(item=>item.type==='editResult');
   assert.equal(failed.success,false); assert.equal(failed.editId,'attempt-2');
   assert.match(failed.error,/Stale source/);
+  assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
 });
 
 test('Ignore while editing records the original decision without saving the draft', async t => {
@@ -383,6 +391,33 @@ test('Ignore while editing records the original decision without saving the draf
   await receive({...message,editId:'ignore-2'});
   const failed=panel.webview.messages.find(item=>item.type==='editResult');
   assert.equal(failed.success,false); assert.equal(failed.editId,'ignore-2'); assert.match(failed.error,/Request changed/);
+  assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
+});
+
+for (const action of ['editAndAccept', 'ignoreEdited']) test(`${action} acknowledges the edit and refreshes before its completion prompt`, async t => {
+  const {editor, uri, service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], acknowledged = deferred();
+  const completionPrompt = {completionId: 'last-' + action, revision: 'completed', requestName: 'inventory_report.py.rr'};
+  service.editAndAccept = async () => ({changed: true, revision: 'completed', completionPrompt});
+  service.decide = async () => ({completionPrompt});
+  service.getState = async () => ({type: 'state', revision: 'completed', files: []});
+  panel.webview.messages = [];
+  panel.webview.postMessage = async message => {
+    panel.webview.messages.push(message);
+    if (message.type === 'editResult') await acknowledged.promise;
+    return true;
+  };
+  const message = {type: action, filePath: 'inventory_report.py', hunkId: 'last', revision: 'before', editId: 'edit-last',
+    ...(action === 'editAndAccept' ? {draft: 'edited'} : {})};
+  const pending = receive(message); await tick();
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult']);
+  const result = panel.webview.messages[0];
+  assert.equal(result.success, true); assert.equal(result.editId, message.editId); assert.equal(result.revision, 'completed');
+  assert.equal(result.completionPrompt, undefined, 'Only the dedicated prompt message opens deletion confirmation');
+  acknowledged.resolve(); await pending;
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult', 'state', 'completionPrompt']);
+  assert.deepEqual(panel.webview.messages.at(-1), {type: 'completionPrompt', ...completionPrompt});
 });
 
 test('malformed edited decisions never reach the file service', async t => {
@@ -406,14 +441,14 @@ test('malformed edited decisions never reach the file service', async t => {
 test('menu draft transformation replies locally without refreshing or submitting a decision', async t => {
   const {editor, uri, service} = setup(t);
   const calls = [];
-  service.transformDraft = async (...args) => {calls.push(args); return {draft:'# edited',reviewActions:[]};};
-  service.reviewActions = async () => [{id:'comment',enabled:true,label:'Comment out changed lines'}];
+  service.transformDraft = async (...args) => {calls.push(args); return {draft:'# original\nedited',reviewActions:[]};};
+  service.reviewActions = async () => [{id:'comment',enabled:true,label:'Keep original as comments'}];
   await editor.openPreview(uri); await tick();
   const panel = current.created[0], refreshes = current.requests.length;
   panel.received.fire({type:'transformDraft',filePath:'sample.py',hunkId:'h1',draft:'edited',revision:'r1',action:'comment',editId:'transform-1'});
   await tick(); await tick();
   assert.equal(calls.length,1);
-  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-1',draft:'# edited',reviewActions:[]});
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-1',draft:'# original\nedited',reviewActions:[]});
   assert.equal(current.requests.length,refreshes);
   panel.received.fire({type:'reviewActions',filePath:'sample.py',hunkId:'h1',draft:'edited',revision:'r1',editId:'menu-1'});
   await tick();
@@ -422,14 +457,30 @@ test('menu draft transformation replies locally without refreshing or submitting
 });
 test('menu transformation failures keep a correlated draft error and reject unknown message keys', async t => {
   const {editor, uri, service} = setup(t);
-  service.transformDraft = async () => {throw Error('Unsafe TeX fragment');};
+  service.transformDraft = async () => {throw Error('Unsupported comment context');};
   await editor.openPreview(uri); await tick();
   const panel = current.created[0], refreshes = current.requests.length;
-  const message = {type:'transformDraft',filePath:'sample.tex',hunkId:'h1',draft:'edited',revision:'r1',action:'markAdded',editId:'transform-2'};
+  const message = {type:'transformDraft',filePath:'sample.tex',hunkId:'h1',draft:'edited',revision:'r1',action:'comment',editId:'transform-2'};
   panel.received.fire(message); await tick();
-  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-2',error:'Unsafe TeX fragment'});
+  assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:'transform-2',error:'Unsupported comment context'});
   panel.received.fire({...message,override:true}); await tick();
   assert.match(panel.webview.messages.at(-1).error,/Invalid/);
+  assert.equal(current.requests.length,refreshes);
+});
+
+test('removed color actions and macro setup messages cannot reach file operations', async t => {
+  const {editor,uri,service} = setup(t);
+  const forbidden = async () => assert.fail('Removed actions must not reach the service');
+  service.transformDraft = service.setupMacros = service.editAndAccept = service.decide = forbidden;
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], refreshes = current.requests.length;
+  for (const action of ['markAdded','markRemoved','invented']) {
+    await receive({type:'transformDraft',filePath:'sample.tex',hunkId:'h1',draft:'new',revision:'r1',action,editId:action});
+    assert.deepEqual(panel.webview.messages.at(-1),{type:'transformResult',editId:action,error:'Unknown proposal action.'});
+  }
+  const messages = panel.webview.messages.length;
+  await receive({type:'setupReviewMacros',filePath:'sample.tex'});
+  assert.equal(panel.webview.messages.length,messages);
   assert.equal(current.requests.length,refreshes);
 });
 
@@ -507,7 +558,8 @@ test('quick decisions acknowledge only the correlated completed operation and re
   const {editor,uri,service} = setup(t);
   await editor.openPreview(uri); await tick();
   const panel = current.created[0], receive = [...panel.received.listeners][0], gate = deferred(), calls = [];
-  service.decide = async (...args) => {calls.push(args); await gate.promise;};
+  const completionPrompt = {completionId:'quick-complete',revision:'completed'};
+  service.decide = async (...args) => {calls.push(args); await gate.promise; return {completionPrompt};};
   panel.webview.messages = [];
   const message = {type:'decide',filePath:'inventory_report.py',hunkId:'pending-1',decision:'accepted',revision:'before',quickDecisionId:'quick-1'};
   const pending = receive(message); await tick();
@@ -517,6 +569,8 @@ test('quick decisions acknowledge only the correlated completed operation and re
   assert.deepEqual(panel.webview.messages.find(item=>item.type==='quickDecisionResult'),{
     type:'quickDecisionResult',quickDecisionId:'quick-1',filePath:message.filePath,hunkId:message.hunkId,decision:'accepted',success:true,error:undefined
   });
+  assert.deepEqual(panel.webview.messages.map(item=>item.type), ['quickDecisionResult','state','completionPrompt']);
+  assert.deepEqual(panel.webview.messages.at(-1), {type:'completionPrompt',...completionPrompt});
   service.decide = async () => {throw Error('The request changed. Review it again.');};
   panel.webview.messages = [];
   await receive({...message,quickDecisionId:'quick-2',decision:'ignored'});
@@ -524,6 +578,7 @@ test('quick decisions acknowledge only the correlated completed operation and re
   assert.equal(failed.success,false); assert.equal(failed.quickDecisionId,'quick-2'); assert.equal(failed.decision,'ignored');
   assert.match(failed.error,/request changed/);
   assert.match(panel.webview.messages.find(item=>item.type==='state').error,/request changed/);
+  assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
 });
 test('malformed quick decisions cannot reach the review service', async t => {
   const {editor,uri,service} = setup(t);

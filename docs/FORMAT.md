@@ -35,7 +35,7 @@ Each `.rr` file describes revisions to one existing UTF-8 text file. Name it by 
 - `line`: required, **1-based first line in the original file when the request was created**. Accepting other entries does not change this number.
 - `before`: exact text to replace, or `null` to insert. It begins in the specified original line and may span consecutive lines separated by LF (`\n` in JSON). It must match uniquely, including spaces and tabs. The first and last lines may be fragments; intervening lines must be complete. Unmatched text before and after the block is preserved.
 - `after`: replacement text or an LF-separated block, preserving unchanged text within the affected lines of `before`, or `null` to delete the complete original block.
-- `reason`: optional explanation shown by **Why** in the entry's **⋯** menu. Omit it or use `""` when an explanation is unnecessary; Why is then disabled. The menu remains available for other supported actions.
+- `reason`: optional explanation shown by **Show change explanation** in the entry's **⋯** menu. Omit it or use `""` when an explanation is unnecessary; this item is then disabled. The popover heading is **Why**. The menu remains available for other supported actions.
 - `status`: required; exactly `pending`, `ignored`, or `accepted`. Creation tools always write `pending`.
 
 LF (`\n`) separates logical lines inside `before` and `after`; CR (`\r`) is rejected, including CRLF. Use LF in the request even when the saved file uses CRLF. The extension preserves saved line endings and the BOM separately. A non-null `before` with N LF separators consumes N + 1 consecutive original lines.

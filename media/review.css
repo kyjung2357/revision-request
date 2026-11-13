@@ -35,6 +35,9 @@ h1, h2, h3, p { margin: 0; }
 .pane-banner { min-width: 0; padding: 12px 14px; }
 .pane-banner.right { padding-left: 0; padding-right: 0; }
 .pane-banner.right > .eyebrow { margin-left: 14px; margin-right: 14px; }
+.review-app:not(.layout-unified) .pane-banner.right { display: flex; flex-direction: column; }
+.review-app:not(.layout-unified) .summary-row { margin-top: auto; }
+.pane-banner.left > .summary { flex: 0 0 auto; margin-top: 9px; padding-left: 0; }
 .left { border-right: 1px solid var(--rr-border); }
 .eyebrow { font-size: 9px; font-weight: 700; letter-spacing: .1em; color: var(--rr-muted); margin-bottom: 4px; }
 .pane-filename, .request-title { font-size: 15px; line-height: 1.4; font-weight: 600; overflow-wrap: anywhere; }
@@ -42,8 +45,8 @@ h1, h2, h3, p { margin: 0; }
 .filename-link { display: inline; max-width: 100%; padding: 0; border: 0; background: none; color: var(--vscode-textLink-foreground, #3794ff); font: inherit; text-align: left; white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
 .filename-link:hover { color: var(--vscode-textLink-activeForeground, #3794ff); text-decoration: underline; }
 .original-description { font-size: 11px; color: var(--rr-muted); margin-top: 7px; }
-.summary-row { display: grid; grid-template-columns: minmax(0, 1fr) var(--rr-action-gutter); align-items: center; width: 100%; margin-top: 9px; }
-.summary { min-width: 0; gap: 3px; flex-wrap: nowrap; padding-left: 14px; white-space: nowrap; }
+.summary-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; width: 100%; margin-top: 9px; }
+.summary { flex: 1 0 auto; min-width: 0; gap: 5px; flex-wrap: nowrap; padding-left: 14px; white-space: nowrap; }
 .summary .badge { height: 24px; padding: 0 3px; font-size: 11px; line-height: 22px; }
 .badge { display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 4px; line-height: 1.5; font-size: 10px; white-space: nowrap; font-weight: 550; }
 .badge.pending { color: var(--rr-orange); background: color-mix(in srgb, var(--rr-orange) 12%, transparent); }
@@ -115,7 +118,7 @@ h1, h2, h3, p { margin: 0; }
   .pane-banner { padding: 10px; }
   .pane-banner.right { padding-left: 0; padding-right: 0; }
   .pane-banner.right > .eyebrow { margin-left: 10px; margin-right: 10px; }
-  .summary { padding-left: 10px; gap: 2px; }
+  .summary { padding-left: 10px; gap: 4px; }
   .summary .badge { font-size: 9px; padding: 0 2px; }
   .file-actions { gap: 3px; }
   .code-side { grid-template-columns: 34px 18px var(--rr-code-width, minmax(0, 1fr)) minmax(0, 1fr); }
@@ -205,25 +208,30 @@ h1, h2, h3, p { margin: 0; }
   }
 }
 
+/* Draw the ellipsis at the button center, independent of font glyph metrics. */
+.review-menu-toggle { position: relative; font-size: 0; }
+.review-menu-toggle::before { content: ""; position: absolute; top: 50%; left: 50%; width: 2px; height: 2px; transform: translate(-50%, -50%); border-radius: 50%; background: currentColor; box-shadow: -4px 0 currentColor, 4px 0 currentColor; pointer-events: none; }
+
 /* The floating actions menu never participates in source-row layout. */
-.review-menu-toggle { font-size: 18px; line-height: 1; }
 .review-action-menu { position: fixed; z-index: 110; box-sizing: border-box; overflow-y: auto; padding: 4px; border: 1px solid var(--vscode-menu-border, var(--rr-border)); border-radius: 5px; background: var(--vscode-menu-background, var(--rr-panel)); color: var(--vscode-menu-foreground, var(--rr-fg)); box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0,0,0,.3)); }
 .review-menu-item { display: block; width: 100%; border: 0; border-radius: 3px; margin: 0; padding: 7px 9px; text-align: left; color: inherit; background: transparent; font: inherit; font-size: 12px; line-height: 1.4; white-space: normal; overflow-wrap: anywhere; cursor: pointer; }
 .review-menu-item:hover:not(:disabled), .review-menu-item:focus-visible { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground, #37373d)); outline: 1px solid var(--vscode-menu-selectionBorder, transparent); outline-offset: -1px; }
 .review-menu-item:disabled { color: var(--vscode-disabledForeground, var(--rr-muted)); cursor: default; }
 .review-menu-label, .review-menu-reason { display: block; }
 .review-menu-reason { font-size: 10px; margin-top: 2px; }
-.review-menu-setup { border-top: 1px solid var(--rr-border); border-radius: 0; margin-top: 4px; padding-top: 10px; }
 
 
-/* Quick Review shares the action gutter; counts stay on the bulk-action row. */
-.file-action-stack { display: flex; flex-direction: column; min-width: 0; gap: 5px; }
-.summary-row > .summary { align-self: end; }
-.quick-review-toggle { --rr-quick-yellow: #f2d64b; --rr-quick-dark: #3a3215; color: var(--rr-quick-yellow); background: var(--rr-quick-dark); border-color: var(--rr-quick-yellow); display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 24px; margin: 0 5px 0 14px; padding: 0 4px; font-size: 11px; line-height: 22px; }
+/* Keep the action buttons together; narrow panes wrap the counts above them. */
+.file-action-group { display: grid; grid-template-columns: auto var(--rr-action-gutter); align-items: center; flex: 0 0 auto; margin-left: auto; }
+.review-app:not(.layout-unified) .file-action-group { width: 100%; grid-template-columns: minmax(0, 1fr) var(--rr-action-gutter); padding-left: 14px; }
+.quick-review-toggle { --rr-quick-yellow: #f2d64b; --rr-quick-dark: #3a3215; color: var(--rr-quick-yellow); background: var(--rr-quick-dark); border-color: transparent; display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 24px; margin: 0; padding: 0 7px; font-size: 11px; line-height: 22px; justify-self: start; }
 .quick-review-icon { width: 16px; height: 16px; flex: 0 0 16px; color: currentColor; fill: currentColor; stroke: none; stroke-linecap: round; stroke-linejoin: round; }
 .quick-review-toggle:hover:not(:disabled) { color: var(--rr-quick-yellow); background: #4b411d; }
 .quick-review-toggle.is-active { color: var(--rr-quick-dark); background: var(--rr-quick-yellow); border-color: var(--rr-quick-dark); }
 .quick-review-toggle.is-active:hover:not(:disabled) { color: var(--rr-quick-dark); background: #ffe575; }
 .quick-review-toggle:disabled { opacity: .45; }
 .inline-actions .quick-review-selected { outline: 2px solid var(--vscode-editorWarning-foreground, #cca700); outline-offset: 1px; }
-@media (max-width: 650px) { .quick-review-toggle { font-size: 10px; gap: 3px; } }
+@media (max-width: 650px) {
+  .quick-review-toggle { font-size: 10px; gap: 3px; }
+  .review-app:not(.layout-unified) .file-action-group { padding-left: 10px; }
+}

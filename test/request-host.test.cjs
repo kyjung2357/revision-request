@@ -217,13 +217,102 @@ test('manual deletion clears an interrupted journal without rolling back the alr
 test('automatic deletion clears caches even when its post-delete receipt update fails', async () => {
   const item = await fixture(); const created = service(); let state = await ready(created.api, item);
   created.api.setCompletionRecorder(async (_uri, cleanup) => {if (cleanup === 'deleted') throw new Error('Injected receipt failure');});
-  settings.set('autoDeleteCompleted', true);
+  settings.set('autoDeleteCompleted', true); settings.set('skipCompletedDeleteConfirmation', true);
   try {
     await created.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'ignored', state.revision);
     state = await ready(created.api, item);
     await created.api.decide(item.request, item.relative, state.files[0].hunks[1].id, 'ignored', state.revision);
     await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
     assert.deepEqual(created.state.workspaceState.keys(), []); assert.equal(await read(item.target), item.before);
+  } finally {settings.set('autoDeleteCompleted', false); settings.set('skipCompletedDeleteConfirmation', false);}
+});
+
+for (const decision of ['accepted', 'ignored']) for (const deleteRequest of [false, true]) for (const rememberChoice of [false, true]) {
+  test(`final individual ${decision} confirms ${deleteRequest ? 'deletion' : 'retention'} with remember=${rememberChoice}`, async () => {
+    const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+    const {api} = service(), receipts = [];
+    api.setCompletionRecorder(async (_uri, cleanup) => {receipts.push(cleanup);});
+    settings.set('autoDeleteCompleted', true);
+    try {
+      const state = await ready(api, item);
+      const result = await api.decide(item.request, item.relative, state.files[0].hunks[0].id, decision, state.revision);
+      const prompt = result.completionPrompt, completed = await ready(api, item);
+      assert.ok(prompt.completionId); assert.equal(prompt.revision, completed.revision);
+      assert.equal(prompt.requestName, path.basename(item.request.fsPath));
+      assert.deepEqual(await statuses(item), [decision]); assert.deepEqual(receipts, ['retained']);
+      const expected = decision === 'accepted' ? 'new\n' : 'old\n';
+      assert.equal(await read(item.target), expected);
+      const writes = sourceWrites.length;
+      assert.deepEqual(await api.resolveCompletion(item.request, prompt.completionId, prompt.revision, deleteRequest, rememberChoice), {deleted: deleteRequest});
+      if (deleteRequest) await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+      else assert.deepEqual(await statuses(item), [decision]);
+      assert.equal(await read(item.target), expected); assert.equal(sourceWrites.length, writes);
+      assert.deepEqual(receipts, deleteRequest ? ['retained', 'deleted'] : ['retained']);
+      assert.equal(settings.get('skipCompletedDeleteConfirmation'), rememberChoice);
+      assert.equal(settings.get('autoDeleteCompleted'), rememberChoice ? deleteRequest : true);
+    } finally {settings.set('autoDeleteCompleted', false); settings.set('skipCompletedDeleteConfirmation', false);}
+  });
+}
+
+test('individual completion waits for the last pending entry and Undo invalidates its prompt without prompting', async () => {
+  const item = await fixture(), {api} = service(), receipts = [];
+  api.setCompletionRecorder(async (_uri, cleanup) => {receipts.push(cleanup);});
+  let state = await ready(api, item);
+  assert.equal(await api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision), undefined);
+  assert.deepEqual(receipts, []);
+  state = await ready(api, item);
+  const {completionPrompt: first} = await api.decide(item.request, item.relative, state.files[0].hunks[1].id, 'ignored', state.revision);
+  state = await ready(api, item); await ready(api, item);
+  assert.deepEqual(receipts, ['retained'], 'Reopening a completed request must not start completion again');
+  assert.equal(await api.undo(item.request, item.relative, state.files[0].hunks[1].id, state.revision), undefined);
+  await assert.rejects(api.resolveCompletion(item.request, first.completionId, first.revision, true, false), /no longer current|pending|changed/);
+  state = await ready(api, item);
+  const {completionPrompt: second} = await api.decide(item.request, item.relative, state.files[0].hunks[1].id, 'accepted', state.revision);
+  assert.notEqual(second.completionId, first.completionId);
+  await api.resolveCompletion(item.request, second.completionId, second.revision, false, false);
+  assert.deepEqual(await statuses(item), ['accepted', 'accepted']);
+});
+
+for (const action of ['decide', 'editAndAccept']) for (const autoDelete of [false, true]) {
+  test(`${action} final action respects skipped confirmation and autoDelete=${autoDelete}`, async () => {
+    const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+    const {api} = service(), state = await ready(api, item);
+    settings.set('skipCompletedDeleteConfirmation', true); settings.set('autoDeleteCompleted', autoDelete);
+    try {
+      const result = action === 'decide'
+        ? await api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision)
+        : await api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'edited', state.revision);
+      assert.equal(result?.completionPrompt, undefined);
+      if (autoDelete) await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+      else assert.deepEqual(await statuses(item), ['accepted']);
+      assert.equal(await read(item.target), action === 'decide' ? 'new\n' : 'edited\n');
+    } finally {settings.set('autoDeleteCompleted', false); settings.set('skipCompletedDeleteConfirmation', false);}
+  });
+}
+
+for (const autoDelete of [false, true]) test(`agent final decisions do not prompt and retain autoDelete=${autoDelete}`, async () => {
+  const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+  const {api} = service(), state = await ready(api, item);
+  settings.set('autoDeleteCompleted', autoDelete); settings.set('mcp.allowAgentDecisions', true);
+  try {
+    assert.equal(await api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision, 'agent'), undefined);
+    if (autoDelete) await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+    else assert.deepEqual(await statuses(item), ['accepted']);
+    assert.equal(await read(item.target), 'new\n');
+  } finally {settings.set('autoDeleteCompleted', false); settings.delete('mcp.allowAgentDecisions');}
+});
+
+for (const action of ['decide', 'editAndAccept']) test(`${action} completion record failure keeps the request without a prompt or deletion`, async () => {
+  const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+  const {api} = service(), state = await ready(api, item);
+  api.setCompletionRecorder(async () => {throw Error('Injected receipt failure');});
+  settings.set('autoDeleteCompleted', true);
+  try {
+    const result = action === 'decide'
+      ? await api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision)
+      : await api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'edited', state.revision);
+    assert.equal(result?.completionPrompt, undefined); assert.deepEqual(await statuses(item), ['accepted']);
+    assert.equal(await read(item.target), action === 'decide' ? 'new\n' : 'edited\n');
   } finally {settings.set('autoDeleteCompleted', false);}
 });
 
@@ -470,6 +559,7 @@ test('editAndAccept commits an unchanged draft directly as accepted with no inte
   const state = await ready(api, item), count = sourceWrites.length;
   const result = await api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'ONE', state.revision);
   assert.equal(result.changed, true); assert.notEqual(result.revision, state.revision);
+  assert.equal(result.completionPrompt, undefined, 'A remaining pending entry must not prompt');
   assert.equal(await read(item.target), 'ONE\ncontext\nthree\n');
   assert.deepEqual(await statuses(item), ['accepted', 'pending']);
   assert.equal(records.length, 1); assert.equal(records[0].request[0].status, 'accepted');
@@ -502,8 +592,13 @@ test('editAndAccept removes a draft restored to the original without accepting t
   const single = await ready(created.api, solo);
   settings.set('autoDeleteCompleted', true);
   try {
-    await created.api.editAndAccept(solo.request, solo.relative, single.files[0].hunks[0].id, 'old', single.revision);
+    const result = await created.api.editAndAccept(solo.request, solo.relative, single.files[0].hunks[0].id, 'old', single.revision);
     assert.deepEqual(await statuses(solo), []); assert.equal(await read(solo.target), 'old\n');
+    assert.ok(result.completionPrompt, 'Accept removing the final pending entry still confirms deletion');
+    const prompt = result.completionPrompt;
+    await created.api.resolveCompletion(solo.request, prompt.completionId, prompt.revision, true, false);
+    await assert.rejects(fs.stat(solo.request.fsPath), {code: 'ENOENT'});
+    assert.equal(await read(solo.target), 'old\n');
   } finally {settings.set('autoDeleteCompleted', false);}
 });
 
@@ -548,7 +643,7 @@ test('editAndAccept RR failure retains the combined draft and decision journal f
   assert.equal(JSON.parse(await read(item.request)).request[0].after, 'EDITED\nSECOND');
 });
 
-test('editAndAccept final completion uses individual cleanup and records the edited accepted proposal', async () => {
+test('editAndAccept final completion confirms deletion after recording the edited accepted proposal', async () => {
   const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
   const created = service(), receipts = [];
   created.api.setCompletionRecorder(async (_uri, cleanup) => {receipts.push(cleanup);});
@@ -556,10 +651,26 @@ test('editAndAccept final completion uses individual cleanup and records the edi
   settings.set('autoDeleteCompleted', true);
   try {
     const result = await created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'edited', state.revision);
-    assert.equal(result.completionPrompt, undefined); assert.equal(result.changed, true);
-    assert.equal(await read(item.target), 'edited\n'); await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+    assert.ok(result.completionPrompt); assert.equal(result.changed, true);
+    assert.equal(await read(item.target), 'edited\n'); assert.deepEqual(await statuses(item), ['accepted']);
+    assert.equal((await ready(created.api, item)).files[0].hunks[0].after, 'edited\n');
+    assert.deepEqual(receipts, ['retained']);
+    const prompt = result.completionPrompt; assert.equal(prompt.revision, result.revision);
+    await created.api.resolveCompletion(item.request, prompt.completionId, prompt.revision, true, false);
+    await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
     assert.deepEqual(receipts, ['retained', 'deleted']); assert.deepEqual(created.state.workspaceState.keys(), []);
   } finally {settings.set('autoDeleteCompleted', false);}
+});
+
+test('opening an empty request or editing away its final entry does not start completion', async () => {
+  const empty = await fixture('old\n', []), {api} = service(), receipts = [];
+  api.setCompletionRecorder(async (_uri, cleanup) => {receipts.push(cleanup);});
+  await ready(api, empty);
+  const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+  const state = await ready(api, item);
+  const result = await api.editPending(item.request, item.relative, state.files[0].hunks[0].id, 'old', state.revision);
+  assert.equal(result.completionPrompt, undefined); assert.deepEqual(await statuses(item), []);
+  await ready(api, item); assert.deepEqual(receipts, []); assert.equal(await read(item.target), 'old\n');
 });
 
 test('review state validates and refreshes the configurable edit acceptance shortcut', async () => {
@@ -671,109 +782,123 @@ test('Git creation baselines block duplicate additions and survive restart, CRLF
   }
 });
 
-test('review menu transforms a Python draft without saving and Accept is the only source write', async () => {
+test('review menu keeps original Python lines as comments and writes only on Accept', async () => {
   const item = await fixture('value = 1\n', [{line:1,before:'1',after:'2',status:'pending'}], true, 'py');
-  const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const {api,state:contextState} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
   const originalRequest = await read(item.request), writeCount = sourceWrites.length;
-  const capabilities = await api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision);
-  assert.equal(capabilities.find(item => item.id === 'comment').enabled,true);
-  assert.equal(capabilities.find(item => item.id === 'markAdded').enabled,false);
-  const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment');
-  assert.equal(result.draft,'# value = 2');
+  const capabilities = await api.reviewActions(item.request,item.relative,hunk.id,'value = 2 + 3',state.revision);
+  assert.deepEqual(capabilities,[{id:'comment',label:'Keep original as comments',enabled:true}]);
+  const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2 + 3',state.revision,'comment');
+  assert.equal(result.draft,'# value = 1\nvalue = 2 + 3');
   assert.equal(await read(item.request),originalRequest);
   assert.equal(await read(item.target),item.before); assert.equal(sourceWrites.length,writeCount);
   await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
-  assert.equal(await read(item.target),'# value = 2\n');
+  assert.equal(await read(item.target),'# value = 1\nvalue = 2 + 3\n');
   assert.deepEqual(await statuses(item),['accepted']);
+  const reopened = service(contextState).api, accepted = await ready(reopened,item);
+  await reopened.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
+  assert.equal(await read(item.target),item.before);
+  assert.deepEqual(await statuses(item),['pending']);
 });
-test('review menu refuses stale, resolved, unsupported and untrusted operations without writes', async () => {
+
+test('review menu refuses stale, resolved, dirty, untrusted and removed operations without writes', async () => {
   const item = await fixture('value = 1\n', [{line:1,before:'1',after:'2',status:'pending'}], true, 'py');
   const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0], raw = await read(item.request);
+  const writeCount = sourceWrites.length;
   await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2','stale','comment'),/request changed/i);
-  await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'markAdded'),/LaTeX|support|available/i);
-  await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'invented'),/Unknown/);
+  for (const action of ['markAdded','markRemoved','invented']) {
+    await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,action),/Unknown proposal action/);
+  }
+  const targetDocument = await vscode.workspace.openTextDocument(item.target);
+  targetDocument.isDirty = true;
+  try { await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment'),/unsaved edits/); }
+  finally {targetDocument.isDirty = false;}
+  const requestDocument = await vscode.workspace.openTextDocument(item.request);
+  requestDocument.isDirty = true;
+  try { await assert.rejects(api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision),/Save the .rr request/); }
+  finally {requestDocument.isDirty = false;}
   vscode.workspace.isTrusted = false;
-  try { await assert.rejects(api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision),/Trust/); }
-  finally {vscode.workspace.isTrusted = true;}
+  try {
+    await assert.rejects(api.reviewActions(item.request,item.relative,hunk.id,'value = 2',state.revision),/Trust/);
+    await assert.rejects(api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment'),/Trust/);
+  } finally {vscode.workspace.isTrusted = true;}
   assert.equal(await read(item.request),raw); assert.equal(await read(item.target),item.before);
+  assert.equal(sourceWrites.length,writeCount);
   await api.decide(item.request,item.relative,hunk.id,'ignored',state.revision);
   const ignored = await ready(api,item);
   await assert.rejects(api.reviewActions(item.request,item.relative,ignored.files[0].hunks[0].id,'value = 2',ignored.revision),/pending/);
 });
-test('TeX review colors require loaded macros and setup queues a separate pending import', async () => {
-  const original = '\\documentclass{article}\n% packages\n\\begin{document}\nThe value is old.\n\\end{document}\n';
-  const item = await fixture(original,[{line:4,before:'old',after:'new',status:'pending'}],true,'tex');
-  const {api} = service(); let state = await ready(api,item), hunk = state.files[0].hunks[0];
-  let actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
-  assert.equal(actions.find(action => action.id === 'markAdded').enabled,false);
-  const macro = await fs.readFile(path.join(root,'media','review-macro.tex'),'utf8');
-  await fs.writeFile(path.join(path.dirname(item.target.fsPath),'review-macro.tex'),macro);
-  await api.queueMacroImport(item.request,{rootUri:item.target,original,line:3,text:'\\input{review-macro.tex}'});
-  assert.equal(await read(item.target),original,'Setup cannot modify the original');
-  let request = JSON.parse(await read(item.request));
-  assert.deepEqual(request.request.map(entry => entry.status),['pending','pending']);
-  assert.equal(request.request[1].line,3);
-  state = await ready(api,item);
-  const imported = state.files[0].hunks.find(part => part.draftAfter === '\\input{review-macro.tex}');
-  assert.ok(imported);
-  await api.decide(item.request,item.relative,imported.id,'accepted',state.revision);
-  state = await ready(api,item); hunk = state.files[0].hunks.find(part => part.decision === 'pending');
-  actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
-  assert.equal(actions.find(action => action.id === 'markAdded').enabled,true,JSON.stringify(actions));
-  const marked = await api.transformDraft(item.request,item.relative,hunk.id,'The value is new.',state.revision,'markAdded');
-  assert.match(marked.draft,/\\reviewadd\{new\}/);
-  assert.match(await read(item.target),/The value is old\./);
-});
-test('macro import maps accepted line insertions back to the immutable request baseline', async () => {
-  const original = '\\documentclass{article}\n% packages\n\\begin{document}\nold\n\\end{document}\n';
-  const item = await fixture(original,[{line:2,before:null,after:'% first\n% second',status:'pending'},{line:4,before:'old',after:'new',status:'pending'}],true,'tex');
-  const {api} = service(); let state = await ready(api,item);
-  await api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision);
-  const current = await read(item.target);
-  await api.queueMacroImport(item.request,{rootUri:item.target,original:current,line:5,text:'\\input{review-macro.tex}'});
-  const request = JSON.parse(await read(item.request));
-  assert.equal(request.request.at(-1).line,3); assert.equal(await read(item.target),current);
-  assert.deepEqual(request.request.map(entry => entry.status),['accepted','pending','pending']);
-  await ready(api,item);
-  await assert.rejects(api.queueMacroImport(item.request,{rootUri:item.target,original,line:3,text:'\\input{review-macro.tex}'}),/changed/i);
+
+test('TeX math lines keep their original labels in comments and proposed lines active without setup', async () => {
+  const oldLines = '  x &= 1, \\\\\n  y &= 2.\\label{eq:old}';
+  const proposed = '  x &= 3, \\\\\n  y &= 4.\\label{eq:new}';
+  const original = '\\begin{align}\n' + oldLines + '\n\\end{align}\n';
+  const item = await fixture(original,[{line:2,before:oldLines,after:proposed,status:'pending'}],true,'tex');
+  const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const raw = await read(item.request), files = await fs.readdir(path.dirname(item.target.fsPath));
+  const result = await api.transformDraft(item.request,item.relative,hunk.id,proposed,state.revision,'comment');
+  const commented = '  % x &= 1, \\\\\n  % y &= 2.\\label{eq:old}';
+  assert.equal(result.draft,commented + '\n' + proposed);
+  assert.equal(await read(item.request),raw); assert.equal(await read(item.target),original);
+  assert.deepEqual(await fs.readdir(path.dirname(item.target.fsPath)),files,'The menu creates no macro or import files');
+  await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+  assert.equal(await read(item.target),'\\begin{align}\n' + commented + '\n' + proposed + '\n\\end{align}\n');
+  const accepted = await ready(api,item);
+  await api.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
+  assert.equal(await read(item.target),original);
 });
 
-test('fragment setup creates a new root import request without changing either source', async () => {
-  const item = await fixture('old\n',[{line:1,before:'old',after:'new',status:'pending'}],true,'tex');
-  const {api} = service(); await ready(api,item);
-  const rootUri = Uri.file(path.join(path.dirname(item.target.fsPath),'main.tex'));
-  const original = '\\documentclass{article}\n\\begin{document}\n\\input{source.tex}\n\\end{document}\n';
-  await fs.writeFile(rootUri.fsPath,original);
-  const output = await api.queueMacroImport(item.request,{rootUri,original,line:2,text:'\\input{review-macro.tex}'});
-  assert.equal(output.fsPath,rootUri.fsPath+'.rr');
-  assert.equal(await read(rootUri),original); assert.equal(await read(item.target),item.before);
-  const generated = JSON.parse(await read(output));
-  assert.equal(generated.request[0].status,'pending'); assert.equal(generated.request[0].line,2);
-  const state = await api.getState(output);
-  assert.equal(state.verified,true,state.error); assert.equal(state.files[0].hunks.length,1);
+test('comment availability distinguishes inserted content from an existing blank line', async () => {
+  const inserted = await fixture('tail\n',[{line:1,before:null,after:'value = 2',status:'pending'}],true,'py');
+  const {api} = service(); let state = await ready(api,inserted), hunk = state.files[0].hunks[0];
+  const actions = await api.reviewActions(inserted.request,inserted.relative,hunk.id,'value = 2',state.revision);
+  assert.equal(actions.length,1); assert.equal(actions[0].enabled,false);
+  await assert.rejects(api.transformDraft(inserted.request,inserted.relative,hunk.id,'value = 2',state.revision,'comment'),/original/i);
+  const blank = await fixture('\ntail\n',[{line:1,before:'',after:'value = 2',status:'pending'}],true,'py');
+  state = await ready(api,blank); hunk = state.files[0].hunks[0];
+  const transformed = await api.transformDraft(blank.request,blank.relative,hunk.id,'value = 2',state.revision,'comment');
+  assert.equal(transformed.draft,'#\nvalue = 2');
+  assert.equal(await read(inserted.target),inserted.before); assert.equal(await read(blank.target),blank.before);
 });
 
-test('menu actions remember an explicitly selected root for a fragment with existing macros', async () => {
-  const item = await fixture('The value is old.\n',[{line:1,before:'old',after:'new',status:'pending'}],true,'tex');
-  const {api,state:contextState} = service(); const state = await ready(api,item), hunk = state.files[0].hunks[0];
-  const rootUri = Uri.file(path.join(path.dirname(item.target.fsPath),'main.tex'));
-  await fs.writeFile(rootUri.fsPath,'\\documentclass{article}\n\\input{review-macro.tex}\n\\begin{document}\n\\input{source.tex}\n\\end{document}\n');
-  await fs.copyFile(path.join(root,'media','review-macro.tex'),path.join(path.dirname(item.target.fsPath),'review-macro.tex'));
-  const open = vscode.window.showOpenDialog, information = vscode.window.showInformationMessage;
-  vscode.window.showOpenDialog = async () => [rootUri];
-  vscode.window.showInformationMessage = async () => undefined;
-  try { await api.setupMacros(item.request,item.relative,Uri.file(root)); }
-  finally {vscode.window.showOpenDialog = open; vscode.window.showInformationMessage = information;}
-  assert.equal(contextState.workspaceState.get('revisionRequest.macroRoot.'+item.target.toString()),rootUri.toString());
-  const actions = await api.reviewActions(item.request,item.relative,hunk.id,'The value is new.',state.revision);
-  assert.equal(actions.find(action => action.id === 'markAdded').enabled,true,JSON.stringify(actions));
+test('deletion retains the original full line as a comment and can be undone exactly', async () => {
+  const item = await fixture('value = 1\ntail\n',[{line:1,before:'value = 1',after:null,status:'pending'}],true,'py');
+  const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+  const result = await api.transformDraft(item.request,item.relative,hunk.id,'',state.revision,'comment');
+  assert.equal(result.draft,'# value = 1'); assert.equal(await read(item.target),item.before);
+  await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+  assert.equal(await read(item.target),'# value = 1\ntail\n');
+  const accepted = await ready(api,item);
+  await api.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
   assert.equal(await read(item.target),item.before);
 });
-test('first-line comment draft preserves UTF-8 BOM when accepted', async () => {
-  const item = await fixture('\uFEFFvalue = 1\n',[{line:1,before:'1',after:'2',status:'pending'}],true,'py');
-  const {api} = service(); const state = await ready(api,item), hunk = state.files[0].hunks[0];
-  const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment');
-  assert.equal(result.draft,'# value = 2'); assert.equal(await read(item.target),item.before);
-  await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
-  assert.equal(await read(item.target),'\uFEFF# value = 2\n');
+
+test('an empty replacement draft keeps its active blank line after the original comments', async () => {
+  for (const after of ['', 'value = 2']) {
+    const item = await fixture('value = 1\ntail\n',[{line:1,before:'value = 1',after,status:'pending'}],true,'py');
+    const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+    const raw = await read(item.request);
+    const result = await api.transformDraft(item.request,item.relative,hunk.id,'',state.revision,'comment');
+    assert.equal(result.draft,'# value = 1\n');
+    assert.equal(await read(item.request),raw); assert.equal(await read(item.target),item.before);
+    await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+    assert.equal(await read(item.target),'# value = 1\n\ntail\n');
+    const accepted = await ready(api,item);
+    await api.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
+    assert.equal(await read(item.target),item.before);
+  }
+});
+
+test('original comments preserve UTF-8 BOM, line endings and final-newline state through Accept and Undo', async () => {
+  for (const ending of ['\n','\r\n','']) {
+    const item = await fixture('\uFEFFvalue = 1' + ending,[{line:1,before:'1',after:'2',status:'pending'}],true,'py');
+    const {api} = service(), state = await ready(api,item), hunk = state.files[0].hunks[0];
+    const result = await api.transformDraft(item.request,item.relative,hunk.id,'value = 2',state.revision,'comment');
+    assert.equal(result.draft,'# value = 1\nvalue = 2'); assert.equal(await read(item.target),item.before);
+    await api.editAndAccept(item.request,item.relative,hunk.id,result.draft,state.revision);
+    assert.equal(await read(item.target),'\uFEFF# value = 1' + (ending || '\n') + 'value = 2' + ending);
+    const accepted = await ready(api,item);
+    await api.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
+    assert.equal(await read(item.target),item.before);
+  }
 });

@@ -818,7 +818,7 @@ export async function run(): Promise<void> {
       await config.update('defaultLayout', previousLayout, vscode.ConfigurationTarget.Workspace);
     }
   });
-  await check('Automatic deletion defaults off, and opting in preserves partial requests but removes final accepted requests', async () => {
+  await check('Individual acceptance keeps partial requests and asks before deleting the final completed request', async () => {
     const config = vscode.workspace.getConfiguration('revisionRequest');
     assert.equal(config.inspect<boolean>('autoDeleteCompleted')?.defaultValue, false);
     const previous = config.inspect<boolean>('autoDeleteCompleted')?.workspaceValue;
@@ -842,11 +842,15 @@ export async function run(): Promise<void> {
       const state = await ready(item);
       const hunks = state.files[0]!.hunks;
       assert.equal(hunks.length, 2);
-      await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', await latestRevision(item.request));
+      const partial = await api.decide(item.request, item.relative, hunks[0]!.id, 'accepted', await latestRevision(item.request));
+      assert.equal(partial?.completionPrompt, undefined, 'A partial review does not ask to delete.');
       assert.equal((await fs.stat(item.request.fsPath)).isFile(), true, 'A partially reviewed request must remain.');
       assert.deepEqual(await bytes(item.target), Buffer.from('FIRST\nmiddle\nlast\n'));
       const readyBeforeFinal = api.getReadyCount();
-      await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', await latestRevision(item.request));
+      const completion = (await api.decide(item.request, item.relative, hunks[1]!.id, 'accepted', await latestRevision(item.request)))?.completionPrompt;
+      assert.ok(completion, 'The final individual Accept asks before cleanup.');
+      assert.equal((await fs.stat(item.request.fsPath)).isFile(), true, 'Keep the completed request until the user chooses.');
+      await api.resolveCompletion(item.request, completion.completionId, completion.revision, true, false);
       await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
       assert.deepEqual(await bytes(item.target), Buffer.from(item.after));
       const closedDeadline = Date.now() + 5000;
@@ -882,8 +886,8 @@ export async function run(): Promise<void> {
       await api.decide(item.request, item.relative, state.files[0]!.hunks[0]!.id, 'ignored', await latestRevision(item.request));
       assert.equal((await fs.stat(item.request.fsPath)).isFile(), true);
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));
-      const completion = (await api.decide(item.request, item.relative, undefined, 'ignored', await latestRevision(item.request)))?.completionPrompt;
-      assert.ok(completion, 'Ignore all asks even when automatic cleanup is enabled.');
+      const completion = (await api.decide(item.request, item.relative, state.files[0]!.hunks[1]!.id, 'ignored', await latestRevision(item.request)))?.completionPrompt;
+      assert.ok(completion, 'The final individual Ignore asks even when automatic cleanup is enabled.');
       await api.resolveCompletion(item.request, completion.completionId, completion.revision, true, false);
       await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
       assert.deepEqual(await bytes(item.target), Buffer.from(item.before));

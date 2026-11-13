@@ -15,6 +15,8 @@
     ? { ...savedEdit, saving: false, editId: null } : null;
   let editSequence = 0;
   let editHistory = { undo: [], redo: [] };
+  let editorHighlightCache = null;
+  const paintedEditorSources = new WeakMap();
   let focusAfterEdit = null;
   let completion = null;
   let splitRatio = typeof restored.splitRatio === 'number' && Number.isFinite(restored.splitRatio) ? Math.max(0.05, Math.min(0.95, restored.splitRatio)) : 0.5;
@@ -223,6 +225,19 @@
     if (lines[lines.length - 1] === '') lines.pop();
     return lines;
   }
+  function appendInlineText(code, content, inlineChanges) {
+    const valid = Array.isArray(inlineChanges)
+      && inlineChanges.every(segment => segment && typeof segment.text === 'string' && typeof segment.changed === 'boolean')
+      && inlineChanges.map(segment => segment.text).join('') === content;
+    const segments = valid ? inlineChanges : [{ text: content, changed: true }];
+    for (const segment of segments) {
+      const span = element('span', segment.changed ? 'inline-changed' : 'inline-common');
+      // Keep glyph painting independent of the highlight's fractional padding.
+      if (segment.changed) span.append(element('span', 'inline-glyph', segment.text));
+      else span.textContent = segment.text;
+      code.append(span);
+    }
+  }
   function codeSide(side, kind, lineNumber, content, inlineChanges) {
     const cell = element('div', 'code-side ' + side + ' ' + kind);
     if (lineNumber !== null) cell.dataset.line = String(lineNumber);
@@ -233,17 +248,7 @@
     const source = element('span', 'code-source');
     const code = element('span', 'code-text');
     if (kind === 'added' || kind === 'removed') {
-      const valid = Array.isArray(inlineChanges)
-        && inlineChanges.every(segment => segment && typeof segment.text === 'string' && typeof segment.changed === 'boolean')
-        && inlineChanges.map(segment => segment.text).join('') === content;
-      const segments = valid ? inlineChanges : [{ text: content, changed: true }];
-      for (const segment of segments) {
-        const span = element('span', segment.changed ? 'inline-changed' : 'inline-common');
-        // Keep glyph painting independent of the highlight's fractional padding.
-        if (segment.changed) span.append(element('span', 'inline-glyph', segment.text));
-        else span.textContent = segment.text;
-        code.append(span);
-      }
+      appendInlineText(code, content, inlineChanges);
       if (!content) code.append(document.createTextNode('\u200b'));
     } else code.textContent = content || '\u200b';
     source.append(code);
@@ -484,7 +489,7 @@
     const range = document.createRange(); let offset = 0, first = false, last;
     while (walker.nextNode()) {
       const node = walker.currentNode, length = node.textContent.length; last = node;
-      if (!first && start <= offset+length) {range.setStart(node,Math.max(0,start-offset)); first = true;}
+      if (!first && start < offset+length) {range.setStart(node,Math.max(0,start-offset)); first = true;}
       if (first && end <= offset+length) {range.setEnd(node,Math.max(0,end-offset)); return range;}
       offset += length;
     }
@@ -646,16 +651,77 @@
     });
     return textarea;
   }
+  function editorHighlightInput() {
+    // Reconstruct the same visible lexical context used by the saved preview.
+    // Keep it for this editing session; caret movement never rescans the file.
+    const file = state?.revision === editing.revision && state.files.find(item => item.path === editing.filePath);
+    if (!file) return null;
+    const left = [], right = [];
+    let offset = 0;
+    for (const hunk of [...file.hunks].sort((a, b) => a.start - b.start || a.index - b.index)) {
+      const unchanged = file.before.slice(offset, hunk.start);
+      left.push(unchanged); right.push(unchanged);
+      if (hunk.id === editing.hunkId) return {
+        path: editing.filePath, before: editing.original,
+        beforePrefix: left.join(''), afterPrefix: right.join('')
+      };
+      const after = hunk.displayAfter === undefined ? hunk.after : '\n' + hunk.after;
+      const decision = decisionOf(hunk);
+      left.push(decision === 'accepted' ? after : hunk.before);
+      right.push(decision === 'ignored' ? hunk.before : after);
+      offset = hunk.end;
+    }
+    return null;
+  }
+  function editorInlineChanges(value) {
+    if (editorHighlightCache?.edit !== editing) {
+      editorHighlightCache = {edit: editing, input: editorHighlightInput(), value: null, rows: null};
+    }
+    const cache = editorHighlightCache;
+    if (cache.value !== value) {
+      cache.value = value; cache.rows = null;
+      if (cache.input && typeof globalThis.RRHighlight?.compute === 'function') {
+        try {
+          cache.rows = globalThis.RRHighlight.compute({...cache.input, draft: value,
+            hasProposed: editing.hadProposedLine !== false || value.length > 0});
+        } catch { /* Keep an exact, fully highlighted mirror if comparison is unavailable. */ }
+      }
+    }
+    return cache.rows;
+  }
+  function paintEditorHighlights(textarea, mirror) {
+    const value = textarea.value, rows = editorInlineChanges(value);
+    const previous = paintedEditorSources.get(mirror);
+    if (previous?.edit === editing && previous.value === value && previous.rows === rows) return;
+    const contents = document.createDocumentFragment();
+    value.split('\n').forEach((line, index) => {
+      if (index) contents.append(document.createTextNode('\n'));
+      appendInlineText(contents, line, rows?.[index]?.after);
+    });
+    // Only one trailing sentinel: hit testing and extra cursors count this text.
+    if (!value || /\n$/.test(value)) contents.append(document.createTextNode('\u200b'));
+    mirror.replaceChildren(contents);
+    textarea.dataset.mirrorValue = value;
+    // Unified direct editors keep the old rows as siblings of the input row.
+    const block = textarea.closest('.hunk') || textarea.closest('.pending-editor-fallback');
+    const originals = sourceLines(editing.original || '');
+    block?.querySelectorAll('.code-side.left.removed .code-text').forEach((code, index) => {
+      const text = originals[index];
+      if (text === undefined) return;
+      const original = document.createDocumentFragment();
+      appendInlineText(original, text, rows?.[index]?.before);
+      if (!text) original.append(document.createTextNode('\u200b'));
+      code.replaceChildren(original);
+    });
+    paintedEditorSources.set(mirror, {edit: editing, value, rows});
+  }
   function sizeEditor() {
     const textarea = root.querySelector('.pending-editor textarea');
     if (!textarea) return;
     // The ordinary code surface determines height; the input adds no box or row.
     const mirror = textarea.parentElement.querySelector('.code-text');
     if (!mirror) return;
-    if (textarea.dataset.mirrorValue !== textarea.value) {
-      mirror.textContent = textarea.value + (!textarea.value || /\n$/.test(textarea.value) ? '\u200b' : '');
-      textarea.dataset.mirrorValue = textarea.value;
-    }
+    paintEditorHighlights(textarea, mirror);
     const cell = textarea.closest('.code-side');
     const hasProposed = editing?.hadProposedLine !== false || textarea.value.length > 0;
     cell.classList.toggle('added', hasProposed); cell.classList.toggle('empty', !hasProposed);
@@ -971,9 +1037,7 @@
   }
 
   const fallbackActions = [
-    {id:'comment',label:'Comment out changed lines'},
-    {id:'markRemoved',label:'Mark removed text in red'},
-    {id:'markAdded',label:'Mark added text in blue'}
+    {id:'comment',label:'Keep original as comments'}
   ];
   function actionMenuAnchor() { return openMenu ? whyAnchor(openMenu.hunkId) : null; }
   function closeActionMenu(focusAnchor = false) {
@@ -1017,10 +1081,10 @@
     const menu = element('section','review-action-menu');
     menu.id = 'rr-actions'; menu.setAttribute('role','menu'); menu.setAttribute('aria-label','Change actions');
     const hasReason = typeof hunk.explanation === 'string' && Boolean(hunk.explanation.trim());
-    const why = button('Why','review-menu-item review-action-why',() => {
+    const why = button('Show change explanation','review-menu-item review-action-why',() => {
       const id = hunk.id; closeActionMenu(); openWhy = id; saveViewState(); render();
       root.querySelector('.why-popover')?.focus({preventScroll:true});
-    },{disabled:!hasReason,label:'Why',key:'menu:why',title:hasReason?'Show the explanation for this change':'No explanation provided'});
+    },{disabled:!hasReason,label:'Show change explanation',key:'menu:why',title:hasReason?'Show the explanation for this change':'No explanation provided'});
     why.setAttribute('role','menuitem'); menu.append(why);
     for (const fallback of fallbackActions) {
       const item = openMenu.actions?.find(action => action.id === fallback.id) || {...fallback,enabled:false,reason:'This action is unavailable for this change.'};
@@ -1032,13 +1096,6 @@
       control.append(element('span','review-menu-label',item.label || fallback.label));
       if (!enabled && reason) control.append(element('span','review-menu-reason',reason));
       menu.append(control);
-    }
-    if (/\.(tex|ltx)$/i.test(file.path)) {
-      const setup = button('Set up LaTeX review macros…','review-menu-item review-menu-setup',()=>{
-        closeActionMenu(true); post({type:'setupReviewMacros',filePath:file.path});
-      },{disabled:Boolean(editing) || !state.trusted || state.busy || awaitingDecision,label:'Set up LaTeX review macros',key:'menu:setup',
-        title:editing?'Finish or discard the draft before setting up macros':'Prepare review macros for this project'});
-      setup.setAttribute('role','menuitem'); menu.append(setup);
     }
     menu.addEventListener('keydown',event=>{
       const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
@@ -1370,8 +1427,14 @@
         + (parseFloat(style.columnGap) || 0) * Math.max(0, badges.length - 1)
         + (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
     }
-    let minimumLeft = Math.max(160, gutter + 80 + 15);
-    let minimumRight = Math.max(gutter + actions + 80 + 8, summaryWidth + actions);
+    const originalBanner = root.querySelector('.pane-banner.left');
+    const originalStyle = originalBanner ? getComputedStyle(originalBanner) : null;
+    const originalPadding = originalStyle ? (parseFloat(originalStyle.paddingLeft) || 0) + (parseFloat(originalStyle.paddingRight) || 0) : 28;
+    const actionGroup = root.querySelector('.file-action-group');
+    const actionPadding = actionGroup ? parseFloat(getComputedStyle(actionGroup).paddingLeft) || 0 : 0;
+    const quickWidth = root.querySelector('.quick-review-toggle')?.getBoundingClientRect().width || 0;
+    let minimumLeft = Math.max(160, gutter + 80 + 15, summaryWidth + originalPadding);
+    let minimumRight = Math.max(gutter + actions + 80 + 8, quickWidth + actionPadding + actions);
     // Tiny windows cannot satisfy both ideals. Retain both panes proportionally.
     if (minimumLeft + minimumRight > available) {
       const scale = available / (minimumLeft + minimumRight);
@@ -1546,7 +1609,8 @@
       summary.setAttribute('role', 'status');
       summary.setAttribute('aria-live', 'polite');
       summary.append(badge(totals.pending + ' pending', 'pending'), badge(totals.accepted + ' accepted', 'accepted'), badge(totals.ignored + ' ignored', 'ignored'));
-      summaryRow.append(summary);
+      if (layout === 'unified') summaryRow.append(summary);
+      else original.append(summary);
       if (file.hunks.length) {
         const actions = element('div', 'file-actions');
         actions.append(
@@ -1557,9 +1621,9 @@
             () => decide({ type: 'decideFile', filePath: file.path, decision: 'ignored' }),
             { disabled: busy || !state.trusted || !totals.pending, key: file.path + ':ignoreFile' })
         );
-        const stack=element('div','file-action-stack');
-        stack.append(quickReviewButton(busy || !quickAllowed()),actions);
-        summaryRow.append(stack);
+        const group=element('div','file-action-group');
+        group.append(quickReviewButton(busy || !quickAllowed()),actions);
+        summaryRow.append(group);
       }
       proposed.append(summaryRow);
       header.append(original, proposed);

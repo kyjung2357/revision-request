@@ -19,7 +19,7 @@ const runName = new Date().toISOString().replace(/[:.]/g, '-');
 const runDir = path.join(scratchRoot, runName);
 const results = [];
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-let browser, server, cdp, computeInlineChanges, computeFileInlineChanges, parseRequestDocument, resolveRequest, createRequestViewHtml, browserLog = '', runCreated = false;
+let browser, server, cdp, computeInlineChanges, computeFileInlineChanges, parseRequestDocument, resolveRequest, createRequestViewHtml, applyReviewAction, getReviewActions, browserLog = '', runCreated = false;
 
 async function findBrowser() {
   const candidates = [
@@ -79,7 +79,7 @@ function mockScript() {
     `window.__setReview = next => { window.__review = structuredClone(next); window.dispatchEvent(new MessageEvent('message', { data: window.__review })); };\n` +
     `window.acquireVsCodeApi = () => ({ getState: () => window.__savedState, setState: value => { window.__savedState = value; sessionStorage.setItem('rr-view-state', JSON.stringify(value)); }, postMessage: message => {\n` +
     `window.__messages.push(structuredClone(message));\n` +
-    `if (message.type === 'reviewActions' && !window.__deferReviewActions) { queueMicrotask(()=>window.dispatchEvent(new MessageEvent('message',{data:{type:'reviewActionsResult',editId:message.editId,reviewActions:[{id:'comment',label:'Comment out changed lines',enabled:true},{id:'markRemoved',label:'Mark removed text in red',enabled:false,reason:'Test setup requires macros.'},{id:'markAdded',label:'Mark added text in blue',enabled:false,reason:'Test setup requires macros.'}]}}))); }\n` +
+    `if (message.type === 'reviewActions' && !window.__deferReviewActions) { queueMicrotask(()=>window.dispatchEvent(new MessageEvent('message',{data:{type:'reviewActionsResult',editId:message.editId,reviewActions:window.__review.files.find(f=>f.path===message.filePath)?.hunks.find(h=>h.id===message.hunkId)?.reviewActions||[{id:'comment',label:'Keep original as comments',enabled:true}]}}))); }\n` +
     `if (message.type === 'decide' || message.type === 'decideFile' || message.type === 'undo') {\n` +
     `if (window.__deferDecisions) return;\n` +
     `const next = structuredClone(window.__review); const file = next.files.find(item => item.path === message.filePath);\n` +
@@ -92,17 +92,21 @@ function mockScript() {
 }
 
 async function startServer() {
-  const [css,js,createCss,createJs] = await Promise.all(['review.css','review.js','create-request.css','create-request.js'].map(name=>fs.readFile(path.join(root,'media',name))));
+  const [css,js,createCss,createJs,highlightJs] = await Promise.all([
+    ...['review.css','review.js','create-request.css','create-request.js'].map(name=>fs.readFile(path.join(root,'media',name))),
+    fs.readFile(path.join(runDir,'review-highlight.js'))
+  ]);
   const createTheme = ':root{--vscode-foreground:#d4d4d4;--vscode-editor-background:#1e1e1e;--vscode-descriptionForeground:#aaa;--vscode-input-background:#252526;--vscode-input-foreground:#d4d4d4;--vscode-panel-border:#555;--vscode-button-secondaryForeground:#fff;--vscode-button-secondaryBackground:#3a3d41;--vscode-button-secondaryHoverBackground:#45494e;--vscode-button-foreground:#fff;--vscode-button-background:#0e639c;--vscode-button-hoverBackground:#1177bb;--vscode-focusBorder:#007fd4;--vscode-errorForeground:#f48771;}';
   let createHtml = createRequestViewHtml({cspSource:"'self'",asWebviewUri:uri=>({toString:()=>'/'+path.basename(uri.fsPath)})},{fsPath:root});
   const nonce = createHtml.match(/<script nonce="([^"]+)"/)[1];
   createHtml = createHtml.replace('</head>','<link rel="stylesheet" href="/create-theme.css"></head>').replace('<script nonce=', '<script nonce="'+nonce+'" src="/create-mock.js"></script><script nonce=');
   const createMock = "window.__createMessages=[];window.__xss=0;window.__setCreate=state=>{window.__createState=structuredClone(state);window.dispatchEvent(new MessageEvent('message',{data:state}));};window.acquireVsCodeApi=()=>({postMessage:message=>window.__createMessages.push(structuredClone(message)),getState:()=>({}),setState:()=>{}});";
-  const html = Buffer.from('<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Revision Request layout fixture</title><link rel="stylesheet" href="/review.css"></head><body><div id="app"></div><script src="/mock.js"></script><script src="/review.js"></script></body></html>');
+  const html = Buffer.from('<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Revision Request layout fixture</title><link rel="stylesheet" href="/review.css"></head><body><div id="app"></div><script src="/mock.js"></script><script src="/review-highlight.js"></script><script src="/review.js"></script></body></html>');
   const routes = new Map([
     ['/', ['text/html; charset=utf-8', html]],
     ['/review.css', ['text/css; charset=utf-8', css]],
     ['/review.js', ['text/javascript; charset=utf-8', js]],
+    ['/review-highlight.js', ['text/javascript; charset=utf-8', highlightJs]],
     ['/mock.js', ['text/javascript; charset=utf-8', Buffer.from(mockScript())]],
     ['/create', ['text/html; charset=utf-8', Buffer.from(createHtml)]],
     ['/create-request.css', ['text/css; charset=utf-8', createCss]],
@@ -566,8 +570,179 @@ async function runProgrammingHighlightTests(width) {
   });
 }
 
+
+function liveHighlightFixture(before, after, targetPath = 'examples/live.py', prefix = '', suffix = '') {
+  const count = text => text ? text.replace(/\n$/, '').split('\n').length : 0;
+  const tail = suffix + Array.from({length:105}, (_, index) => '# Unchanged context ' + index + '\n').join('');
+  const hunk = {id:'live',index:0,start:prefix.length,end:prefix.length+before.length,before,after,
+    oldStart:count(prefix)+1,newStart:count(prefix)+1,oldLines:count(before),newLines:count(after),
+    decision:'pending',contextBefore:[],contextAfter:[]};
+  const file = {path:targetPath,before:prefix+before+tail,after:prefix+after+tail,hunks:[hunk]};
+  hunk.inlineChanges = computeFileInlineChanges(file,[hunk],{},1000).get(hunk.id);
+  return {...structuredClone(fixture),files:[file]};
+}
+async function liveHighlightSnapshot(remember = false) {
+  return cdp.evaluate('('+function(remember) {
+    const hunk = document.querySelector('.hunk'), area = hunk.querySelector('textarea[data-focus-key="edit:draft"]');
+    if (remember) window.__liveHighlightArea = area;
+    const alpha = color => color === 'transparent' ? 0 : color.startsWith('rgba(') ? Number(color.slice(color.lastIndexOf(',')+1,-1)) : 1;
+    const sides = {};
+    for (const side of ['left','right']) {
+      const codes = Array.from(hunk.querySelectorAll('.code-side.'+side+' .code-text'));
+      sides[side] = {
+        text:codes.map(code=>code.textContent.replace(/\u200b/g,'')).join('\n'),
+        spans:codes.flatMap(code=>Array.from(code.querySelectorAll('.inline-common,.inline-changed'),node=>{
+          const style = getComputedStyle(node), cell = node.closest('.code-side');
+          return {text:node.textContent,changed:node.classList.contains('inline-changed'),colorAlpha:alpha(style.color),
+            background:style.backgroundColor,backgroundAlpha:alpha(style.backgroundColor),cellAlpha:alpha(getComputedStyle(cell).backgroundColor)};
+        })).filter(span=>span.text.length>0)
+      };
+    }
+    return {sides,draft:area?.value,rawMirror:area?.parentElement.querySelector('.code-text').textContent,selection:area?[area.selectionStart,area.selectionEnd]:null,
+      sameInput:area===window.__liveHighlightArea,focused:document.activeElement===area,
+      injected:hunk.querySelectorAll('img,svg,script').length,xss:window.__xss};
+  }.toString()+')('+remember+')');
+}
+function assertLiveHighlights(snapshot, before, draft, oldChanged, newChanged, onlyChanged = false) {
+  assert.equal(snapshot.sides.left.text,before,'Original text remains exact while its diff spans update');
+  assert.equal(snapshot.sides.right.text,draft,'Visible proposal preserves every draft character and blank line');
+  if (snapshot.draft !== undefined) assert.equal(snapshot.rawMirror,draft+(!draft||/\n$/.test(draft)?'\u200b':''),
+    'The mirror adds at most one final layout sentinel, preserving multiline caret and multi-cursor offsets');
+  for (const [side, expected] of [['left',oldChanged],['right',newChanged]]) {
+    const spans = snapshot.sides[side].spans;
+    assert.deepEqual(spans.filter(span=>span.changed).map(span=>span.text),expected,side+' changed fragments');
+    for (const span of spans) {
+      if (span.changed) {
+        assert.ok(span.colorAlpha>0,'Changed text is visible');
+        assert.ok(span.backgroundAlpha>span.cellAlpha,'Changed fragments keep stronger backgrounds than the row');
+        const rgb = span.background.match(/[\d.]+/g).map(Number);
+        assert.ok(side==='left'?rgb[0]>rgb[1]:rgb[1]>rgb[0],side+' uses the expected removed/added color');
+      } else assert.ok(onlyChanged?span.colorAlpha===0:span.colorAlpha>0,'Common text follows Show Only Changed Text');
+    }
+  }
+  assert.equal(snapshot.injected,0); assert.equal(snapshot.xss,0,'Draft text remains literal');
+}
+async function nativeDraftReplace(start, end, text) {
+  await cdp.evaluate('(()=>{const area=document.querySelector(".pending-editor textarea");area.focus({preventScroll:true});area.setSelectionRange('+start+','+end+');area.dispatchEvent(new Event("select",{bubbles:true}));})()');
+  await settle();
+  if (text) await cdp.send('Input.insertText',{text});
+  else {
+    const key = {key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8,nativeVirtualKeyCode:8};
+    await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',...key});
+    await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',...key});
+  }
+  await settle();
+}
+async function runLiveHighlightTests(width) {
+  const load = async (state, mode) => {
+    await resetFixture(width);
+    await cdp.evaluate('window.__setReview('+JSON.stringify(state)+')'); await settle();
+    if (mode === 'unified') await toggleLayout();
+  };
+  for (const mode of ['sideBySide','unified']) {
+    await runTest(width+'px '+mode+': multiline editing preserves diff colors and native typing updates both sides through Undo',async()=>{
+      const before='first_name = 1\nsecond_name = 2', proposed='last_name = 1\nsecond_name = 3';
+      await load(liveHighlightFixture(before+'\n',proposed+'\n'),mode);
+      const pending=await liveHighlightSnapshot();
+      assertLiveHighlights(pending,before,proposed,['first_name','2'],['last_name','3']);
+      await openEdit('live','click',1);
+      const opened=await liveHighlightSnapshot(true);
+      assertLiveHighlights(opened,before,proposed,['first_name','2'],['last_name','3']);
+      for(const side of ['left','right']) assert.deepEqual(opened.sides[side].spans,pending.sides[side].spans,'Entering the multiline editor retains '+side+' highlight boundaries and colors');
+      const index=proposed.lastIndexOf('3');
+      await nativeDraftReplace(index,index+1,'2');
+      let current=await liveHighlightSnapshot();
+      assertLiveHighlights(current,before,proposed.replace(/3$/,'2'),['first_name'],['last_name']);
+      assert.ok(current.sameInput&&current.focused,'Repainting both panes keeps the exact active native textarea');
+      assert.deepEqual(current.selection,[index+1,index+1],'Native typing leaves the caret after the inserted character');
+      await nativeDraftReplace(0,current.draft.length,before);
+      current=await liveHighlightSnapshot();
+      assertLiveHighlights(current,before,before,[],[]);
+      assert.ok(current.sameInput&&current.focused);
+      assert.deepEqual(current.selection,[before.length,before.length]);
+      await editorKey('z',{ctrlKey:true});
+      current=await liveHighlightSnapshot();
+      assertLiveHighlights(current,before,proposed.replace(/3$/,'2'),['first_name'],['last_name']);
+      assert.ok(current.sameInput&&current.focused,'Undo refreshes highlights without replacing the input');
+      await editorKey('z',{ctrlKey:true});
+      assertLiveHighlights(await liveHighlightSnapshot(),before,proposed,['first_name','2'],['last_name','3']);
+      await screenshot('live-highlight-'+width+'-'+mode);
+      await editorKey('Escape');
+      if(mode==='unified') await toggleLayout();
+    });
+    await runTest(width+'px '+mode+': Show Only Changed Text remains accurate while typing in the proposal',async()=>{
+      const before='value = 1\nmessage = "old text"', proposed='value = 2\nmessage = "new text"';
+      const state=liveHighlightFixture(before+'\n',proposed+'\n');state.showOnlyChangedText=true;state.highlightChangedLines=false;
+      await load(state,mode);await openEdit('live');
+      let current=await liveHighlightSnapshot(true);
+      assertLiveHighlights(current,before,proposed,['1','old'],['2','new'],true);
+      const index=proposed.indexOf('2');
+      await nativeDraftReplace(index,index+1,'1');
+      current=await liveHighlightSnapshot();
+      assertLiveHighlights(current,before,proposed.replace('2','1'),['old'],['new'],true);
+      assert.ok(current.sameInput&&current.focused);assert.deepEqual(current.selection,[index+1,index+1]);
+      await editorKey('Escape');
+      if(mode==='unified') await toggleLayout();
+    });
+    await runTest(width+'px '+mode+': insertion deletion and trailing blank drafts preserve exact text and live line highlights',async()=>{
+      const cases=[
+        {before:'',after:'added = 1\nadded = 2\n',old:[],next:['added = 1','added = 2'],draft:'added = 1\nadded = 2\n',typedOld:[],typedNext:['added = 1','added = 2']},
+        {before:'removed = 1\nremoved = 2\n',after:'',old:['removed = 1','removed = 2'],next:[],draft:'removed = 1',typedOld:['removed = 2'],typedNext:[]},
+        {before:'value = 1\n\n',after:'value = 2\n\n',old:['1'],next:['2'],draft:'value = 2\n\n',typedOld:['1'],typedNext:['2']}
+      ];
+      for (const item of cases) {
+        await load(liveHighlightFixture(item.before,item.after),mode);await openEdit('live');
+        const original=item.before.replace(/\n$/,''), proposed=item.after.replace(/\n$/,'');
+        assertLiveHighlights(await liveHighlightSnapshot(true),original,proposed,item.old,item.next);
+        await nativeDraftReplace(0,proposed.length,item.draft);
+        const current=await liveHighlightSnapshot();
+        assertLiveHighlights(current,original,item.draft,item.typedOld,item.typedNext);
+        assert.equal(current.draft,item.draft);assert.ok(current.sameInput&&current.focused);
+        assert.deepEqual(current.selection,[item.draft.length,item.draft.length],'Multiline edits preserve the exact final caret offset');
+        await nativeDraftReplace(0,item.draft.length,original);
+        assertLiveHighlights(await liveHighlightSnapshot(),original,original,[],[]);
+        await editorKey('Escape');
+        if(mode==='unified') await toggleLayout();
+      }
+    });
+    await runTest(width+'px '+mode+': live diff keeps Python multiline-string and Markdown fenced-code context from preceding lines',async()=>{
+      const cases=[
+        ['examples/context.py','text = """\n','"""\n',['a[i+1]'],['a[i+2]'],['a[i+3]']],
+        ['examples/context.md','# Example\n~~~python\n','~~~\n',['1'],['2'],['3']]
+      ];
+      for(const [target,prefix,suffix,oldChanged,newChanged,typedChanged] of cases) {
+        await load(liveHighlightFixture('a[i+1]\n','a[i+2]\n',target,prefix,suffix),mode);
+        assertLiveHighlights(await liveHighlightSnapshot(),'a[i+1]','a[i+2]',oldChanged,newChanged);
+        await openEdit('live');assertLiveHighlights(await liveHighlightSnapshot(true),'a[i+1]','a[i+2]',oldChanged,newChanged);
+        await nativeDraftReplace(4,5,'3');
+        const current=await liveHighlightSnapshot();
+        assertLiveHighlights(current,'a[i+1]','a[i+3]',oldChanged,typedChanged);
+        assert.ok(current.sameInput&&current.focused);assert.deepEqual(current.selection,[5,5]);
+        await editorKey('Escape');
+        if(mode==='unified') await toggleLayout();
+      }
+    });
+  }
+  await resetFixture(width);
+}
+
 async function clickEditorOffset(offset, alt = true) {
-  const point = await cdp.evaluate('(() => {const area=document.querySelector(".pending-editor textarea");area.scrollIntoView({block:"nearest"});const mirror=area.parentElement.querySelector(".code-text");const walker=document.createTreeWalker(mirror,NodeFilter.SHOW_TEXT);let remaining='+offset+',last;while(walker.nextNode()){last=walker.currentNode;if(remaining<=last.length)break;remaining-=last.length;}const range=document.createRange();range.setStart(last,Math.min(remaining,last.length));range.collapse(true);const rect=range.getBoundingClientRect();return {x:rect.x+.2,y:rect.y+rect.height/2};})()');
+  const point = await cdp.evaluate('('+function(offset) {
+    const area=document.querySelector('.pending-editor textarea');area.scrollIntoView({block:'nearest'});
+    const mirror=area.parentElement.querySelector('.code-text');
+    const at=offset=>{
+      const walker=document.createTreeWalker(mirror,NodeFilter.SHOW_TEXT);let remaining=offset,last;
+      while(walker.nextNode()){last=walker.currentNode;if(remaining<last.length)return [last,remaining];remaining-=last.length;}
+      return [last,last.length];
+    };
+    const range=document.createRange();range.setStart(...at(offset));range.collapse(true);
+    let rect=range.getBoundingClientRect(),x=rect.x;
+    if(!rect.height && offset>0){
+      range.setStart(...at(offset-1));range.setEnd(...at(offset));rect=range.getBoundingClientRect();x=rect.right;
+    }
+    if(!rect.height) throw new Error('No visible caret rectangle at editor offset '+offset);
+    return {x:x+.2,y:rect.y+rect.height/2};
+  }.toString()+')('+offset+')');
   await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,modifiers:alt?1:0,...point});
   await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,modifiers:alt?1:0,...point});
   await settle();
@@ -877,12 +1052,29 @@ async function runEditorDecisionTests(width) {
 async function runReviewActionTests(width) {
   await runTest(width+'px: More actions floats without starting an editor and supports keyboard navigation',async()=>{
     await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+    const dots=await cdp.evaluate(`(() => {
+      const button=document.querySelector('.review-menu-toggle'),rect=button.getBoundingClientRect(),css=getComputedStyle(button),dot=getComputedStyle(button,'::before');
+      const transform=new DOMMatrixReadOnly(dot.transform),width=parseFloat(dot.width),height=parseFloat(dot.height);
+      const offset=(value,size)=>value.endsWith('%')?parseFloat(value)*size/100:parseFloat(value);
+      return {fontSize:css.fontSize,width,height,shadow:dot.boxShadow,
+        centerX:rect.x+parseFloat(css.borderLeftWidth)+offset(dot.left,button.clientWidth)+transform.e+width/2,
+        centerY:rect.y+parseFloat(css.borderTopWidth)+offset(dot.top,button.clientHeight)+transform.f+height/2,
+        buttonX:rect.x+rect.width/2,buttonY:rect.y+rect.height/2};
+    })()`);
+    assert.equal(dots.fontSize,'0px','The font glyph cannot shift the visible ellipsis');
+    assert.equal(dots.width,2);assert.equal(dots.height,2);
+    assert.ok(Math.abs(dots.centerX-dots.buttonX)<.6&&Math.abs(dots.centerY-dots.buttonY)<.6,'The visible ellipsis is centered in its button');
+    assert.match(dots.shadow,/-4px 0px/);assert.match(dots.shadow,/ 4px 0px/);
     const before=await geometry();await clickMore('grow');await assertNoLayoutShift(before);
     const request=await cdp.evaluate("window.__messages.filter(m=>m.type==='reviewActions').at(-1)");
     assert.equal(request.hunkId,'grow');assert.equal(request.draft,fixture.files[0].hunks[0].after.replace(/\n$/,''));
     assert.equal(await cdp.evaluate('Boolean(document.querySelector(".pending-editor"))'),false);
     const menu=await cdp.evaluate('(() => {const m=document.querySelector(".review-action-menu"),r=m.getBoundingClientRect();return {role:m.getAttribute("role"),x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight};})()');
     assert.equal(menu.role,'menu');assert.ok(menu.x>=0&&menu.y>=0&&menu.right<=menu.width+1&&menu.bottom<=menu.height+1);
+    const labels=await cdp.evaluate(`(() => {const why=document.querySelector('.review-action-why');return {why:why.textContent,aria:why.getAttribute('aria-label'),reasons:[...document.querySelectorAll('.review-menu-reason')].map(node=>node.textContent)};})()`);
+    assert.equal(labels.why,'Show change explanation');assert.equal(labels.aria,'Show change explanation');
+    assert.deepEqual(labels.reasons,[]);
+    assert.deepEqual(await cdp.evaluate('[...document.querySelectorAll(".review-action-menu [role=menuitem]")].map(node=>node.textContent)'),['Show change explanation','Keep original as comments'],'Only explanation and original-preservation actions remain');
     await screenshot('review-actions-'+width);
     await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}))');
     assert.equal(await cdp.evaluate('document.activeElement.dataset.reviewAction'),'comment');
@@ -896,15 +1088,34 @@ async function runReviewActionTests(width) {
     await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
     const sent=await cdp.evaluate("window.__messages.filter(m=>m.type==='transformDraft').at(-1)");
     assert.equal(sent.action,'comment');assert.equal(sent.revision,fixture.revision);
-    const draft='% '+sent.draft;
+    const hunk=fixture.files[0].hunks[0];
+    const draft=applyReviewAction({path:fixture.files[0].path,before:hunk.before.replace(/\n$/,''),after:sent.draft,prefix:fixture.files[0].before.slice(0,hunk.start),hasOriginal:true,hasProposed:hunk.newLines>0},'comment');
+    assert.ok(draft.endsWith('\n'+sent.draft),'The active proposal remains unchanged after the preserved original');
     await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'transformResult',editId:sent.editId,draft})+'}))');await settle();
     assert.equal((await editSnapshot()).draft,draft);assert.deepEqual((await editSnapshot()).buttons.sort(),['Accept','Ignore','⋯']);
     assert.equal(await cdp.evaluate('JSON.stringify(window.__review)'),before);
     assert.equal(await cdp.evaluate("window.__messages.filter(m=>['editPending','editAndAccept','decide'].includes(m.type)).length"),0);
     await editorKey('z',{ctrlKey:true});assert.equal((await editSnapshot()).draft,sent.draft);
     await clickMore('grow');const capabilities=await cdp.evaluate("window.__messages.filter(m=>m.type==='reviewActions').at(-1)");assert.equal(capabilities.draft,sent.draft);
-    assert.equal(await cdp.evaluate('document.querySelector(".review-menu-setup").disabled'),true);
+    assert.equal(await cdp.evaluate('document.querySelector(".review-menu-setup")'),null);
     await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await editorKey('Escape');await resetFixture(width);
+  });
+  await runTest(width+'px: original preservation is unavailable for insertions and keeps deleted lines as comments',async()=>{
+    await resetFixture(width);await clickMore('insert');
+    const unavailable=await cdp.evaluate('(() => {const control=document.querySelector("[data-review-action=comment]");return {disabled:control.disabled,reason:control.querySelector(".review-menu-reason")?.textContent};})()');
+    assert.equal(unavailable.disabled,true);assert.match(unavailable.reason,/original/i);
+    await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
+    assert.equal(await cdp.evaluate('window.__messages.filter(m=>m.type==="transformDraft").length'),0);
+    await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await clickMore('delete');
+    assert.equal(await cdp.evaluate('document.querySelector("[data-review-action=comment]").disabled'),false);
+    const original=await originalProjection();
+    await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
+    const sent=await cdp.evaluate('window.__messages.filter(m=>m.type==="transformDraft").at(-1)'),hunk=fixture.files[0].hunks.find(h=>h.id==='delete');
+    const draft=applyReviewAction({path:fixture.files[0].path,before:hunk.before.replace(/\n$/,''),after:sent.draft,prefix:fixture.files[0].before.slice(0,hunk.start),hasOriginal:true,hasProposed:hunk.newLines>0},'comment');
+    assert.equal(draft,'% Remove first.\n% Remove second.\n% Remove third.');
+    await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'transformResult',editId:sent.editId,draft})+'}))');await settle();
+    assert.equal((await editSnapshot()).draft,draft);assert.equal(await originalProjection(),original,'Preservation only edits the pending draft');
+    await editorKey('Escape');await resetFixture(width);
   });
   await runTest(width+'px: failed transforms keep draft and stale responses cannot overwrite it',async()=>{
     await resetFixture(width);await clickMore('grow');await cdp.evaluate('document.querySelector("[data-review-action=comment]").click()');await settle();
@@ -947,6 +1158,8 @@ async function quickSnapshot() {
       focused:{id:document.activeElement.dataset.hunk,decision:document.activeElement.dataset.quickDecision,key:document.activeElement.dataset.focusKey},
       colors:toggle?{text:getComputedStyle(toggle).color,background:getComputedStyle(toggle).backgroundColor,icon:getComputedStyle(toggle.querySelector('svg')).color,fill:getComputedStyle(toggle.querySelector('svg')).fill,border:getComputedStyle(toggle).borderTopColor}:null,
       toggle:rect(toggle),bulk:bulk.map(rect),badges:[...document.querySelectorAll('.summary .badge')].map(rect),
+      row:rect(document.querySelector('.summary-row')),rowGap:parseFloat(getComputedStyle(document.querySelector('.summary-row')).rowGap)||0,
+      counterPane:rect(document.querySelector('.summary').closest('.pane-banner')),
       left:rect(document.querySelector('.pane-banner.left')),right:rect(document.querySelector('.pane-banner.right')),
       scroll:{top:scroll.scrollTop,total:scroll.scrollHeight,rect:rect(scroll)},menu:Boolean(document.querySelector('.review-action-menu')),why:Boolean(document.querySelector('.why-popover')),
       decisions:window.__messages.filter(message=>message.type==='decide'),modeMessages:window.__messages.filter(message=>message.type==='quickReviewState')};
@@ -1109,16 +1322,39 @@ async function runOpenNavigationTests(width) {
   await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
 }
 
+function assertHeaderRows(view, requireSingleRow = false, split = false) {
+  const first=view.badges[0],actions=[view.toggle,...view.bulk];
+  assert.ok(Math.abs(first.y-view.row.y)<.7,'The header starts with populated content, without a blank row');
+  for(const badge of view.badges) {
+    assert.ok(Math.abs(badge.y-first.y)<.7,'All counters share one row');
+    assert.ok(Math.abs(badge.height-24)<.7,'Counters retain their 24px height');
+    assert.ok(badge.x>=view.counterPane.x-.7&&badge.right<=view.counterPane.right+.7,'Counters remain within their assigned pane');
+  }
+  for(const action of actions) {
+    assert.ok(Math.abs(action.y-view.toggle.y)<.7,'Quick Review and both bulk buttons share one row');
+    assert.ok(Math.abs(action.height-24)<.7,'Header controls retain their 24px height');
+    assert.ok(action.x>=view.row.x-.7&&action.right<=view.row.right+.7,'Header actions stay within the pane');
+  }
+  assert.ok(view.toggle.right<=view.bulk[0].x+.7,'Quick Review stays left of Accept all');
+  if(split) {
+    assert.ok(view.toggle.x-view.row.x<=15,'Split-view Quick Review sits at the left edge of the right pane');
+    assert.ok(view.counterPane.right<=view.row.x+.7,'Split-view counters occupy the original pane');
+  } else assert.ok(view.bulk[0].x-view.toggle.right<20,'Unified-view Quick Review sits immediately left of Accept all');
+  const wrapped=Math.abs(first.y-view.toggle.y)>.7;
+  if(requireSingleRow)assert.equal(wrapped,false,'Counters and controls use one row when the pane is wide enough');
+  if(wrapped)assert.ok(Math.abs(view.toggle.y-first.bottom-view.rowGap)<.7,'A narrow pane wraps directly below its populated counters');
+  else assert.ok(view.badges.at(-1).right<=view.toggle.x+.7,'Counters do not overlap Quick Review');
+  assert.ok(Math.abs(view.row.bottom-view.bulk[0].bottom)<.7,'The header ends at the controls without unused vertical space');
+}
+
 async function runQuickReviewTests(width) {
   for(const unified of [false,true]) {
     const label=width+'px '+(unified?'unified':'side-by-side');
-    await runTest(label+': Quick Review is a yellow toggle above aligned bulk actions and defaults off',async()=>{
+    await runTest(label+': Quick Review sits left of bulk actions without an empty row and defaults off',async()=>{
       await resetQuick(width,unified);const view=await quickSnapshot();
       assert.equal(view.enabled,false);assert.equal(view.disabled,false);assert.equal(view.selected.length,0);assert.equal(view.bulk.length,2);
-      assert.ok(view.toggle.bottom<=view.bulk[0].y+.6,'Quick Review sits above the bulk row');
-      assert.ok(Math.abs(view.toggle.x-view.bulk[0].x)<.7,'Same left edge as Accept all');
-      assert.ok(Math.abs(view.toggle.right-view.bulk[1].right)<.7,'Spans both bulk buttons');
-      for(const badge of view.badges) {assert.ok(Math.abs(badge.height-view.bulk[0].height)<.7);assert.ok(Math.abs(badge.y-view.bulk[0].y)<.7,'Counters stay on lower bulk row');}
+      assertHeaderRows(view,true,!unified);
+      assert.equal(view.colors.border,'rgba(0, 0, 0, 0)','The disabled Quick Review mode has no visible border');
       if(!unified) {assert.ok(Math.abs(view.left.y-view.right.y)<.6);assert.ok(Math.abs(view.left.height-view.right.height)<.6,'Banner heights remain equal');}
       const prevented=await cdp.evaluate('(()=>{const event=new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true});document.body.dispatchEvent(event);return event.defaultPrevented;})()');
       assert.equal(prevented,false,'Off mode does not intercept ordinary keys');assert.equal((await quickSnapshot()).decisions.length,0);
@@ -1345,7 +1581,7 @@ async function splitSnapshot() {
       left:left.width,right:right.width,divider:right.x,rail:rail.width,ratio:left.width/scroll.clientWidth,
       saved:window.__savedState.splitRatio,dragging:document.querySelector('.review-app').classList.contains('resizing-panes'),
       sourceWidths:Array.from(document.querySelectorAll('.code-side .code-source'),node=>({side:node.closest('.code-side').classList.contains('right')?'right':'left',width:node.clientWidth,scrollWidth:node.scrollWidth})),
-      headerFit:Array.from(header.querySelectorAll('.summary .badge,.file-actions .button'),node=>{const r=node.getBoundingClientRect();return r.x>=right.x-1&&r.right<=right.right+1;})};
+      headerFit:Array.from(header.querySelectorAll('.summary .badge,.file-actions .button,.quick-review-toggle'),node=>{const r=node.getBoundingClientRect(),pane=node.closest('.pane-banner').getBoundingClientRect();return r.x>=pane.x-1&&r.right<=pane.right+1;})};
   })()`);
 }
 async function dragSplitter(ratio, cancel = false, refresh = false) {
@@ -1379,7 +1615,7 @@ function assertSplitGeometry(value) {
   assert.ok(Math.abs((value.overview.x+value.overview.right)/2-value.divider)<.6,'The scroll rail is centered on the column divider');
   assert.ok(Math.abs(value.splitter.right-value.overview.x)<.6,'Resize and scroll hitboxes are adjacent without overlap');
   assert.ok(Math.abs(value.left+value.right-value.available)<1.1,'Both panes fill the comparison width');
-  assert.ok(value.headerFit.every(Boolean),'Status badges and action buttons remain within the right pane');
+  assert.ok(value.headerFit.every(Boolean),'Status badges and action buttons remain within their assigned panes');
   for(const source of value.sourceWidths) {
     assert.ok(source.width>=79,'Minimum pane widths leave readable code beside the fixed rail');
     assert.ok(source.scrollWidth<=source.width+1,'Resizing never hides code horizontally');
@@ -1869,6 +2105,7 @@ async function runLayoutTests() {
     });
     await runLanguageHighlightTests(width);
     await runProgrammingHighlightTests(width);
+    await runLiveHighlightTests(width);
     await runEditorTests(width);
     await runMulticursorTests(width);
     await runEditorButtonTests(width);
@@ -1914,9 +2151,11 @@ async function runLayoutTests() {
     await runTest(width + 'px: larger banner items align actual bulk button edges with inline controls', async () => {
       const layout = await cdp.evaluate(`(() => {
         const rect = node => { const box = node.getBoundingClientRect(); return { x: box.x, y: box.y, right: box.right, bottom: box.bottom, width: box.width, height: box.height }; };
-        const summary = document.querySelector('.summary-row .summary');
+        const summary = document.querySelector('.comparison-header .summary');
         const bulk = document.querySelector('.summary-row .file-actions');
         return { row: rect(document.querySelector('.summary-row')), summary: rect(summary), bulk: rect(bulk),
+          rowGap:parseFloat(getComputedStyle(document.querySelector('.summary-row')).rowGap)||0,
+          toggle:rect(document.querySelector('.quick-review-toggle')),counterPane:rect(summary.closest('.pane-banner')),
           gutter: rect(document.querySelector('.code-side.right .action-gutter')),
           badges: Array.from(summary.querySelectorAll('.badge'), rect),
           buttons: Array.from(bulk.querySelectorAll('button'), rect),
@@ -1926,13 +2165,8 @@ async function runLayoutTests() {
       assert.equal(layout.badges.length, 3); assert.equal(layout.buttons.length, 2);
       assert.ok(Math.abs(layout.bulk.x - layout.gutter.x) < 0.6, 'Bulk region begins at the code action gutter');
       assert.ok(Math.abs(layout.bulk.width - layout.gutter.width) < 0.6, 'Bulk region has the code action gutter width');
-      assert.ok(layout.summary.right <= layout.bulk.x + 0.6, 'Counters and bulk controls do not overlap');
+      assertHeaderRows({...layout,bulk:layout.buttons},true,true);
       const first = layout.badges[0];
-      for (const item of [...layout.badges, ...layout.buttons]) {
-        assert.ok(Math.abs(item.y - first.y) < 0.6, 'All banner badges and buttons share a top edge');
-        assert.ok(Math.abs(item.height - first.height) < 0.6, 'All banner badges and buttons have equal heights');
-        assert.ok(item.y >= layout.row.y - 0.6 && item.bottom <= layout.row.bottom + 0.6, 'All controls stay in one banner row');
-      }
       assert.ok(first.height >= 23.4, 'Banner badges and buttons are enlarged to at least 24px');
       for (const item of layout.inlineButtons) {
         assert.ok(Math.abs(item.height - 18) < 0.6, 'Inline buttons retain their compact 18px height');
@@ -2194,21 +2428,29 @@ async function main() {
     'Refuse to create artifacts until .codex-test-ui is ignored.');
   const executable = await findBrowser();
   await fs.mkdir(runDir, { recursive: true }); runCreated = true;
-  const corePath = path.join(runDir, 'core.cjs'), requestPath = path.join(runDir, 'request.cjs'), createPath = path.join(runDir, 'create-view.cjs');
-  await Promise.all([[corePath,'core.ts'],[requestPath,'request.ts'],[createPath,'createRequestView.ts']].map(([outfile,entry])=>
+  const corePath = path.join(runDir, 'core.cjs'), requestPath = path.join(runDir, 'request.cjs'), createPath = path.join(runDir, 'create-view.cjs'), actionsPath = path.join(runDir, 'review-actions.cjs');
+  await Promise.all([[corePath,'core.ts'],[requestPath,'request.ts'],[createPath,'createRequestView.ts'],[actionsPath,'reviewActions.ts']].map(([outfile,entry])=>
     require('esbuild').build({entryPoints:[path.join(root,'src',entry)],outfile,
       bundle:true,platform:'node',format:'cjs',external:['vscode'],logLevel:'silent'})));
+  await require('esbuild').build({entryPoints:[path.join(root,'src','reviewHighlight.ts')],outfile:path.join(runDir,'review-highlight.js'),
+    bundle:true,platform:'browser',format:'iife',globalName:'RRHighlight',logLevel:'silent'});
   ({computeInlineChanges, computeFileInlineChanges} = require(corePath));
   ({parseRequestDocument,resolveRequest} = require(requestPath));
+  ({applyReviewAction,getReviewActions} = require(actionsPath));
   const load = Module._load;
   Module._load = function(name,parent,main){return name==='vscode'?{Uri:{joinPath:(uri,...parts)=>({fsPath:path.join(uri.fsPath,...parts)})}}:load.call(this,name,parent,main);};
   try { ({createRequestViewHtml} = require(createPath)); } finally { Module._load = load; }
-  for (const hunk of fixture.files[0].hunks) hunk.inlineChanges = computeInlineChanges(hunk, 40, fixture.files[0].path);
+  for (const hunk of fixture.files[0].hunks) {
+    hunk.inlineChanges = computeInlineChanges(hunk, 40, fixture.files[0].path);
+    hunk.reviewActions = getReviewActions({path:fixture.files[0].path,before:hunk.before.replace(/\n$/,''),after:hunk.after.replace(/\n$/,''),prefix:fixture.files[0].before.slice(0,hunk.start),hasOriginal:hunk.end>hunk.start,hasProposed:hunk.newLines>0});
+  }
   const url = await startServer();
   console.log('Browser: ' + executable); console.log('Artifacts: ' + runDir);
   await startBrowser(executable, url);
   if (process.env.RR_UI_TEST_GROUP === 'highlight') {
-    for (const width of [1200, 620]) {await runLanguageHighlightTests(width);await runProgrammingHighlightTests(width);}
+    for (const width of [1200, 620]) {await runLanguageHighlightTests(width);await runProgrammingHighlightTests(width);await runLiveHighlightTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'live-highlight') {
+    for (const width of [1200,620]) await runLiveHighlightTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'actions') {
     for (const width of [1200,620]) await runReviewActionTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'navigation') {

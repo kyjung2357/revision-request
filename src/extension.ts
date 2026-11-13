@@ -13,7 +13,6 @@ import { createRequestFromFiles } from './createRequestCommand';
 import { readGitOriginal, validateGitOriginalTarget, type GitOriginal } from './gitOriginal';
 import { collectMcpDiagnostics, formatMcpDiagnostics } from './mcpDiagnostics';
 import { applyReviewAction, getReviewActions, type ReviewAction, type ReviewActionInput } from './reviewActions';
-import { inspectReviewMacros, setupReviewMacros, type SetupImportPlan } from './reviewMacroSetup';
 
 const VIEW = 'revisionRequest.review';
 type Decisions = Record<string, Decision>;
@@ -443,34 +442,37 @@ export class ReviewService implements vscode.Disposable {
         (loaded.decisions[keyFor(file.path, hunk.id)] ?? 'pending') === 'pending');
       if (!selected.length) throw new Error('There are no pending changes for this action.');
       this.completionPrompts.delete(uri.toString());
-      const next = {...loaded.decisions};
-      for (const hunk of selected) next[keyFor(file.path, hunk.id)] = decision;
       const updates: Record<number, Decision> = {};
       for (const hunk of selected) updates[loaded.resolved.review.entryIndexByHunkId[hunk.id]!] = decision;
       const committed = await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, updates), origin);
-      if (hunks.every(hunk => next[keyFor(file.path, hunk.id)] !== 'pending' && next[keyFor(file.path, hunk.id)] !== undefined)) {
-        // Persist the final outcome before automatic cleanup clears decisions.
-        try { await this.completionRecorder?.(uri, 'retained'); }
-        catch (error) {
-          void vscode.window.showWarningMessage('Review completed. The .rr request was kept because its completion record could not be saved: ' + failure(error));
-          return;
-        }
-        if (origin === 'user' && hunkId === undefined &&
-            !vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('skipCompletedDeleteConfirmation', false)) {
-          const completionPrompt: CompletionPrompt = {completionId: randomUUID(), revision: committed.fingerprint, requestName: path.basename(uri.fsPath)};
-          this.completionPrompts.set(uri.toString(), completionPrompt);
-          return {completionPrompt};
-        }
-        await this.removeCompletedRequest(uri, committed.document, committed.fingerprint);
-      }
+      const completionPrompt = await this.finishCompletedReview(uri, committed, origin);
+      if (completionPrompt) return {completionPrompt};
     });
   }
   private completedReview(loaded: Awaited<ReturnType<ReviewService['load']>>) {
     const hunks = loaded.request.files.flatMap(file => computeHunks(file).map(hunk => ({file: file.path, id: hunk.id})));
-    return hunks.length > 0 && hunks.every(hunk => {
+    // An accepted draft restored to the original can remove the final entry.
+    // Completion prompts are created only after a successful pending action.
+    return hunks.every(hunk => {
       const decision = loaded.decisions[keyFor(hunk.file, hunk.id)];
       return decision === 'accepted' || decision === 'ignored';
     });
+  }
+  private async finishCompletedReview(uri: vscode.Uri, committed: Awaited<ReturnType<ReviewService['commitReview']>>, origin: DecisionOrigin): Promise<CompletionPrompt | undefined> {
+    if (!this.completedReview(committed)) return;
+    // Persist the final outcome before prompting or automatic cleanup clears decisions.
+    try { await this.completionRecorder?.(uri, 'retained'); }
+    catch (error) {
+      void vscode.window.showWarningMessage('Review completed. The .rr request was kept because its completion record could not be saved: ' + failure(error));
+      return;
+    }
+    if (origin === 'user' &&
+        !vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('skipCompletedDeleteConfirmation', false)) {
+      const completionPrompt: CompletionPrompt = {completionId: randomUUID(), revision: committed.fingerprint, requestName: path.basename(uri.fsPath)};
+      this.completionPrompts.set(uri.toString(), completionPrompt);
+      return completionPrompt;
+    }
+    await this.removeCompletedRequest(uri, committed.document, committed.fingerprint);
   }
   private async rememberCompletionChoice(uri: vscode.Uri, deleteRequest: boolean) {
     const settings = vscode.workspace.getConfiguration('revisionRequest', uri);
@@ -570,134 +572,27 @@ export class ReviewService implements vscode.Disposable {
       if (previous === hunk) break;
       if (loaded.decisions[keyFor(file.path, previous.id)] === 'accepted') start += previous.after.length - previous.before.length;
     }
-    const input: ReviewActionInput = {path: file.path,
+    const input: ReviewActionInput = {path: file.path, hasOriginal: hunk.end > hunk.start, hasProposed: hunk.newLines > 0,
       before: hunk.before.replace(/\r\n|\r/g, '\n').replace(/\n$/, ''),
       after: draft.replace(/\r\n|\r/g, '\n'), prefix: target.current.slice(0, start).replace(/^\uFEFF/, '').replace(/\r\n|\r/g, '\n')};
     return {loaded, file, hunk, input, target};
   }
-  private async actionAvailability(input: ReviewActionInput, targetUri: vscode.Uri) {
-    const actions = getReviewActions(input);
-    if (actions.some(action => action.id !== 'comment' && action.enabled)) {
-      const rememberedRoot = this.context.workspaceState.get<string>('revisionRequest.macroRoot.' + targetUri.toString());
-      const macros = await inspectReviewMacros(targetUri, rememberedRoot ? vscode.Uri.parse(rememberedRoot) : undefined);
-      if (!macros.ready) for (const action of actions) {
-        if (action.id !== 'comment' && action.enabled) {
-          action.enabled = false;
-          action.reason = (macros.reason || 'LaTeX review macros are not loaded.') + ' Use Set up LaTeX review macros, then Accept its import proposal.';
-        }
-      }
-    }
-    return actions;
-  }
   async reviewActions(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
     const context = await this.reviewActionContext(uri, filePath, hunkId, draft, revision);
-    const actions = await this.actionAvailability(context.input, context.target.uri);
+    const actions = getReviewActions(context.input);
     await this.assertRawRequest(uri, context.loaded);
     return actions;
   }
   async transformDraft(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string, action: ReviewAction) {
-    if (!['comment', 'markRemoved', 'markAdded'].includes(action)) throw new Error('Unknown proposal action.');
+    if (action !== 'comment') throw new Error('Unknown proposal action.');
     const context = await this.reviewActionContext(uri, filePath, hunkId, draft, revision);
-    const actions = await this.actionAvailability(context.input, context.target.uri);
-    const selected = actions.find(item => item.id === action)!;
-    if (!selected.enabled) throw new Error(selected.reason || 'This action is unavailable for this change.');
+    const actions = getReviewActions(context.input);
+    const selected = actions.find(item => item.id === action);
+    if (!selected?.enabled) throw new Error(selected?.reason || 'This action is unavailable for this change.');
     const transformed = applyReviewAction(context.input, action);
     editPendingRequest(context.loaded.savedText, context.loaded.resolved.review.baseline, hunkId, transformed);
     await this.assertRawRequest(uri, context.loaded);
-    return {draft: transformed, reviewActions: await this.actionAvailability({...context.input, after: transformed}, context.target.uri)};
-  }
-  /** Macro installation is explicit; the preamble change remains a pending RR entry. */
-  async setupMacros(uri: vscode.Uri, filePath: string, extensionUri: vscode.Uri) {
-    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before setting up LaTeX review macros.');
-    const loaded = await this.load(uri), file = loaded.request.files.find(item => item.path === filePath);
-    if (!file || !/\.(?:tex|ltx)$/i.test(file.path)) throw new Error('Choose a LaTeX revision request.');
-    const target = await this.targetUri(uri, file);
-    let result: vscode.Uri | undefined;
-    const root = await setupReviewMacros(target, extensionUri, async plan => {
-      result = await this.queueMacroImport(uri, plan);
-    });
-    if (root) await this.context.workspaceState.update('revisionRequest.macroRoot.' + target.toString(), root.toString());
-    return result;
-  }
-  async queueMacroImport(requestUri: vscode.Uri, plan: SetupImportPlan): Promise<vscode.Uri> {
-    return this.runExclusive(async () => {
-      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before preparing the import proposal.');
-      const folder = vscode.workspace.getWorkspaceFolder(requestUri);
-      if (!folder || plan.rootUri.scheme !== 'file' || !inside(folder.uri.fsPath, plan.rootUri.fsPath)) {
-        throw new Error('The LaTeX root must be inside the request workspace.');
-      }
-      const relative = path.relative(folder.uri.fsPath, plan.rootUri.fsPath).split(path.sep).join('/');
-      const active = await this.load(requestUri);
-      const destination = active.resolved.request.path === relative ? requestUri : vscode.Uri.file(plan.rootUri.fsPath + '.rr');
-      const targetUri = await this.targetUri(requestUri, {path: relative, before: '', after: ''});
-      if (!Number.isSafeInteger(plan.line) || plan.line < 1 || plan.text !== '\\input{review-macro.tex}') throw new Error('Invalid macro import proposal.');
-      const dirty = vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty);
-      if (dirty || decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) throw new Error('The LaTeX root changed. Save it and try setup again.');
-      let exists = true;
-      try { await fs.lstat(destination.fsPath); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        exists = false;
-      }
-      const entry = {line: plan.line, before: null, after: plan.text, reason: 'Load the shared LaTeX review markup commands.', status: 'pending' as const};
-      if (exists) {
-        await this.prepareReview(destination);
-        const loaded = await this.load(destination);
-        const file = loaded.request.files[0]!;
-        const target = await this.inspectTarget(destination, file, loaded.decisions);
-        if (file.path !== relative || target.current !== plan.original) throw new Error('The LaTeX root or its request changed. Review it before setup.');
-        // Convert the current preamble line to the request's immutable original line.
-        let shift = 0;
-        for (const hunk of computeHunks(file)) {
-          if (loaded.decisions[keyFor(file.path, hunk.id)] !== 'accepted') continue;
-          const currentStart = hunk.oldStart + shift;
-          if (plan.line <= currentStart) break;
-          if (plan.line < currentStart + hunk.newLines) throw new Error('The import location is inside an accepted block. Undo that block or prepare the macros before creating this request.');
-          shift += hunk.newLines - hunk.oldLines;
-        }
-        entry.line -= shift;
-        if (loaded.resolved.request.request.some(item => item.before === null && item.after === entry.after && item.status === 'pending')) return destination;
-        const request = {...loaded.resolved.request, request: [...loaded.resolved.request.request, entry]};
-        const text = JSON.stringify(request, null, 2) + '\n';
-        const review = resolveRequest(parseRequestDocument(text), target.current, loaded.resolved.review.baseline);
-        if (review.expectedTarget !== target.current) throw new Error('Macro setup must preserve the original file.');
-        await this.commitReview(destination, loaded, text, 'user');
-      } else {
-        const request: RevisionRequest = {path: relative, time: new Date().toISOString(), request: [entry]};
-        const text = JSON.stringify(request, null, 2) + '\n';
-        resolveRequest(parseRequestDocument(text), plan.original);
-        const bytes = Buffer.from(text, 'utf8');
-        const parent = path.dirname(destination.fsPath);
-        const parentReal = await fs.realpath(parent);
-        if (path.relative(parentReal, path.resolve(parent)) !== '') throw new Error('The import request destination cannot use symbolic links.');
-        if (vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty) ||
-            decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) throw new Error('The LaTeX root changed before creating the import proposal.');
-        const handle = await fs.open(destination.fsPath, 'wx');
-        const created = await handle.stat();
-        let written: Awaited<ReturnType<typeof handle.stat>> | undefined;
-        try {
-          try { await handle.writeFile(bytes); } finally { written = await handle.stat(); await handle.close(); }
-          if (path.relative(parentReal, await fs.realpath(parent)) !== '' ||
-              vscode.workspace.textDocuments.some(document => document.uri.toString() === targetUri.toString() && document.isDirty) ||
-              decode(await vscode.workspace.fs.readFile(targetUri)) !== plan.original) {
-            throw new Error('The LaTeX root changed while preparing its import proposal.');
-          }
-        } catch (error) {
-          // Remove only this creation, including a partial write, while preserving concurrent edits/replacements.
-          try {
-            const current = await fs.lstat(destination.fsPath), contents = await fs.readFile(destination.fsPath);
-            if (written && current.isFile() && !current.isSymbolicLink() && current.dev === created.dev && current.ino === created.ino &&
-                current.birthtimeMs === created.birthtimeMs && current.mtimeMs === written.mtimeMs && current.size === written.size &&
-                contents.length <= bytes.length && bytes.subarray(0, contents.length).equals(contents)) {
-              const final = await fs.lstat(destination.fsPath);
-              if (final.dev === current.dev && final.ino === current.ino && final.birthtimeMs === current.birthtimeMs &&
-                  final.mtimeMs === current.mtimeMs && final.size === current.size) await fs.unlink(destination.fsPath);
-            }
-          } catch { /* Keep any file whose identity is no longer certain. */ }
-          throw error;
-        }
-      }
-      return destination;
-    });
+    return {draft: transformed, reviewActions: getReviewActions({...context.input, after: transformed})};
   }
   async editPending(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before editing a proposal.');
@@ -743,17 +638,8 @@ export class ReviewService implements vscode.Disposable {
       this.completionPrompts.delete(uri.toString());
       // The draft and its decision share one source/RR journal and one guarded commit.
       const committed = await this.commitReview(uri, loaded, text, 'user');
-      const result = {changed: true, revision: committed.fingerprint};
-      if (this.completedReview(committed)) {
-        try { await this.completionRecorder?.(uri, 'retained'); }
-        catch (error) {
-          void vscode.window.showWarningMessage('Review completed. The .rr request was kept because its completion record could not be saved: ' + failure(error));
-          return result;
-        }
-        // This is an individual acceptance, so batch confirmation does not apply.
-        await this.removeCompletedRequest(uri, committed.document, committed.fingerprint);
-      }
-      return result;
+      const completionPrompt = await this.finishCompletedReview(uri, committed, 'user');
+      return {changed: true, revision: committed.fingerprint, completionPrompt};
     });
   }
   private async inspectRequestDeletion(uri: vscode.Uri) {
@@ -859,7 +745,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
     for (const panel of this.unboundPanels) panel.dispose();
   }
   private webviewOptions(): vscode.WebviewOptions {
-    return {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]};
+    return {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media'), vscode.Uri.file(__dirname)]};
   }
   async deserializeWebviewPanel(panel: vscode.WebviewPanel, state: unknown): Promise<void> {
     let uri: vscode.Uri | undefined;
@@ -1138,6 +1024,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
           try {
             const allowed = ['type', 'filePath', 'hunkId', 'draft', 'revision', 'editId', ...(message.type === 'transformDraft' ? ['action'] : [])];
             if (typeof message.editId !== 'string' || Object.keys(message).some(key => !allowed.includes(key))) throw new Error('Invalid proposal menu action.');
+            if (message.type === 'transformDraft' && message.action !== 'comment') throw new Error('Unknown proposal action.');
             const result = message.type === 'transformDraft'
               ? await this.service.transformDraft(uri, message.filePath, message.hunkId, message.draft, message.revision, message.action)
               : {reviewActions: await this.service.reviewActions(uri, message.filePath, message.hunkId, message.draft, message.revision)};
@@ -1186,7 +1073,11 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
                   Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'draft', 'revision', 'editId'].includes(key))) {
                 throw new Error('Invalid proposal acceptance.');
               }
-              editResult = await this.service.editAndAccept(uri, message.filePath, message.hunkId, message.draft, message.revision);
+              {
+                const accepted = await this.service.editAndAccept(uri, message.filePath, message.hunkId, message.draft, message.revision);
+                editResult = {changed: accepted.changed, revision: accepted.revision};
+                if (accepted.completionPrompt) decisionResult = {completionPrompt: accepted.completionPrompt};
+              }
               break;
             case 'ignoreEdited':
               if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' || !message.hunkId ||
@@ -1194,19 +1085,16 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
                   Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'revision', 'editId'].includes(key))) {
                 throw new Error('Invalid proposal ignore action.');
               }
-              await this.service.decide(uri, message.filePath, message.hunkId, 'ignored', message.revision);
-              editResult = {changed: true, revision: (await this.service.getState(uri, false)).revision};
+              {
+                const ignored = await this.service.decide(uri, message.filePath, message.hunkId, 'ignored', message.revision);
+                editResult = {changed: true, revision: (await this.service.getState(uri, false)).revision};
+                decisionResult = ignored;
+              }
               break;
             case 'resolveCompletion':
               await this.service.resolveCompletion(uri, message.completionId, message.revision, message.deleteRequest, message.rememberChoice);
               completionSucceeded = true;
               break;
-            case 'setupReviewMacros': {
-              if (typeof message.filePath !== 'string') throw new Error('Choose a LaTeX file from this request.');
-              const prepared = await this.service.setupMacros(uri, message.filePath, this.context.extensionUri);
-              if (prepared && prepared.toString() !== uri.toString()) await this.openPreview(prepared);
-              break;
-            }
             case 'deleteRequest': await this.service.deleteRequest(uri); break;
             case 'openTarget': await this.service.openTarget(uri, message.filePath, {preserveFocus: false}); break;
             case 'openSource': await this.openSource(uri); break;
@@ -1223,9 +1111,6 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
           await panel.webview.postMessage({type: 'editResult', editId: message.editId, filePath: message.filePath,
             hunkId: message.hunkId, success: editResult !== undefined, error: actionError, ...editResult});
           actionError = undefined; // The draft editor owns edit errors and keeps the draft.
-        }
-        if (message.type === 'setupReviewMacros' && !disposed) {
-          await panel.webview.postMessage({type: 'macroSetupResult', error: actionError});
         }
         if (message.type === 'resolveCompletion' && !disposed) {
           await panel.webview.postMessage({type: 'completionResult', completionId: message.completionId, revision: message.revision,
@@ -1418,18 +1303,6 @@ export async function activate(context: vscode.ExtensionContext) {
             'Open RR as JSON');
           if (choice === 'Open RR as JSON') await editor.openSource(created.uri);
         } else await editor.openPreview(created.uri);
-      } catch (error) { void vscode.window.showErrorMessage(failure(error)); }
-    }),
-    vscode.commands.registerCommand('revisionRequest.setupReviewMacros', async () => {
-      try {
-        const active = vscode.window.activeTextEditor?.document.uri;
-        const uri = active?.path.endsWith('.rr') ? active : editor.activeUri;
-        if (!uri) throw new Error('Open a LaTeX revision request before setting up its review macros.');
-        const state = await service.getState(uri);
-        const file = state.files[0];
-        if (!file) throw new Error(state.error || 'Open a valid LaTeX revision request.');
-        const prepared = await service.setupMacros(uri, file.path, context.extensionUri);
-        if (prepared) {tree.refresh(); await editor.openPreview(prepared);}
       } catch (error) { void vscode.window.showErrorMessage(failure(error)); }
     }),
     ...['revisionRequest.toggleQuickReview', 'revisionRequest.enableQuickReview', 'revisionRequest.disableQuickReview'].map(command =>

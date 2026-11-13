@@ -44,7 +44,7 @@ Git commit selection is available in the VS Code **Create Revision Request** for
 
 - The extension offers `always` (default), `once`, and `manual` preview modes. `rr_open_preview` is an explicit open in every mode. **Open RR as JSON** keeps the current source-editing session editable. Opening/reopening jumps to the first pending change; ordinary decisions retain the viewport.
 - **Quick Review** lets the user toggle Accept/Ignore with either horizontal arrow, confirm with Tab, and exit with Escape. It starts off and pauses during menus or code editing. Do not activate it or send review keystrokes to substitute for human review.
-- The **⋯** menu contains **Why**, comment actions, and supported LaTeX red/blue markup. Missing reasons disable Why. These actions edit the pending draft; **Accept** applies it. LaTeX macro setup can copy a missing macro file and creates a pending import proposal; it does not approve the import. Existing working macro paths are reused. Explain these user controls when relevant; do not operate them to bypass review permissions.
+- The **⋯** menu contains **Show change explanation** and **Keep original as comments**. Missing reasons disable the explanation item. The comment action preserves complete original lines as comments before the active proposed text; pure insertions and unsupported contexts disable it. It edits only the pending draft, and **Accept** applies it. Pending code stays highlighted while editing, with both sides updating against the current draft. Explain these user controls when relevant; do not operate them to bypass review permissions.
 
 ## Connection and direct-file fallback
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "revision-request",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prepare revision requests for human review in VS Code before changing source files.",
   "author": {
     "name": "Kiyuob Jung",
