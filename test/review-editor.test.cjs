@@ -330,3 +330,65 @@ test('ready arriving during an initial post receives a fresh state after its lis
   firstPost.resolve(); await Promise.all([firstReady, listenerReady]);
   assert.deepEqual(panel.webview.messages.map(message => message.revision), ['delivery-1', 'delivery-2']);
 });
+
+
+test('edited Accept routes one guarded action and acknowledges only its correlated result', async t => {
+  const {editor,uri,service}=setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel=current.created[0], receive=[...panel.received.listeners][0], calls=[];
+  service.editPending=async()=>assert.fail('Do not save a draft in a separate transaction before accepting');
+  service.decide=async()=>assert.fail('Do not decide separately after saving a draft');
+  service.editAndAccept=async(...args)=>{calls.push(args);return {changed:true,revision:'edited-accepted'};};
+  panel.webview.messages=[];
+  const message={type:'editAndAccept',filePath:'inventory_report.py',hunkId:'selected',draft:'new\nblock',revision:'before',editId:'attempt-1'};
+  await receive(message);
+  assert.deepEqual(calls,[[uri,message.filePath,message.hunkId,message.draft,message.revision]]);
+  const result=panel.webview.messages.find(item=>item.type==='editResult');
+  assert.equal(result.success,true); assert.equal(result.editId,'attempt-1');
+  assert.equal(result.hunkId,'selected'); assert.equal(result.filePath,message.filePath);
+  assert.equal(result.revision,'edited-accepted');
+  service.editAndAccept=async()=>{throw Error('Stale source; draft kept.');};
+  panel.webview.messages=[];
+  await receive({...message,editId:'attempt-2'});
+  const failed=panel.webview.messages.find(item=>item.type==='editResult');
+  assert.equal(failed.success,false); assert.equal(failed.editId,'attempt-2');
+  assert.match(failed.error,/Stale source/);
+});
+
+test('Ignore while editing records the original decision without saving the draft', async t => {
+  const {editor,uri,service}=setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel=current.created[0], receive=[...panel.received.listeners][0], calls=[];
+  service.editPending=service.editAndAccept=async()=>assert.fail('Ignore must not write the edited draft');
+  service.decide=async(...args)=>{calls.push(args);};
+  service.getState=async()=>({type:'state',revision:'ignored',files:[]});
+  panel.webview.messages=[];
+  const message={type:'ignoreEdited',filePath:'inventory_report.py',hunkId:'selected',revision:'before',editId:'ignore-1'};
+  await receive(message);
+  assert.deepEqual(calls,[[uri,message.filePath,message.hunkId,'ignored',message.revision]]);
+  const result=panel.webview.messages.find(item=>item.type==='editResult');
+  assert.equal(result.success,true); assert.equal(result.editId,'ignore-1'); assert.equal(result.revision,'ignored');
+  service.decide=async()=>{throw Error('Request changed.');};
+  panel.webview.messages=[];
+  await receive({...message,editId:'ignore-2'});
+  const failed=panel.webview.messages.find(item=>item.type==='editResult');
+  assert.equal(failed.success,false); assert.equal(failed.editId,'ignore-2'); assert.match(failed.error,/Request changed/);
+});
+
+test('malformed edited decisions never reach the file service', async t => {
+  const {editor,uri,service}=setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel=current.created[0], receive=[...panel.received.listeners][0];
+  service.editAndAccept=service.decide=async()=>assert.fail('Invalid payload must not decide');
+  const base={filePath:'inventory_report.py',hunkId:'selected',revision:'before',editId:'invalid'};
+  for(const message of [
+    {type:'editAndAccept',...base},
+    {type:'editAndAccept',...base,draft:'new',decision:'accepted'},
+    {type:'ignoreEdited',...base,draft:'must not save'},
+    {type:'ignoreEdited',...base,hunkId:undefined}
+  ]) {
+    panel.webview.messages=[]; await receive(message);
+    const result=panel.webview.messages.find(item=>item.type==='editResult');
+    assert.equal(result.success,false); assert.ok(result.error);
+  }
+});

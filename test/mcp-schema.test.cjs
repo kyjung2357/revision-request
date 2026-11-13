@@ -75,7 +75,9 @@ test('format tool and schema resource publish the same multiline contract', asyn
   const result = await client.callTool({name: 'rr_get_format', arguments: {}});
   assert.notEqual(result.isError, true);
   const format = result.structuredContent;
-  assert.match(format.guide, /Group related changes on consecutive lines/);
+  assert.match(format.guide, /smallest independently reviewable change/);
+  assert.match(format.guide, /Keep prose, display-math blocks, and neighboring LaTeX environments in separate entries/);
+  assert.match(format.guide, /keep its opening and closing delimiters together/);
   assert.match(format.guide, /CR.*rejected/);
   assert.match(format.guide, /Omit it or use/);
   assert.ok(format.example.request[0].before.includes('\n'));

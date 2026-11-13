@@ -80,7 +80,7 @@ Both creation methods preserve the original line endings and UTF-8 BOM. Changes 
 
 - **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 
-- **Edit proposal**: Click pending code to place the caret and edit the proposed block directly in place. Save and Cancel replace its action buttons. Save changes only the `.rr` proposal; Accept is still required to change the original. Saving the original content removes that entry without affecting other decisions. Undo resolved entries before editing them.
+- **Edit proposal**: Click pending code to edit it directly in place. Alt+click adds cursors within that block for simultaneous typing, deletion, and pasting. **Accept** applies the current edited text immediately; no separate Save step is needed. Ctrl+Enter (also Cmd+Enter on macOS) does the same; change or disable it with `revisionRequest.acceptShortcut`. **Ignore** discards the draft and ignores the proposal. Escape cancels the draft; with multiple cursors, the first Escape returns to one cursor. Accepting text restored to the original removes that entry without changing the original. Undo resolved entries before editing them.
 
 
 

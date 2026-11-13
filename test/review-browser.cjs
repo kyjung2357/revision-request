@@ -19,7 +19,7 @@ const runName = new Date().toISOString().replace(/[:.]/g, '-');
 const runDir = path.join(scratchRoot, runName);
 const results = [];
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-let browser, server, cdp, computeInlineChanges, parseRequestDocument, resolveRequest, createRequestViewHtml, browserLog = '', runCreated = false;
+let browser, server, cdp, computeInlineChanges, computeFileInlineChanges, parseRequestDocument, resolveRequest, createRequestViewHtml, browserLog = '', runCreated = false;
 
 async function findBrowser() {
   const candidates = [
@@ -344,10 +344,9 @@ function assertInlinePresentation(snapshot, lineHighlight, onlyChanged, baseline
     const common = value.spans.filter(span => !span.changed), changed = value.spans.filter(span => span.changed);
     assert.ok(common.length >= 2, 'Separated word edits retain common source text');
     const oldSide = side === 'left';
-    assert.deepEqual(changed.map(span => span.text.trim()), [
-      oldSide ? '\\(F_1(x)=x^2+α\\)' : '\\(F_2(x)=x^3+λ\\)',
-      oldSide ? '\\(G_1(y)=y+β\\), 한글😀.' : '\\(G_2(y)=y+γ\\), 한글😃.'
-    ], 'Highlights cover complete whitespace-delimited LaTeX and Unicode words');
+    const expected = fixture.files[0].hunks[0].inlineChanges[0][oldSide ? 'before' : 'after'];
+    assert.deepEqual(changed.map(span => span.text), expected.filter(segment => segment.changed).map(segment => segment.text),
+      'Rendering preserves the language-specific highlight boundaries supplied by the core');
     assert.equal(value.text, fixture.files[0].hunks[0][side === 'left' ? 'before' : 'after'].split('\n')[0], 'Spans preserve exact LaTeX/Unicode text');
     assert.ok(value.text.includes('한글') && value.text.includes(side === 'left' ? '😀' : '😃'), 'Unicode stays literal');
     assert.ok(lineHighlight ? value.backgroundAlpha > 0 : value.backgroundAlpha === 0, 'Only the row tint follows Highlight Changed Lines');
@@ -406,7 +405,7 @@ async function assertNoLayoutShift(before) {
 }
 
 async function editSnapshot() {
-  return cdp.evaluate("(() => { const editor = document.querySelector('.pending-editor'); if (!editor) return null; const area = editor.querySelector('textarea'); const box = editor.getBoundingClientRect(); const areaBox = area.getBoundingClientRect(); const gutter = editor.querySelector('.action-gutter').getBoundingClientRect(); return {draft:area.value, readOnly:area.readOnly, wrap:area.wrap, whiteSpace:getComputedStyle(area).whiteSpace, selection:[area.selectionStart,area.selectionEnd], direction:area.selectionDirection, scroll:[area.scrollTop,area.scrollLeft], error:editor.querySelector('.pending-editor-error')?.textContent, saveDisabled:editor.querySelector('[data-focus-key=\"edit:save\"]').disabled, focused:document.activeElement.dataset.focusKey, rect:{x:box.x,y:box.y,right:box.right,bottom:box.bottom}, area:{x:areaBox.x,right:areaBox.right,width:area.clientWidth,scrollWidth:area.scrollWidth}, gutter:{x:gutter.x,right:gutter.right}, position:getComputedStyle(editor).position, role:editor.getAttribute('role'), buttons:Array.from(editor.querySelectorAll('.action-gutter button'),node=>node.textContent), persisted:window.__savedState.editing}; })()");
+  return cdp.evaluate("(() => { const editor = document.querySelector('.pending-editor'); if (!editor) return null; const area = editor.querySelector('textarea'); const box = editor.getBoundingClientRect(); const areaBox = area.getBoundingClientRect(); const gutter = editor.querySelector('.action-gutter').getBoundingClientRect(); return {draft:area.value, readOnly:area.readOnly, wrap:area.wrap, whiteSpace:getComputedStyle(area).whiteSpace, selection:[area.selectionStart,area.selectionEnd], direction:area.selectionDirection, scroll:[area.scrollTop,area.scrollLeft], error:editor.querySelector('.pending-editor-error')?.textContent, acceptDisabled:editor.querySelector('[data-focus-key=\"edit:accept\"]').disabled, focused:document.activeElement.dataset.focusKey, rect:{x:box.x,y:box.y,right:box.right,bottom:box.bottom}, area:{x:areaBox.x,right:areaBox.right,width:area.clientWidth,scrollWidth:area.scrollWidth}, gutter:{x:gutter.x,right:gutter.right}, position:getComputedStyle(editor).position, role:editor.getAttribute('role'), buttons:Array.from(editor.querySelectorAll('.action-gutter button'),node=>node.textContent), persisted:window.__savedState.editing}; })()");
 }
 async function directEditorSnapshot(id, remember = false) {
   return cdp.evaluate(`(() => {
@@ -480,17 +479,162 @@ function assertInlineEditor(snapshot, width) {
   assert.ok(snapshot.rect.x >= width / 2 - 10 && snapshot.rect.right <= width + 0.6, 'Editor stays in the proposed pane');
   assert.ok(snapshot.area.x >= snapshot.rect.x && snapshot.area.right <= snapshot.gutter.x + 0.6, 'Draft text ends before the action rail');
   assert.ok(snapshot.area.scrollWidth <= snapshot.area.width + 1, 'The draft is fully readable without horizontal scrolling');
-  assert.deepEqual([...snapshot.buttons].sort(), ['Cancel', 'Save'], 'Save/Cancel replace decision controls on the editing block');
+  assert.deepEqual([...snapshot.buttons].sort(), ['Accept', 'Ignore', 'Why'], 'Editing keeps the normal decision controls');
 }
 async function originalProjection() {
   return cdp.evaluate("Array.from(document.querySelectorAll('.code-side.left[data-line] .code-text'),node=>node.textContent.replace(/\u200b/g,'')).join('\\n')");
 }
-function singleLineFixture(before = 'Old text.\n', after = 'New text.\n') {
+function singleLineFixture(before = 'Old text.\n', after = 'New text.\n', targetPath = fixture.files[0].path) {
   const hunk = {id:'direct',index:0,start:0,end:before.length,before,after,oldStart:1,newStart:1,
     oldLines:before?1:0,newLines:after?1:0,decision:'pending',contextBefore:[],contextAfter:[]};
-  hunk.inlineChanges = computeInlineChanges(hunk);
-  return {...structuredClone(fixture),files:[{path:fixture.files[0].path,
+  hunk.inlineChanges = computeInlineChanges(hunk, 40, targetPath);
+  return {...structuredClone(fixture),files:[{path:targetPath,
     before:before+Array.from({length:105},(_,index)=>'Unchanged context '+index+'\n').join(''),hunks:[hunk]}]};
+}
+
+async function runLanguageHighlightTests(width) {
+  await runTest(width+'px: TeX atom groups, padding-only edits and commands render exact language-specific highlights', async () => {
+    const cases = [
+      ['f(a)', 'f(b)', ['(a)'], ['(b)']],
+      ['f( a )', 'f( b )', ['( a )'], ['( b )']],
+      ['{a} [ b ]', '{c} [ d ]', ['{a} [ b ]'], ['{c} [ d ]']],
+      ['(x - y)', '(x + y)', ['-'], ['+']],
+      ['a[i+1]', 'a[i+2]', ['i+1'], ['i+2']],
+      ['(a)', '( a )', [], [' ', ' ']],
+      ['(\\alpha)', '(\\beta)', ['(\\alpha)'], ['(\\beta)']],
+      ['\\alpha(x)', '\\beta(x)', ['\\alpha'], ['\\beta']],
+      ['(a)(b)', '(b)', ['(a)'], []],
+      ['(a)', '( b )(a)', [], ['( b )']],
+      ['((a))', '([b])', ['(a)'], ['[b]']],
+      ['((a))', '((b))', ['(a)'], ['(b)']]
+    ];
+    for (const [before,after,oldChanged,newChanged] of cases) {
+      await resetFixture(width);
+      const current = singleLineFixture(before+'\n',after+'\n');
+      await cdp.evaluate('window.__setReview('+JSON.stringify(current)+')'); await settle();
+      const visible = await cdp.evaluate('(()=>{const result={};for(const side of ["left","right"]){const cell=document.querySelector(".hunk .code-side."+side),source=cell.querySelector(".code-source"),code=source.querySelector(".code-text"),box=source.getBoundingClientRect(),gutter=cell.querySelector(".action-gutter")?.getBoundingClientRect();result[side]={text:code.textContent,changed:Array.from(code.querySelectorAll(".inline-changed"),node=>node.textContent),width:source.clientWidth,scroll:source.scrollWidth,right:box.right,gutter:gutter?.left};}return result;})()');
+      assert.equal(visible.left.text,before); assert.equal(visible.right.text,after);
+      assert.deepEqual(visible.left.changed,oldChanged,before+' old highlights');
+      assert.deepEqual(visible.right.changed,newChanged,after+' new highlights');
+      for(const side of ['left','right']) assert.ok(visible[side].scroll<=visible[side].width+1,'Highlight grouping cannot hide source text');
+      assert.ok(visible.right.right<=visible.right.gutter+.6,'Highlights stay inside the code column before buttons');
+      assertAligned(await geometry()); await assertTextProjection();
+      assert.equal(await cdp.evaluate('window.__messages.some(message=>["decide","undo","editAndAccept"].includes(message.type))'),false);
+    }
+    await screenshot('comparison-'+width+'-tex-highlight-groups');
+    const python = singleLineFixture('f(a)\n','f(b)\n','examples/sample.py');
+    await cdp.evaluate('window.__setReview('+JSON.stringify(python)+')'); await settle();
+    assert.deepEqual(await cdp.evaluate('Array.from(document.querySelectorAll(".hunk .code-side.left .inline-changed"),node=>node.textContent)'),['a']);
+    assert.deepEqual(await cdp.evaluate('Array.from(document.querySelectorAll(".hunk .code-side.right .inline-changed"),node=>node.textContent)'),['b']);
+    await assertTextProjection(); await resetFixture(width);
+  });
+}
+
+async function runProgrammingHighlightTests(width) {
+  await runTest(width+'px: Python JS JSON and Markdown show exact token highlights in both layouts', async () => {
+    const cases = [
+      ['examples/main.py','a[i+1]','a[i+2]',['1'],['2']],
+      ['examples/main.py','first_name = 0.95','last_name = 0.99',['first_name','0.95'],['last_name','0.99']],
+      ['examples/app.ts','user?.name === 1','user?.title !== 1',['name ==='],['title !==']],
+      ['examples/app.js','`Hello ${name}`','`Hello ${user}`',['name'],['user']],
+      ['examples/config.json','{"old key": "old value"}','{"new key": "new value"}',['old key','old'],['new key','new']],
+      ['examples/README.md','**old title**','**new title**',['old'],['new']],
+    ];
+    for (const [target,before,after,oldChanged,newChanged] of cases) {
+      await resetFixture(width);
+      await cdp.evaluate('window.__setReview('+JSON.stringify(singleLineFixture(before+'\n',after+'\n',target))+')'); await settle();
+      for (const mode of ['sideBySide','unified']) {
+        if (mode === 'unified') await toggleLayout();
+        const visible=await cdp.evaluate('(()=>{const result={};for(const side of ["left","right"]){const code=document.querySelector(".hunk .code-side."+side+" .code-text");result[side]={text:code.textContent,changed:Array.from(code.querySelectorAll(".inline-changed"),node=>node.textContent)};}return result;})()');
+        assert.equal(visible.left.text,before); assert.equal(visible.right.text,after);
+        assert.deepEqual(visible.left.changed,oldChanged); assert.deepEqual(visible.right.changed,newChanged);
+        if (mode === 'sideBySide') {assertAligned(await geometry()); await assertTextProjection();}
+      }
+      await toggleLayout();
+    }
+    await resetFixture(width);
+    const source='# Example\n~~~python\na[i+1]\n~~~\n**old title**\n'+Array.from({length:105},(_,index)=>'Unchanged context '+index+'\n').join('');
+    const doc={path:'examples/README.md',request:[{line:3,before:'1',after:'2',status:'pending'},{line:5,before:'old',after:'new',status:'pending'}]};
+    const resolved=resolveRequest(doc,source), highlights=computeFileInlineChanges(resolved.file,resolved.hunks,{},1000);
+    const state={...structuredClone(fixture),files:[{path:doc.path,before:source,hunks:resolved.hunks.map(hunk=>({...hunk,decision:'pending',inlineChanges:highlights.get(hunk.id)}))}]};
+    await cdp.evaluate('window.__setReview('+JSON.stringify(state)+')'); await settle();
+    assert.deepEqual(await cdp.evaluate('Array.from(document.querySelectorAll(".hunk"),hunk=>Array.from(hunk.querySelectorAll(".right .inline-changed"),span=>span.textContent))'),[['2'],['new']]);
+    assertAligned(await geometry()); await assertTextProjection();
+    await screenshot('comparison-'+width+'-language-highlights');
+    await resetFixture(width);
+  });
+}
+
+async function clickEditorOffset(offset, alt = true) {
+  const point = await cdp.evaluate('(() => {const area=document.querySelector(".pending-editor textarea");area.scrollIntoView({block:"nearest"});const mirror=area.parentElement.querySelector(".code-text");const walker=document.createTreeWalker(mirror,NodeFilter.SHOW_TEXT);let remaining='+offset+',last;while(walker.nextNode()){last=walker.currentNode;if(remaining<=last.length)break;remaining-=last.length;}const range=document.createRange();range.setStart(last,Math.min(remaining,last.length));range.collapse(true);const rect=range.getBoundingClientRect();return {x:rect.x+.2,y:rect.y+rect.height/2};})()');
+  await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,modifiers:alt?1:0,...point});
+  await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,modifiers:alt?1:0,...point});
+  await settle();
+}
+async function editorCursors() {return cdp.evaluate('({primary:[document.querySelector(".pending-editor textarea").selectionStart,document.querySelector(".pending-editor textarea").selectionEnd],secondary:window.__savedState.editing.secondarySelections||[],visible:document.querySelectorAll(".editor-extra-caret").length,count:Number(document.querySelector(".pending-editor textarea").dataset.cursorCount)})');}
+async function runMulticursorTests(width) {
+  const begin = async text => {await resetFixture(width);await openEdit('grow');await writeDraft(text);await clickEditorOffset(0,false);};
+  await runTest(width+'px: Alt-click adds real inline cursors and simultaneous typing, deletion, undo, redo and selections',async()=>{
+    await begin('alpha one\nbeta one\ngamma one');
+    await clickEditorOffset(6,false);await clickEditorOffset(15);await clickEditorOffset(25);
+    let cursors=await editorCursors();assert.equal(cursors.count,3);assert.equal(cursors.visible,2);
+    assert.deepEqual(cursors.primary,[25,25]);assert.deepEqual(cursors.secondary.map(item=>item.start),[6,15]);
+    await cdp.send('Input.insertText',{text:'X'});await settle();
+    assert.equal((await editSnapshot()).draft,'alpha Xone\nbeta Xone\ngamma Xone');
+    await editorKey('z',{ctrlKey:true});assert.equal((await editSnapshot()).draft,'alpha one\nbeta one\ngamma one');assert.equal((await editorCursors()).count,3);
+    await editorKey('z',{ctrlKey:true,shiftKey:true});assert.equal((await editSnapshot()).draft,'alpha Xone\nbeta Xone\ngamma Xone');
+    await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});
+    await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});await settle();
+    assert.equal((await editSnapshot()).draft,'alpha one\nbeta one\ngamma one');
+    await nativeEditorKey('ArrowRight',8);await nativeEditorKey('ArrowRight',8);await nativeEditorKey('ArrowRight',8);
+    await cdp.send('Input.insertText',{text:'two'});await settle();assert.equal((await editSnapshot()).draft,'alpha two\nbeta two\ngamma two');
+    await screenshot('multicursor-'+width);
+    await editorKey('Escape');assert.equal((await editorCursors()).count,1);assert.ok(await editSnapshot(),'First Escape clears extra cursors without losing draft');
+    await editorKey('Escape');assert.equal(await editSnapshot(),null);
+  });
+  await runTest(width+'px: multi-cursor paste, grapheme deletion and committed IME input preserve Unicode and cancel/save behavior',async()=>{
+    await begin('a\nb');await clickEditorOffset(1,false);await clickEditorOffset(3);
+    await cdp.evaluate('(()=>{const data=new DataTransfer();data.setData("text/plain","😀é");document.querySelector(".pending-editor textarea").dispatchEvent(new ClipboardEvent("paste",{clipboardData:data,bubbles:true,cancelable:true}));})()');await settle();
+    assert.equal((await editSnapshot()).draft,'a😀é\nb😀é');
+    for(let i=0;i<2;i++){await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});}await settle();
+    assert.equal((await editSnapshot()).draft,'a\nb','Backspace removes whole combining graphemes and emoji at all cursors');
+    await cdp.send('Input.imeSetComposition',{text:'ㅎ',selectionStart:1,selectionEnd:1});await settle();
+    assert.equal((await editSnapshot()).draft,'a\nbㅎ','Intermediate IME text is not duplicated');
+    await cdp.send('Input.imeSetComposition',{text:'한',selectionStart:1,selectionEnd:1});
+    await cdp.send('Input.insertText',{text:'한'});await settle();
+    assert.equal((await editSnapshot()).draft,'a한\nb한','One committed Korean composition is replicated once');
+    await editorKey('z',{ctrlKey:true});assert.equal((await editSnapshot()).draft,'a\nb');
+    await editorKey('y',{ctrlKey:true});assert.equal((await editSnapshot()).draft,'a한\nb한');
+    assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="editAndAccept"||message.type==="decide").length'),0,'Multi-cursor edits are local drafts');
+    await editorKey('Enter',{ctrlKey:true});
+    const message=await cdp.evaluate('window.__messages.filter(message=>message.type==="editAndAccept").at(-1)');assert.equal(message.draft,'a한\nb한');
+    await editAck(message,{ok:false,error:'Injected failure'});assert.equal((await editorCursors()).count,2,'Failed save retains all cursor positions');
+    await editorKey('Escape');await editorKey('Escape');assert.equal(await editSnapshot(),null);
+  });
+  await runTest(width+'px: canceled composition keeps different selected words and unsupported native edits clear extra cursors',async()=>{
+    await begin('red\nblue');await clickEditorOffset(0,false);await clickEditorOffset(4);await nativeEditorKey('ArrowRight',8);
+    const selected=await editorCursors();assert.equal(selected.count,2);
+    await cdp.evaluate('(()=>{const area=document.querySelector(".pending-editor textarea");area.dispatchEvent(new CompositionEvent("compositionstart",{bubbles:true}));area.dispatchEvent(new CompositionEvent("compositionend",{data:"",bubbles:true}));})()');await settle();
+    assert.equal((await editSnapshot()).draft,'red\nblue','Canceling an untouched composition never copies one selected word over another');
+    assert.deepEqual(await editorCursors(),selected);
+    await cdp.evaluate('(()=>{const area=document.querySelector(".pending-editor textarea");area.dispatchEvent(new InputEvent("beforeinput",{inputType:"insertFromDrop",data:"!",bubbles:true,cancelable:false}));area.setRangeText("!",area.selectionStart,area.selectionEnd,"end");area.dispatchEvent(new InputEvent("input",{inputType:"insertFromDrop",data:"!",bubbles:true}));})()');await settle();
+    assert.equal((await editorCursors()).count,1);assert.equal((await editSnapshot()).draft,'red\n!lue');
+    await editorKey('z',{ctrlKey:true});assert.equal((await editSnapshot()).draft,'red\nblue','Native fallback remains undoable');
+    await editorKey('Escape');
+  });
+  await runTest(width+'px: wrapped Alt-click positions and multi-cursor drafts survive refresh and resize',async()=>{
+    const draft='prefix '+('long_token '.repeat(25))+'END\nsecond END';
+    await begin(draft);await clickEditorOffset(draft.indexOf('END'),false);await clickEditorOffset(draft.lastIndexOf('END'));
+    assert.equal((await editorCursors()).count,2);
+    await cdp.evaluate('window.__setReview(structuredClone(window.__review))');await settle();
+    assert.equal((await editSnapshot()).draft,draft);assert.equal((await editorCursors()).count,2);assert.equal((await editorCursors()).visible,1);
+    await cdp.send('Emulation.setDeviceMetricsOverride',{width:width+100,height:850,deviceScaleFactor:1,mobile:false});await settle();
+    assert.equal((await editorCursors()).count,2);await cdp.send('Input.insertText',{text:'new_'});await settle();
+    assert.equal((await editSnapshot()).draft,draft.replaceAll('END','new_END'));
+    await editorKey('a',{ctrlKey:true});await cdp.evaluate('document.querySelector(".pending-editor textarea").select()');await cdp.send('Input.insertText',{text:'one whole buffer'});await settle();
+    assert.equal((await editSnapshot()).draft,'one whole buffer');assert.equal((await editorCursors()).count,1,'Select all returns to a single selection');
+    await editorKey('Escape');await resetFixture(width);
+  });
 }
 async function runEditorTests(width) {
   await resetFixture(width);
@@ -536,7 +680,7 @@ async function runEditorTests(width) {
     const busy=await editSnapshot();
     assert.equal(await cdp.evaluate("window.__busyArea===document.querySelector('.pending-editor textarea')&&window.__busyRows.every((row,index)=>row===document.querySelectorAll('.diff-row')[index])"),true,'Busy notification replaces neither input nor rows');
     assert.equal(busy.draft,before.draft); assert.deepEqual(busy.selection,before.selection); assert.equal(busy.direction,'backward');
-    assert.equal(busy.readOnly,true); assert.equal(busy.saveDisabled,true); assert.equal(busy.focused,'edit:draft');
+    assert.equal(busy.readOnly,true); assert.equal(busy.acceptDisabled,true); assert.equal(busy.focused,'edit:draft');
     assert.deepEqual((await geometry()).rows,layout.rows);
     await cdp.send('Input.insertText',{text:'blocked'}); await settle();
     assert.equal((await editSnapshot()).draft,before.draft,'Busy input cannot accept an accidental edit');
@@ -576,7 +720,7 @@ async function runEditorTests(width) {
     assert.ok(opened.selection[0] >= clickedRowStart && opened.selection[0] <= clickedRowEnd, 'Caret starts within the clicked proposed row');
     assert.equal(await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button,.file-actions button')).filter(button=>!button.dataset.focusKey?.startsWith('edit:')).every(button=>button.disabled)"), true, 'Drafting blocks review decisions');
     const messages = await cdp.evaluate('window.__messages.length');
-    await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button')).find(node=>node.textContent==='Accept')?.click()");
+    await cdp.evaluate("Array.from(document.querySelectorAll('.inline-actions button')).find(node=>node.textContent==='Accept'&&!node.dataset.focusKey?.startsWith('edit:'))?.click()");
     assert.equal(await cdp.evaluate('window.__messages.length'), messages, 'Disabled Accept cannot submit a decision');
     assertAligned(await geometry());
     assert.equal(await originalProjection(), original, 'Entering an editor preserves every original line');
@@ -585,12 +729,12 @@ async function runEditorTests(width) {
     opened = await editSnapshot();
     assert.ok(opened.draft.includes('Typed directly. '), 'Real keyboard input edits the focused inline textarea');
     await writeDraft('Unsubmitted draft <script>window.__xss=99</script>\n');
-    await cdp.evaluate("document.querySelector('[data-focus-key=\"edit:save\"]').focus()");
+    await cdp.evaluate("document.querySelector('[data-focus-key=\"edit:accept\"]').focus()");
     await editorKey('Escape');
     assert.equal(await editSnapshot(), null, 'Escape from any editor control cancels');
     assert.equal(await cdp.evaluate('document.activeElement.dataset.editRow'), '1', 'Cancel restores the clicked row, including a non-first row');
     assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].after'), fixture.files[0].hunks[0].after);
-    assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').length"), 0);
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').length"), 0);
     await assertTextProjection(); assertAligned(await geometry());
     await openEdit('delete', 'click'); assert.equal((await editSnapshot()).draft, '', 'Pure deletion has an editable empty proposal');
     await writeDraft('Replacement for the deleted lines.\nSecond line.\n');
@@ -602,7 +746,7 @@ async function runEditorTests(width) {
     await clickUndo('grow'); await openEdit('grow', 'Enter'); await editorKey('Escape');
     await resetFixture(width);
   });
-  await runTest(width + 'px: multiline inline draft and caret survive busy refreshes; stale revisions never retarget a save', async () => {
+  await runTest(width + 'px: multiline inline draft and caret survive busy refreshes; stale revisions never retarget acceptance', async () => {
     await openEdit('grow', 'F2');
     const draft = '\t' + 'long_draft '.repeat(35) + '<img src=x onerror="window.__xss=91">\n' + 'draft line\n'.repeat(20);
     await writeDraft(draft);
@@ -611,18 +755,18 @@ async function runEditorTests(width) {
     await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop=44; window.__setReview({...window.__review,busy:true})"); await settle();
     let current = await editSnapshot();
     assert.equal(current.draft,draft); assert.deepEqual(current.selection,prior.selection); assert.deepEqual(current.scroll,prior.scroll);
-    assert.equal(current.persisted.draft,draft); assert.equal(current.saveDisabled,true); assert.equal(current.focused,'edit:draft');
+    assert.equal(current.persisted.draft,draft); assert.equal(current.acceptDisabled,true); assert.equal(current.focused,'edit:draft');
     assertInlineEditor(current, width);
     assert.equal((await geometry()).scroll.top,44); assertAligned(await geometry());
     await cdp.evaluate("window.__setReview({...window.__review,busy:false})"); await settle();
-    assert.equal((await editSnapshot()).saveDisabled,false);
+    assert.equal((await editSnapshot()).acceptDisabled,false);
     const originalRevision = (await editSnapshot()).persisted.revision;
     await cdp.evaluate("window.__setReview({...window.__review,revision:'externally-changed'})"); await settle();
     current = await editSnapshot();
-    assert.equal(current.draft,draft); assert.equal(current.persisted.revision,originalRevision); assert.equal(current.saveDisabled,true);
+    assert.equal(current.draft,draft); assert.equal(current.persisted.revision,originalRevision); assert.equal(current.acceptDisabled,true);
     assert.ok(current.error.includes('request changed')); assert.equal(current.focused,'edit:draft');
     await editorKey('Enter',{ctrlKey:true});
-    assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').length"),0, 'Stale shortcut cannot submit with a newer revision');
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').length"),0, 'Stale shortcut cannot submit with a newer revision');
     assert.equal(await cdp.evaluate('window.__xss'),0);
     await editorKey('Escape');
     await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop=0");
@@ -638,61 +782,98 @@ async function runEditorTests(width) {
       await settle();
       const editor = await editSnapshot();
       assert.ok(editor, 'A stale or unparseable request cannot hide an unsaved draft');
-      assert.equal(editor.draft,draft); assert.equal(editor.saveDisabled,true);
+      assert.equal(editor.draft,draft); assert.equal(editor.acceptDisabled,true);
       assert.notEqual(editor.position,'fixed'); assert.notEqual(editor.role,'dialog');
       assert.ok(editor.area.width > 40, 'Stale draft retains a visible text area');
       assert.ok(editor.error.includes('request changed'));
       await cdp.evaluate("document.querySelector('.pending-editor textarea').select()");
       assert.deepEqual((await editSnapshot()).selection,[0,draft.length],'The complete draft remains selectable for copying');
-      const cancelDisabled = await cdp.evaluate("document.querySelector('.pending-editor [data-focus-key=\"edit:cancel\"]').disabled");
-      assert.equal(cancelDisabled,false,'Cancel stays available after the request disappears');
-      await cdp.evaluate("document.querySelector('.pending-editor [data-focus-key=\"edit:cancel\"]').click()"); await settle();
+      await editorKey('Escape');
       assert.equal(await editSnapshot(),null);
     }
     await resetFixture(width);
   });
-  await runTest(width + 'px: inline Save correlates acknowledgements, keeps failed drafts, and updates only the proposal', async () => {
+  await runTest(width + 'px: inline Accept correlates acknowledgements, keeps failed drafts, and applies the edited block', async () => {
     await openEdit('grow');
     const draft = 'Edited proposal <svg onload="window.__xss=92">literal</svg>.\nA second revised line.\n';
     await writeDraft(draft);
-    const sourceBefore = await originalProjection();
     await editorKey('Enter',{ctrlKey:true});
-    let message = await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
-    assert.deepEqual({...message,editId:undefined},{type:'editPending',filePath:fixture.files[0].path,hunkId:'grow',draft,revision:fixture.revision,editId:undefined});
+    let message = await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').at(-1)");
+    assert.deepEqual({...message,editId:undefined},{type:'editAndAccept',filePath:fixture.files[0].path,hunkId:'grow',draft,revision:fixture.revision,editId:undefined});
     assert.ok(typeof message.editId==='string' && message.editId.length>0);
-    assert.equal((await editSnapshot()).readOnly,true); assert.equal((await editSnapshot()).saveDisabled,true);
+    assert.equal((await editSnapshot()).readOnly,true); assert.equal((await editSnapshot()).acceptDisabled,true);
     await editAck(message,{success:true,editId:'unrelated-edit-id',revision:'unrelated-revision'});
     assert.equal((await editSnapshot()).draft,draft,'Unrelated acknowledgements cannot close or change a draft');
     await cdp.evaluate("window.__setReview({...window.__review,busy:true})"); await settle();
     assert.equal((await editSnapshot()).draft,draft);
     await cdp.evaluate("window.__setReview({...window.__review,busy:false})"); await settle();
-    const error = 'Request save failed <img src=x onerror="window.__xss=93">.';
+    const error = 'Accept failed <img src=x onerror="window.__xss=93">.';
     await editAck(message,{success:false,error});
     let editor = await editSnapshot();
-    assert.equal(editor.draft,draft); assert.equal(editor.error,error); assert.equal(editor.readOnly,false); assert.equal(editor.saveDisabled,false); assert.equal(editor.focused,'edit:draft');
-    assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].after'),fixture.files[0].hunks[0].after,'Failed save retains original proposal');
+    assert.equal(editor.draft,draft); assert.equal(editor.error,error); assert.equal(editor.readOnly,false); assert.equal(editor.acceptDisabled,false); assert.equal(editor.focused,'edit:draft');
+    assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].after'),fixture.files[0].hunks[0].after,'Failed acceptance retains original proposal');
     await editorKey('Enter',{metaKey:true});
-    const retry = await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
+    const retry = await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').at(-1)");
     assert.notEqual(retry.editId,message.editId); assert.equal(retry.revision,fixture.revision); assert.equal(retry.draft,draft);
     await editAck(message,{success:false,error:'Delayed first result'});
-    assert.equal((await editSnapshot()).readOnly,true,'Old attempt cannot unlock a newer pending save');
-    await cdp.evaluate("(() => { const next=structuredClone(window.__review); next.revision='browser-edited-v2'; const hunk=next.files[0].hunks[0]; hunk.after=" + JSON.stringify(draft) + "; hunk.id='grow-edited'; hunk.newLines=2; delete hunk.inlineChanges; window.__setReview(next); })()");
+    assert.equal((await editSnapshot()).readOnly,true,'Old attempt cannot unlock a newer pending acceptance');
+    await cdp.evaluate("(() => { const next=structuredClone(window.__review); next.revision='browser-edited-v2'; const hunk=next.files[0].hunks[0]; hunk.after=" + JSON.stringify(draft) + "; hunk.id='grow-edited'; hunk.decision='accepted'; hunk.newLines=2; delete hunk.inlineChanges; window.__setReview(next); })()");
     await settle();
     assert.equal((await editSnapshot()).draft,draft,'New state before acknowledgement still preserves the draft');
-    assert.equal(await originalProjection(),sourceBefore,'Saving proposal does not alter the original projection');
+    assert.ok((await originalProjection()).includes(draft.trimEnd()),'The accepted state displays the edited original');
     await editAck(retry,{success:true,revision:'browser-edited-v2',changed:true});
     assert.equal(await editSnapshot(),null,'Only matching successful acknowledgement closes the editor');
-    assert.equal(await cdp.evaluate('document.activeElement.dataset.editHunk'),'grow-edited','Focus follows the newly computed pending hunk');
+    assert.equal(await cdp.evaluate('document.activeElement.dataset.editHunk'),'delete','Focus advances to the next pending block');
     assert.equal(await cdp.evaluate('window.__savedState.editing'),null);
-    assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].decision'),'pending');
+    assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].decision'),'accepted');
+    assert.ok((await originalProjection()).includes(draft.trimEnd()),'The accepted edited text appears in the original projection');
     await assertTextProjection(); assertAligned(await geometry()); assert.equal(await cdp.evaluate('window.__xss'),0);
     await screenshot('comparison-' + width + '-edited-proposal');
     await resetFixture(width);
   });
 }
 
+async function runEditorDecisionTests(width) {
+  await runTest(width+'px: configured editor shortcuts approve once and retain drafts across settings, IME and failed decisions',async()=>{
+    await resetFixture(width);await openEdit('grow');await writeDraft('Editable draft');
+    const sent=()=>cdp.evaluate('window.__messages.filter(message=>message.type==="editAndAccept")');
+    const setting=async value=>{await cdp.evaluate('window.__setReview({...window.__review,acceptShortcut:'+JSON.stringify(value)+'})');await settle();};
+    await setting('ctrlEnter');await editorKey('Tab');assert.equal((await editSnapshot()).draft,'Editable draft\t','Default Tab still inserts indentation');assert.equal((await sent()).length,0);
+    await setting('none');await editorKey('Enter',{ctrlKey:true});await editorKey('Enter',{altKey:true});assert.equal((await sent()).length,0);
+    const draft=(await editSnapshot()).draft;
+    for(const [name,key,modifiers] of [['ctrlEnter','Enter',{ctrlKey:true}],['altEnter','Enter',{altKey:true}],['tab','Tab',{}],['shiftTab','Tab',{shiftKey:true}],['unexpected','Enter',{metaKey:true}]]) {
+      await setting(name);assert.equal((await editSnapshot()).draft,draft,'Setting refresh never loses typed text');
+      const count=(await sent()).length;
+      await editorKey(key,{...modifiers,isComposing:true});await editorKey(key,{...modifiers,keyCode:229});await editorKey(key,{...modifiers,repeat:true});
+      assert.equal((await sent()).length,count,'IME and held keys cannot approve');
+      await editorKey(key,{...modifiers,ctrlKey:true,metaKey:true,altKey:true,shiftKey:true});assert.equal((await sent()).length,count,'Non-matching modifier combinations cannot approve');
+      await editorKey(key,modifiers);const messages=await sent();assert.equal(messages.length,count+1);assert.equal(messages.at(-1).draft,draft);
+      await editorKey(key,modifiers);assert.equal((await sent()).length,count+1,'An outstanding decision prevents duplicate approval');
+      await editAck(messages.at(-1),{success:false,error:'Retain this draft.'});assert.equal((await editSnapshot()).draft,draft);
+    }
+    await setting('none');await cdp.evaluate("document.querySelector('[data-focus-key=\"edit:accept\"]').click()");await settle();
+    const last=(await sent()).at(-1);assert.equal(last.draft,draft,'Accept button remains available with shortcuts disabled');
+    await editAck(last,{success:false,error:'Retain this draft.'});await editorKey('Escape');await resetFixture(width);
+  });
+  await runTest(width+'px: editing Why preserves the draft and correlated Ignore discards it only after success',async()=>{
+    await resetFixture(width);await openEdit('grow');await writeDraft('An unaccepted local draft.');
+    const original=await originalProjection(),before=await geometry();
+    await clickWhy('grow');assert.equal((await editSnapshot()).draft,'An unaccepted local draft.');await assertNoLayoutShift(before);
+    await cdp.evaluate('document.querySelector(".why-popover .why-close").click()');await settle();
+    assert.equal((await editSnapshot()).draft,'An unaccepted local draft.');
+    const ignore=async()=>{await cdp.evaluate("document.querySelector('[data-focus-key=\"edit:ignore\"]').click()");await settle();return cdp.evaluate('window.__messages.filter(message=>message.type==="ignoreEdited").at(-1)');};
+    const first=await ignore();assert.ok(first);assert.equal(first.draft,undefined,'Ignore never persists edited draft text');assert.equal((await editSnapshot()).readOnly,true);
+    await editAck(first,{success:false,error:'Ignore failed.'});assert.equal((await editSnapshot()).draft,'An unaccepted local draft.');assert.equal((await editSnapshot()).readOnly,false);
+    const second=await ignore();assert.notEqual(second.editId,first.editId);
+    await editAck(first,{success:true,revision:'late-first'});assert.equal((await editSnapshot()).readOnly,true,'Late previous replies cannot discard this draft');
+    await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.revision="ignored-v2";next.files[0].hunks[0].decision="ignored";window.__setReview(next);})()');await settle();
+    assert.ok(await editSnapshot(),'Keep draft until its matching result arrives');await editAck(second,{success:true,revision:'ignored-v2'});
+    assert.equal(await editSnapshot(),null);assert.equal(await originalProjection(),original);assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].after'),fixture.files[0].hunks[0].after);
+    await resetFixture(width);
+  });
+}
 async function runEditorButtonTests(width) {
-  await runTest(width+'px: Save and Cancel reuse the same button slots and text metrics as Accept and Ignore',async()=>{
+  await runTest(width+'px: editing keeps Accept, Ignore and Why in the same button slots and text metrics',async()=>{
     for(const unified of [false,true])for(const direct of [false,true]) {
       await resetFixture(width);if((await unifiedSnapshot()).unified!==unified)await toggleLayout();
       if(direct){await cdp.evaluate('window.__setReview('+JSON.stringify(singleLineFixture())+')');await settle();}
@@ -701,15 +882,15 @@ async function runEditorButtonTests(width) {
       const before=await metrics();await openEdit(id);const editing=await metrics();
       assert.equal(editing.origin,before.origin,'Editing preserves the action group origin');assert.equal(editing.gutterRight,before.gutterRight,'The reserved Why slot keeps the whole action rail unchanged');
       for(let index=0;index<2;index++) {
-        assert.equal(editing.buttons[index].label,index?'Cancel':'Save');
+        assert.equal(editing.buttons[index].label,index?'Ignore':'Accept');
         const {label:oldLabel,...oldMetrics}=before.buttons[index],{label:newLabel,...newMetrics}=editing.buttons[index];
         assert.deepEqual(newMetrics,oldMetrics,'Editor and decision buttons share exact width, position, height, text metrics, padding, and colors');
         assert.equal(newMetrics.width,width<=650?41:43);assert.equal(newMetrics.height,18);
       }
       await editorKey('Enter',{ctrlKey:true});const saving=await metrics();
-      assert.equal(saving.buttons[0].label,'Saving…');assert.equal(saving.buttons[0].width,before.buttons[0].width,'The saving label cannot resize its action slot');
+      assert.equal(saving.buttons[0].label,'Accept');assert.equal(saving.buttons[0].width,before.buttons[0].width,'The busy action cannot resize its slot');
       assert.equal(saving.buttons[1].x,before.buttons[1].x);
-      const sent=await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
+      const sent=await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').at(-1)");
       await editAck(sent,{success:false,error:'Test host leaves the draft open.'});await editorKey('Escape');
       if(unified)await toggleLayout();
     }
@@ -899,7 +1080,7 @@ async function runSplitterTests(width) {
     assert.ok(Math.abs(moved.saved-moved.ratio)<.002); assert.equal(moved.dragging,false);
     assertAligned(await geometry()); await assertTextProjection(); await assertMatchingContextWraps();
     assert.equal(await cdp.evaluate("JSON.stringify(window.__review)"),text,'Pane resizing cannot alter review content or decisions');
-    assert.equal(await cdp.evaluate("window.__messages.filter(message=>['decide','editPending','undo'].includes(message.type)).length"),0);
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>['decide','editAndAccept','undo'].includes(message.type)).length"),0);
     await screenshot('comparison-'+width+'-resized-panes');
     const cancelled=await dragSplitter(.52,true);
     assert.ok(Math.abs(cancelled.ratio-moved.ratio)<.002,'Pointer cancellation restores the pre-drag ratio');
@@ -987,7 +1168,7 @@ async function runGroupedRequestTests(width) {
     const state={...structuredClone(fixture),files:[{path:fixture.files[0].path,before:resolved.file.before,
       hunks:resolved.hunks.map(hunk=>{const preview={...hunk,after:hunk.displayAfter??hunk.after};return {...preview,
         decision:resolved.decisions[hunk.id],explanation:document.request[resolved.entryIndexByHunkId[hunk.id]].reason,
-        inlineChanges:computeInlineChanges(preview)};})}]};
+        inlineChanges:computeInlineChanges(preview, 40, fixture.files[0].path)};})}]};
     await cdp.evaluate('window.__setReview('+JSON.stringify(state)+')');await settle();
     const controls=id=>cdp.evaluate(`(() => {const block=Array.from(document.querySelectorAll('[data-overview-hunk]')).find(node=>node.dataset.overviewHunk===${JSON.stringify(id)});const why=block.querySelector('.why-toggle');return {accept:block.querySelectorAll('.button-accept').length,ignore:Array.from(block.querySelectorAll('button')).filter(button=>button.textContent==='Ignore').length,undo:Array.from(block.querySelectorAll('button')).filter(button=>button.textContent==='Undo').length,rows:block.querySelectorAll('.diff-row').length,height:block.getBoundingClientRect().height,why:why?{disabled:why.disabled,visibility:getComputedStyle(why).visibility,color:getComputedStyle(why).color,background:getComputedStyle(why).backgroundColor}:null};})()`);
     for(const hunk of state.files[0].hunks){const buttons=await controls(hunk.id);assert.equal(buttons.accept,1);assert.equal(buttons.ignore,1);assert.ok(buttons.rows>=2,'A multiline group has several source rows but one decision pair');if(!hunk.explanation)assert.deepEqual(buttons.why,{disabled:true,visibility:'visible',color:'rgba(0, 0, 0, 0)',background:'rgba(0, 0, 0, 0)'},'Omitted and empty multiline reasons retain a fully transparent disabled Why button');}
@@ -999,7 +1180,7 @@ async function runGroupedRequestTests(width) {
     const draft=await editSnapshot();assert.equal(draft.draft,document.request[1].after,'The complete multiline draft preserves its intentional terminal blank line');
     assertInlineEditor(draft,width);
     await editorKey('Enter',{ctrlKey:true});
-    const saved=await cdp.evaluate("window.__messages.filter(message=>message.type==='editPending').at(-1)");
+    const saved=await cdp.evaluate("window.__messages.filter(message=>message.type==='editAndAccept').at(-1)");
     assert.equal(saved.draft,document.request[1].after,'Saving the full block does not strip its intentional terminal blank line');
     await editAck(saved,{success:false,error:'Test host retains this draft for cancellation.'});await editorKey('Escape');
     for(const hunk of state.files[0].hunks) {
@@ -1023,7 +1204,7 @@ async function runUnterminatedAppendTests(width) {
       const document=parseRequestDocument(JSON.stringify({path:fixture.files[0].path,request:[{line:2,before:null,after,status:'pending'}]}));
       const resolved=resolveRequest(document,baseline,baseline), hunk=resolved.hunks[0];
       const preview={...hunk,after:hunk.displayAfter??hunk.after};
-      const state={...structuredClone(fixture),files:[{path:fixture.files[0].path,before:baseline,hunks:[{...preview,decision:'pending',inlineChanges:computeInlineChanges(preview)}]}]};
+      const state={...structuredClone(fixture),files:[{path:fixture.files[0].path,before:baseline,hunks:[{...preview,decision:'pending',inlineChanges:computeInlineChanges(preview, 40, fixture.files[0].path)}]}]};
       await cdp.evaluate('window.__setReview('+JSON.stringify(state)+')');await settle();
       const block=()=>cdp.evaluate(`(() => {const group=Array.from(document.querySelectorAll('[data-overview-hunk]')).find(node=>node.dataset.overviewHunk===${JSON.stringify(hunk.id)});if(!group)return null;return {rows:group.querySelectorAll('.diff-row').length,accept:group.querySelectorAll('.button-accept').length,ignore:Array.from(group.querySelectorAll('button')).filter(node=>node.textContent==='Ignore').length,undo:Array.from(group.querySelectorAll('button')).filter(node=>node.textContent==='Undo').length,right:Array.from(group.querySelectorAll('.code-side.right[data-line] .code-text'),node=>node.textContent.replace(/\u200b/g,'')),numbers:Array.from(group.querySelectorAll('.code-side.right[data-line]'),node=>Number(node.dataset.line))};})()`);
       const projection=side=>cdp.evaluate(`Array.from(document.querySelectorAll('.code-side.${side}[data-line] .code-text'),node=>node.textContent.replace(/\u200b/g,''))`);
@@ -1117,7 +1298,7 @@ async function runNavigationTests(width) {
     await nativeEditorKey('ArrowDown');assert.equal((await overviewSnapshot()).top,22);
     await nativeEditorKey('PageDown');assert.ok((await overviewSnapshot()).top>200);
     await nativeEditorKey('End');const ended=await overviewSnapshot();assert.ok(Math.abs(ended.top-ended.max)<1.1);
-    assert.equal(await cdp.evaluate("window.__messages.filter(message=>['decide','undo','editPending'].includes(message.type)).length"),0,'Rail navigation cannot submit review decisions');
+    assert.equal(await cdp.evaluate("window.__messages.filter(message=>['decide','undo','editAndAccept'].includes(message.type)).length"),0,'Rail navigation cannot submit review decisions');
     await screenshot('comparison-'+width+'-change-scrollbar');
     await cdp.evaluate("document.querySelector('[data-scroll-area]').scrollTop=0");await settle();
     await clickDecision('grow','accept');
@@ -1266,7 +1447,7 @@ async function runLayoutTests() {
       const longState = { ...structuredClone(fixture), files: [{path: fixture.files[0].path, before: beforeLine + tail,
         hunks: [{id: 'long', index: 0, start: 0, end: beforeLine.length, before: beforeLine, after: afterLine,
           oldStart: 1, newStart: 1, oldLines: 1, newLines: 1, decision: 'pending', contextBefore: [], contextAfter: [],
-          inlineChanges: computeInlineChanges({before: beforeLine, after: afterLine})}] }] };
+          inlineChanges: computeInlineChanges({before: beforeLine, after: afterLine}, 40, fixture.files[0].path)}] }] };
       const metrics = () => cdp.evaluate(`(() => {
         const rect = node => { const box = node.getBoundingClientRect(); return {x: box.x, y: box.y, right: box.right, bottom:box.bottom, width: box.width, height: box.height}; };
         const data = {horizontalBars:document.querySelectorAll('[data-horizontal],.horizontal-bars').length};
@@ -1322,8 +1503,12 @@ async function runLayoutTests() {
         await settle(); await resetFixture(width);
       }
     });
+    await runLanguageHighlightTests(width);
+    await runProgrammingHighlightTests(width);
     await runEditorTests(width);
+    await runMulticursorTests(width);
     await runEditorButtonTests(width);
+    await runEditorDecisionTests(width);
     await runGroupedRequestTests(width);
     await runUnterminatedAppendTests(width);
     await runNavigationTests(width);
@@ -1451,7 +1636,7 @@ async function runLayoutTests() {
       assert.ok(actual.code.includes('<img src=x onerror="window.__xss=1">'));
     });
     let inlineBaseline, inlineGeometry;
-    await runTest(width + 'px: default inline rendering highlights complete LaTeX and Unicode words', async () => {
+    await runTest(width + 'px: default inline rendering preserves language-aware LaTeX and Unicode highlights', async () => {
       inlineBaseline = await inlinePresentation(); inlineGeometry = await geometry();
       assertInlinePresentation(inlineBaseline, true, false); await assertTextProjection();
     });
@@ -1652,18 +1837,24 @@ async function main() {
   await Promise.all([[corePath,'core.ts'],[requestPath,'request.ts'],[createPath,'createRequestView.ts']].map(([outfile,entry])=>
     require('esbuild').build({entryPoints:[path.join(root,'src',entry)],outfile,
       bundle:true,platform:'node',format:'cjs',external:['vscode'],logLevel:'silent'})));
-  ({computeInlineChanges} = require(corePath));
+  ({computeInlineChanges, computeFileInlineChanges} = require(corePath));
   ({parseRequestDocument,resolveRequest} = require(requestPath));
   const load = Module._load;
   Module._load = function(name,parent,main){return name==='vscode'?{Uri:{joinPath:(uri,...parts)=>({fsPath:path.join(uri.fsPath,...parts)})}}:load.call(this,name,parent,main);};
   try { ({createRequestViewHtml} = require(createPath)); } finally { Module._load = load; }
-  for (const hunk of fixture.files[0].hunks) hunk.inlineChanges = computeInlineChanges(hunk);
+  for (const hunk of fixture.files[0].hunks) hunk.inlineChanges = computeInlineChanges(hunk, 40, fixture.files[0].path);
   const url = await startServer();
   console.log('Browser: ' + executable); console.log('Artifacts: ' + runDir);
   await startBrowser(executable, url);
-  await runDefaultLayoutTests();
-  await runLayoutTests();
-  await runCreateRequestTests();
+  if (process.env.RR_UI_TEST_GROUP === 'highlight') {
+    for (const width of [1200, 620]) {await runLanguageHighlightTests(width);await runProgrammingHighlightTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'multicursor') {
+    for (const width of [1600, 620]) {await runMulticursorTests(width);await runEditorDecisionTests(width);}
+  } else {
+    await runDefaultLayoutTests();
+    await runLayoutTests();
+    await runCreateRequestTests();
+  }
   assert.equal(cdp.exceptions.length, 0, 'Production JavaScript must not throw browser exceptions');
   console.log('Real browser layout: ' + results.length + '/' + results.length + ' checks passed.');
 }

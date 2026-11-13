@@ -192,6 +192,14 @@
           "scope": "resource",
           "description": "Initial layout for new previews. Each preview keeps its restored or toggled layout until it is closed."
         },
+        "revisionRequest.acceptShortcut": {
+          "type": "string",
+          "enum": ["ctrlEnter", "altEnter", "tab", "shiftTab", "none"],
+          "enumDescriptions": ["Ctrl+Enter (also Cmd+Enter on macOS).", "Alt+Enter.", "Tab instead of inserting a tab while editing.", "Shift+Tab instead of moving focus while editing.", "Use the Accept button only."],
+          "default": "ctrlEnter",
+          "scope": "resource",
+          "description": "Shortcut to accept the currently edited pending block, applying its current text to the original. Only active inside the proposal editor."
+        },
         "revisionRequest.unchangedOpacity": {
           "type": "number",
           "default": 20,
@@ -219,7 +227,7 @@
         "revisionRequest.showOnlyChangedText": {
           "type": "boolean",
           "default": false,
-          "description": "Hide unchanged words within pending changed lines, keeping their space for alignment. Only the changed words remain visible. Other context lines are unaffected."
+          "description": "Hide unchanged text within pending changed lines, keeping its space for alignment. Only the changed text remains visible. Other context lines are unaffected."
         },
         "revisionRequest.mcp.allowAgentDecisions": {
           "type": "boolean",
@@ -246,7 +254,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",

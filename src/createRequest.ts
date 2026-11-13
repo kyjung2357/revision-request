@@ -1,8 +1,9 @@
 import { diffArrays } from 'diff';
+import { createLatexGrouping } from './latexSnapshotGroups';
 import { validateRequestFile, type RequestExplanation } from './core';
 import { parseRequestDocument, resolveRequest, sourceLines, minimalBlockReplacement, type RevisionRequest, type RequestEntry } from './request';
 export interface SnapshotRequestOptions { reason?: string; explanations?: RequestExplanation[]; time?: string }
-/** Generate one atomic entry per contiguous changed block, keeping boundary context minimal. */
+/** Generate atomic changed blocks, separating safe TeX environment boundaries. */
 export function createRequestFromSnapshots(path: string, before: string, after: string, options: SnapshotRequestOptions = {}): RevisionRequest {
   const validated = validateRequestFile({path, before, after, reason: options.reason, explanations: options.explanations});
   if (Buffer.from(before, 'utf8').toString('utf8') !== before || Buffer.from(after, 'utf8').toString('utf8') !== after) throw new Error('Snapshots must contain valid Unicode.');
@@ -10,6 +11,7 @@ export function createRequestFromSnapshots(path: string, before: string, after: 
   const original = sourceLines(before), proposed = sourceLines(after), entries: RequestEntry[] = [];
   const parts = diffArrays(original.map(line => line.content), proposed.map(line => line.content), {timeout: 1500});
   if (!parts) throw new Error('The file is too large to compare quickly.');
+  const groupLatex = createLatexGrouping(validated.path, original.map(line => line.content), proposed.map(line => line.content));
   let oldIndex = 0, newIndex = 0, index = 0;
   const reason = (line: number) => validated.explanations?.find(item => item.line === line)?.text ?? options.reason ?? '';
   while (index < parts.length) {
@@ -30,15 +32,19 @@ export function createRequestFromSnapshots(path: string, before: string, after: 
         item.line >= line && item.line < line + Math.max(1, oldCount));
       entries.push({line, ...replacement, ...(hasReason ? {reason: reasons.filter(Boolean).join('\n\n')} : {}), status: 'pending'});
     };
-    if (removed > 1 && (removed === added || added === 0)) {
-      // Explicitly different explanations identify separate review intentions.
-      let start = 0;
-      for (let end = 1; end <= removed; end++) {
-        if (end < removed && reason(oldIndex + end + 1) === reason(oldIndex + start + 1)) continue;
-        addBlock(oldIndex + start, newIndex + (added ? start : 0), end - start, added ? end - start : 0);
-        start = end;
-      }
-    } else addBlock(oldIndex, newIndex, removed, added);
+    const groups = groupLatex?.(oldIndex, newIndex, removed, added) ??
+      [{oldOffset: oldIndex, newOffset: newIndex, oldCount: removed, newCount: added, atomic: false}];
+    for (const {oldOffset, newOffset, oldCount, newCount, atomic} of groups) {
+      if (!atomic && oldCount > 1 && (oldCount === newCount || newCount === 0)) {
+        // Different reasons separate intentions, without detaching environment delimiters.
+        let start = 0;
+        for (let end = 1; end <= oldCount; end++) {
+          if (end < oldCount && reason(oldOffset + end + 1) === reason(oldOffset + start + 1)) continue;
+          addBlock(oldOffset + start, newOffset + (newCount ? start : 0), end - start, newCount ? end - start : 0);
+          start = end;
+        }
+      } else addBlock(oldOffset, newOffset, oldCount, newCount);
+    }
     oldIndex += removed; newIndex += added;
   }
   const request = parseRequestDocument(JSON.stringify({path: validated.path, time: options.time ?? new Date().toISOString(), request: entries}));

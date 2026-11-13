@@ -86,10 +86,10 @@ function service(state = context(), requestFault = {remaining: 0, when: 'before'
   })};
 }
 let serial = 0;
-async function fixture(beforeText = 'one\ncontext\nthree\n', entries = [{line: 1, before: 'one', after: 'ONE', status: 'pending'}, {line: 3, before: 'three', after: 'THREE', status: 'pending'}], withTime = true) {
+async function fixture(beforeText = 'one\ncontext\nthree\n', entries = [{line: 1, before: 'one', after: 'ONE', status: 'pending'}, {line: 3, before: 'three', after: 'THREE', status: 'pending'}], withTime = true, extension = 'txt') {
   const folder = 'case-' + (++serial);
   await fs.mkdir(path.join(scratch, folder));
-  const relative = folder + '/source.txt';
+  const relative = folder + '/source.' + extension;
   const target = Uri.file(path.join(scratch, relative));
   const request = Uri.file(target.fsPath + '.rr');
   const value = {path: relative, ...(withTime ? {time: '2026-11-10T00:00:00Z'} : {}), request: entries};
@@ -336,12 +336,13 @@ test('cached multiline Undo after restart preserves mixed EOL bytes exactly', as
 });
 
 
-async function comparisonFixture() {
+async function comparisonFixture(options = {}) {
   const folder = 'mcp-files-' + (++serial); await fs.mkdir(path.join(scratch, folder));
-  const originalPath = folder + '/source.txt', proposedPath = folder + '/source.proposed.txt';
+  const extension = options.extension ?? 'txt';
+  const originalPath = folder + '/source.' + extension, proposedPath = folder + '/source.proposed.' + extension;
   const original = Uri.file(path.join(scratch,originalPath)), proposed = Uri.file(path.join(scratch,proposedPath));
-  const before = Buffer.from('\uFEFFone\r\ntwo\r\nkeep\r\n');
-  const after = Buffer.from('\uFEFFONE\r\nTWO\r\nkeep\r\nadded\r\n');
+  const before = Buffer.from(options.before ?? '\uFEFFone\r\ntwo\r\nkeep\r\n');
+  const after = Buffer.from(options.after ?? '\uFEFFONE\r\nTWO\r\nkeep\r\nadded\r\n');
   await fs.writeFile(original.fsPath,before); await fs.writeFile(proposed.fsPath,after);
   const {api,state:stateContext}=service();
   const host=new McpHost(stateContext,api,async()=>{assert.fail('Creation must not open the preview automatically');},()=>false);
@@ -378,6 +379,45 @@ test('MCP compares two saved files into grouped pending requests and keeps both 
   await item.api.decide(Uri.file(item.output),item.args.path,state.files[0].hunks[0].id,'accepted',state.revision);
   const reviewed=await item.host.handler('create_request_from_files',item.args,item.workspace);
   assert.equal(reviewed.requestId,made.requestId); assert.equal(reviewed.accepted,1,'Retry retrieves existing human decisions without regenerating from a changed source');
+});
+
+test('MCP file comparison separates LaTeX prose and equations and reviews each insertion independently', async () => {
+  const blocks = [
+    'Introduce the first equation.',
+    '\\begin{equation*}\na = b\n\\end{equation*}',
+    'Introduce the second equation.',
+    '\\begin{equation*}\nc = d\n\\end{equation*}'
+  ];
+  const saved = selected => '\uFEFFheading\r\n' + selected.map(block => block.replaceAll('\n', '\r\n') + '\r\n').join('') + 'tail\r\n';
+  const item = await comparisonFixture({extension: 'tex', before: saved([]), after: saved(blocks)});
+  const writesBefore = sourceWrites.length;
+  const made = await item.host.handler('create_request_from_files', item.args, item.workspace);
+  assert.equal(made.pending, 4);
+  const request = JSON.parse(await fs.readFile(item.output, 'utf8'));
+  assert.deepEqual(request.request.map(({line, before, after}) => ({line, before, after})),
+    blocks.map(after => ({line: 2, before: null, after})));
+  const {resolveRequest} = require('../src/request.ts');
+  assert.equal(resolveRequest(request, item.before.toString()).file.after, item.after.toString());
+  assert.deepEqual(await fs.readFile(item.original.fsPath), item.before);
+  assert.deepEqual(await fs.readFile(item.proposed.fsPath), item.after);
+  assert.equal(sourceWrites.length, writesBefore);
+
+  const review = {request: Uri.file(item.output), target: item.original, relative: item.args.path};
+  let state = await ready(item.api, review);
+  await item.api.decide(review.request, review.relative, state.files[0].hunks[1].id, 'accepted', state.revision);
+  assert.equal(await read(item.original), saved([blocks[1]]));
+  state = await ready(item.api, review);
+  await item.api.decide(review.request, review.relative, state.files[0].hunks[3].id, 'accepted', state.revision);
+  assert.equal(await read(item.original), saved([blocks[1], blocks[3]]));
+  assert.deepEqual(await statuses(review), ['pending', 'accepted', 'pending', 'accepted']);
+
+  state = await ready(item.api, review);
+  await item.api.undo(review.request, review.relative, state.files[0].hunks[1].id, state.revision);
+  assert.equal(await read(item.original), saved([blocks[3]]));
+  assert.deepEqual(await statuses(review), ['pending', 'pending', 'pending', 'accepted']);
+  assert.deepEqual(await fs.readFile(item.proposed.fsPath), item.after);
+  const status = await item.host.handler('get_request_status', {requestId: made.requestId}, item.workspace);
+  assert.equal(status.pending, 3); assert.equal(status.accepted, 1);
 });
 
 test('MCP file comparison rejects stale hashes, dirty inputs/output, identical files, and unknown fields',async()=>{
@@ -422,4 +462,167 @@ test('MCP file comparison stays inside the selected workspace and detects dirty 
   await assert.rejects(item.host.handler('create_request_from_files',item.args,item.workspace),codeIs('STALE_PROPOSED'));
   await noComparisonOutput(item);
   assert.deepEqual(await fs.readFile(item.original.fsPath),item.before);
+});
+
+test('editAndAccept commits an unchanged draft directly as accepted with no intermediate pending write', async () => {
+  const item = await fixture(), records = [], stored = context();
+  const api = new ReviewService(stored, async (uri, bytes) => {records.push(JSON.parse(Buffer.from(bytes).toString('utf8'))); await fs.writeFile(uri.fsPath, bytes);});
+  const state = await ready(api, item), count = sourceWrites.length;
+  const result = await api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'ONE', state.revision);
+  assert.equal(result.changed, true); assert.notEqual(result.revision, state.revision);
+  assert.equal(await read(item.target), 'ONE\ncontext\nthree\n');
+  assert.deepEqual(await statuses(item), ['accepted', 'pending']);
+  assert.equal(records.length, 1); assert.equal(records[0].request[0].status, 'accepted');
+  assert.equal(sourceWrites.length, count + 1); assert.equal(journals(stored).length, 0);
+});
+
+test('editAndAccept commits the current multiline draft and Undo preserves other accepted entries', async () => {
+  const item = await fixture(), created = service(); let state = await ready(created.api, item);
+  await created.api.decide(item.request, item.relative, state.files[0].hunks[1].id, 'accepted', state.revision);
+  state = await ready(created.api, item);
+  const result = await created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'edited first\nedited second', state.revision);
+  assert.equal(await read(item.target), 'edited first\nedited second\ncontext\nTHREE\n');
+  assert.deepEqual(await statuses(item), ['accepted', 'accepted']);
+  state = await ready(service(created.state).api, item); assert.equal(result.revision, state.revision);
+  const entry = JSON.parse(await read(item.request)).request[0];
+  assert.equal(entry.after.includes('edited first\nedited second'), true);
+  await created.api.undo(item.request, item.relative, state.files[0].hunks[0].id, state.revision);
+  assert.equal(await read(item.target), 'one\ncontext\nTHREE\n');
+  assert.deepEqual(await statuses(item), ['pending', 'accepted']);
+});
+
+test('editAndAccept removes a draft restored to the original without accepting the next entry', async () => {
+  const item = await fixture(), created = service(), count = sourceWrites.length;
+  const state = await ready(created.api, item);
+  await created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'one', state.revision);
+  const entries = JSON.parse(await read(item.request)).request;
+  assert.equal(entries.length, 1); assert.equal(entries[0].line, 3); assert.equal(entries[0].status, 'pending');
+  assert.equal(await read(item.target), item.before); assert.equal(sourceWrites.length, count);
+  const solo = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+  const single = await ready(created.api, solo);
+  settings.set('autoDeleteCompleted', true);
+  try {
+    await created.api.editAndAccept(solo.request, solo.relative, single.files[0].hunks[0].id, 'old', single.revision);
+    assert.deepEqual(await statuses(solo), []); assert.equal(await read(solo.target), 'old\n');
+  } finally {settings.set('autoDeleteCompleted', false);}
+});
+
+test('editAndAccept rejects stale request/source, dirty models, untrusted workspaces and invalid drafts before writes', async () => {
+  for (const kind of ['request', 'source', 'dirty-source', 'dirty-request', 'untrusted', 'invalid-draft']) {
+    const item = await fixture(), created = service(); const state = await ready(created.api, item);
+    let dirty;
+    if (kind === 'request') await fs.appendFile(item.request.fsPath, ' ');
+    if (kind === 'source') await fs.writeFile(item.target.fsPath, 'EXTERNAL\n');
+    if (kind.startsWith('dirty-')) {dirty = await vscode.workspace.openTextDocument(kind === 'dirty-source' ? item.target : item.request); dirty.isDirty = true;}
+    const raw = await read(item.request), target = await read(item.target), count = sourceWrites.length;
+    if (kind === 'untrusted') vscode.workspace.isTrusted = false;
+    try {
+      await assert.rejects(created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id,
+        kind === 'invalid-draft' ? 'bad\0draft' : 'EDITED', state.revision), /changed|unsaved|Save|Trust|NUL/);
+      assert.equal(await read(item.request), raw, kind); assert.equal(await read(item.target), target, kind);
+      assert.equal(sourceWrites.length, count, kind); assert.equal(journals(created.state).length, 0, kind);
+    } finally {if (dirty) dirty.isDirty = false; vscode.workspace.isTrusted = true;}
+  }
+});
+
+test('editAndAccept source failure before writing preserves both files and a retry uses the same draft', async () => {
+  const item = await fixture(), created = service(); const state = await ready(created.api, item), raw = await read(item.request);
+  sourceFault = {path: item.target.fsPath, when: 'before'};
+  await assert.rejects(created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'EDITED', state.revision), /Injected source failure/);
+  assert.equal(await read(item.request), raw); assert.equal(await read(item.target), item.before);
+  assert.equal(journals(created.state).length, 0);
+  await created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'EDITED', state.revision);
+  assert.equal(await read(item.target), 'EDITED\ncontext\nthree\n'); assert.deepEqual(await statuses(item), ['accepted', 'pending']);
+});
+
+test('editAndAccept RR failure retains the combined draft and decision journal for exact restart recovery', async () => {
+  const item = await fixture(), created = service(); const state = await ready(created.api, item);
+  created.requestFault.remaining = Infinity;
+  await assert.rejects(created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'EDITED\nSECOND', state.revision), /Injected RR failure/);
+  assert.equal(await read(item.target), 'EDITED\nSECOND\ncontext\nthree\n');
+  assert.deepEqual(await statuses(item), ['pending', 'pending']); assert.equal(journals(created.state).length, 1);
+  const count = sourceWrites.length;
+  const recovered = service(created.state); await ready(recovered.api, item);
+  assert.equal(sourceWrites.length, count); assert.deepEqual(await statuses(item), ['accepted', 'pending']);
+  assert.equal(journals(created.state).length, 0);
+  assert.equal(JSON.parse(await read(item.request)).request[0].after, 'EDITED\nSECOND');
+});
+
+test('editAndAccept final completion uses individual cleanup and records the edited accepted proposal', async () => {
+  const item = await fixture('old\n', [{line: 1, before: 'old', after: 'new', status: 'pending'}]);
+  const created = service(), receipts = [];
+  created.api.setCompletionRecorder(async (_uri, cleanup) => {receipts.push(cleanup);});
+  const state = await ready(created.api, item);
+  settings.set('autoDeleteCompleted', true);
+  try {
+    const result = await created.api.editAndAccept(item.request, item.relative, state.files[0].hunks[0].id, 'edited', state.revision);
+    assert.equal(result.completionPrompt, undefined); assert.equal(result.changed, true);
+    assert.equal(await read(item.target), 'edited\n'); await assert.rejects(fs.stat(item.request.fsPath), {code: 'ENOENT'});
+    assert.deepEqual(receipts, ['retained', 'deleted']); assert.deepEqual(created.state.workspaceState.keys(), []);
+  } finally {settings.set('autoDeleteCompleted', false);}
+});
+
+test('review state validates and refreshes the configurable edit acceptance shortcut', async () => {
+  const item = await fixture(), {api} = service();
+  try {
+    settings.delete('acceptShortcut'); assert.equal((await ready(api, item)).acceptShortcut, 'ctrlEnter');
+    for (const choice of ['ctrlEnter', 'altEnter', 'tab', 'shiftTab', 'none']) {
+      settings.set('acceptShortcut', choice); assert.equal((await ready(api, item)).acceptShortcut, choice);
+    }
+    for (const invalid of ['invalid', null, 42]) {
+      settings.set('acceptShortcut', invalid); assert.equal((await ready(api, item)).acceptShortcut, 'ctrlEnter');
+    }
+  } finally {settings.delete('acceptShortcut');}
+});
+
+
+test('preview highlighting dispatches by the target language without changing request or source', async () => {
+  for (const extension of ['tex', 'ltx', 'LaTeX', 'py']) {
+    const item = await fixture('f(a)\n', [{line: 1, before: 'a', after: 'b', status: 'pending'}], true, extension);
+    const originalRequest = await read(item.request), originalSource = await read(item.target);
+    const {api} = service(), writesBefore = sourceWrites.length;
+    const state = await ready(api, item), hunk = state.files[0].hunks[0], inline = hunk.inlineChanges[0];
+    const changed = side => inline[side].filter(segment => segment.changed).map(segment => segment.text);
+    assert.deepEqual(changed('before'), [extension === 'py' ? 'a' : '(a)']);
+    assert.deepEqual(changed('after'), [extension === 'py' ? 'b' : '(b)']);
+    assert.equal(inline.before.map(segment => segment.text).join(''), 'f(a)');
+    assert.equal(inline.after.map(segment => segment.text).join(''), 'f(b)');
+    const refreshed = await ready(api, item);
+    assert.equal(refreshed.files[0].hunks[0].id, hunk.id, 'Presentation rules do not change review identity');
+    assert.equal(await read(item.target), originalSource);
+    assert.equal(await read(item.request), originalRequest);
+    assert.equal(sourceWrites.length, writesBefore, 'Computing language-specific highlights never writes the source');
+  }
+});
+
+test('preview uses full Markdown context and updates it after real review decisions', async () => {
+  const item = await fixture('~~~unknown\na[i+1]\n~~~\n', [
+    {line: 1, before: 'unknown', after: 'python', status: 'pending'},
+    {line: 2, before: '1', after: '2', status: 'pending'}
+  ], true, 'md');
+  const {api} = service();
+  let state = await ready(api, item);
+  const highlights = () => state.files[0].hunks[1].inlineChanges[0].after.filter(part => part.changed).map(part => part.text);
+  assert.deepEqual(highlights(), ['a[i+2]']);
+  const firstId = state.files[0].hunks[0].id, secondId = state.files[0].hunks[1].id;
+  await api.decide(item.request, item.relative, firstId, 'accepted', state.revision);
+  state = await ready(api, item); assert.deepEqual(highlights(), ['2']);
+  assert.equal(state.files[0].hunks[1].id, secondId);
+  await api.undo(item.request, item.relative, firstId, state.revision);
+  state = await ready(api, item); assert.deepEqual(highlights(), ['a[i+2]']);
+  await api.decide(item.request, item.relative, firstId, 'ignored', state.revision);
+  state = await ready(api, item); assert.deepEqual(highlights(), ['a[i+2]']);
+  assert.equal(await read(item.target), item.before, 'Review context never applies pending text');
+});
+
+test('preview preserves string and comment context that begins outside a pending block', async () => {
+  for (const [extension, opening, closing] of [['py','value = """','"""'], ['ts','/*','*/']]) {
+    const item = await fixture(opening+'\na[i+1]\n'+closing+'\na[i+1]\n', [
+      {line:2,before:'1',after:'2',status:'pending'}, {line:4,before:'1',after:'2',status:'pending'}
+    ], true, extension);
+    const {api} = service(), state = await ready(api,item);
+    const values=state.files[0].hunks.map(hunk=>hunk.inlineChanges[0].after.filter(part=>part.changed).map(part=>part.text));
+    assert.deepEqual(values,[['a[i+2]'],['2']]);
+    assert.equal(await read(item.target),item.before);
+  }
 });

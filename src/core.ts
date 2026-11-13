@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { diffArrays } from 'diff';
+import { inlineDiffRulesFor, inlineComparisonKeys, expandAtomicHighlights } from './inlineDiffRules';
+import { createInlineDiffContext, type InlineDiffContext } from './inlineDiffContext';
 
 /** A review decision never changes the proposal's base snapshot. */
 export type Decision = 'pending' | 'accepted' | 'ignored';
@@ -144,12 +146,13 @@ export interface InlineChangeLine {
 }
 
 /**
- * Zip the displayed old/new lines and mark whole whitespace-delimited words.
+ * Zip displayed old/new lines and highlight tokens using the target language rules.
  * This is presentation metadata only; it never changes hunk boundaries.
  * Large or costly comparisons conservatively mark the entire paired line.
  */
 export function computeInlineChanges(
-  hunk: Pick<Hunk, 'before' | 'after'>, timeBudgetMs = 40,
+  hunk: Pick<Hunk, 'before' | 'after'> & Partial<Pick<Hunk, 'oldStart' | 'newStart'>>,
+  timeBudgetMs = 40, targetPath?: string, context?: InlineDiffContext,
 ): InlineChangeLine[] {
   const beforeLines = lines(hunk.before).map(displayLine);
   const afterLines = lines(hunk.after).map(displayLine);
@@ -157,6 +160,9 @@ export function computeInlineChanges(
   const whole = (text: string | undefined, changed: boolean): InlineSegment[] =>
     text === undefined ? [] : [{text, changed}];
   const result: InlineChangeLine[] = [];
+  const tokens = context ?? createInlineDiffContext(targetPath, hunk.before, hunk.after, deadline);
+  const oldStart = context ? hunk.oldStart ?? 1 : 1;
+  const newStart = context ? hunk.newStart ?? 1 : 1;
   for (let index = 0; index < Math.max(beforeLines.length, afterLines.length); index++) {
     const before = beforeLines[index];
     const after = afterLines[index];
@@ -169,12 +175,17 @@ export function computeInlineChanges(
       result.push({before: whole(before, true), after: whole(after, true)});
       continue;
     }
-    // Match words independently of their separators so repeated spaces cannot
-    // displace an exact word match. Retain source offsets for exact projection.
-    const beforeWords = [...before.matchAll(/\S+/gu)];
-    const afterWords = [...after.matchAll(/\S+/gu)];
-    const parts = diffArrays(beforeWords.map(word => word[0]), afterWords.map(word => word[0]),
-      {timeout: Math.min(20, remaining), maxEditLength: 512});
+    // Separate display tokenization from the common bounded diff and exact projection.
+    const beforeTokens = tokens.before(oldStart + index, before), afterTokens = tokens.after(newStart + index, after);
+    if (!beforeTokens || !afterTokens) {
+      result.push({before: whole(before, true), after: whole(after, true)});
+      continue;
+    }
+    const beforeWords = beforeTokens.tokens, afterWords = afterTokens.tokens;
+    const [beforeKeys, afterKeys] = inlineComparisonKeys(beforeTokens, afterTokens);
+    const tokenBudget = deadline - Date.now();
+    const parts = tokenBudget > 0 ? diffArrays(beforeKeys, afterKeys,
+      {timeout: Math.min(20, tokenBudget), maxEditLength: 512}) : undefined;
     if (!parts) {
       result.push({before: whole(before, true), after: whole(after, true)});
       continue;
@@ -202,6 +213,7 @@ export function computeInlineChanges(
         append(segments, text.slice(text.length - end), false);
       }
     };
+    const matches = new Map<number, number>();
     let oldWord = 0;
     let newWord = 0;
     let oldEnd = 0;
@@ -209,18 +221,50 @@ export function computeInlineChanges(
     for (const part of parts) {
       if (part.removed) oldWord += part.value.length;
       else if (part.added) newWord += part.value.length;
-      else for (const text of part.value) {
+      else for (let index = 0; index < part.value.length; index++) {
+        matches.set(oldWord, newWord);
         const oldMatch = beforeWords[oldWord++]!;
         const newMatch = afterWords[newWord++]!;
-        appendGap(before.slice(oldEnd, oldMatch.index), after.slice(newEnd, newMatch.index));
-        append(pair.before, text, false);
-        append(pair.after, text, false);
-        oldEnd = oldMatch.index + text.length;
-        newEnd = newMatch.index + text.length;
+        appendGap(before.slice(oldEnd, oldMatch.start), after.slice(newEnd, newMatch.start));
+        append(pair.before, oldMatch.text, false);
+        append(pair.after, newMatch.text, false);
+        oldEnd = oldMatch.end;
+        newEnd = newMatch.end;
       }
     }
     appendGap(before.slice(oldEnd), after.slice(newEnd));
-    result.push(pair);
+    result.push(expandAtomicHighlights(beforeTokens, afterTokens, matches, pair));
+  }
+  return result;
+}
+
+/** Highlight pending blocks in the same lexical context as the visible review columns. */
+export function computeFileInlineChanges(
+  file: RequestFile, hunks: Hunk[], decisions: Record<string, Decision>, timeBudgetMs = 120,
+): Map<string, InlineChangeLine[]> {
+  const deadline = Date.now() + Math.max(0, timeBudgetMs);
+  const result = new Map<string, InlineChangeLine[]>();
+  if (!hunks.some(hunk => (decisions[hunk.id] ?? 'pending') === 'pending')) return result;
+  let context: InlineDiffContext | undefined;
+  if (inlineDiffRulesFor(file.path).createTokenizer && Date.now() < deadline) {
+    const rightDecisions: Record<string, Decision> = Object.fromEntries(hunks.map(hunk =>
+      [hunk.id, decisions[hunk.id] === 'ignored' ? 'ignored' : 'accepted']));
+    const before = renderAccepted(file.before, hunks, decisions).replace(/^\uFEFF/, '');
+    const after = renderAccepted(file.before, hunks, rightDecisions).replace(/^\uFEFF/, '');
+    context = createInlineDiffContext(file.path, before, after, deadline);
+  }
+  let leftDelta = 0, rightDelta = 0;
+  for (const hunk of hunks) {
+    const decision = decisions[hunk.id] ?? 'pending';
+    if (decision === 'pending') {
+      result.set(hunk.id, computeInlineChanges({
+        before: hunk.before, after: hunk.displayAfter ?? hunk.after,
+        oldStart: hunk.oldStart + leftDelta, newStart: hunk.oldStart + rightDelta,
+      }, Math.min(40, Math.max(0, deadline - Date.now())), file.path, context));
+    }
+    const delta = hunk.newLines - hunk.oldLines;
+    if (decision === 'accepted') leftDelta += delta;
+    if (decision !== 'ignored') rightDelta += delta;
   }
   return result;
 }

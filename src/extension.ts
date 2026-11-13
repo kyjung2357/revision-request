@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
-import { computeHunks, computeInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
+import { computeHunks, computeFileInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
 import { getReviewHtml, getReviewRestoreErrorHtml } from './webview';
 import { parseRequestDocument, proposalIdentity, resolveRequest, patchRequestStatuses, editPendingRequest, ensureRequestTime, type RevisionRequest } from './request';
 import { McpHost } from './mcpHost';
@@ -43,6 +43,7 @@ export interface ReviewState {
   type: 'state'; revision: string; title: string; description?: string;
   requestName: string; files: ReviewFile[]; trusted: boolean; busy: boolean; unchangedOpacity: number;
   highlightChangedLines: boolean; showOnlyChangedText: boolean; defaultLayout: 'unified' | 'sideBySide'; error?: string;
+  acceptShortcut: 'ctrlEnter' | 'altEnter' | 'tab' | 'shiftTab' | 'none';
   requestIdentity?: string; verified: boolean;
   verificationIssue?: string; verifiedTargetHash?: string; closed?: boolean;
 }
@@ -302,12 +303,14 @@ export class ReviewService implements vscode.Disposable {
     return {uri, expected, current};
   }
   async getState(uri: vscode.Uri, includeInlineChanges = true): Promise<ReviewState> {
+    const configuredShortcut = vscode.workspace.getConfiguration('revisionRequest', uri).get<ReviewState['acceptShortcut']>('acceptShortcut', 'ctrlEnter');
     const base: ReviewState = {
       type: 'state', revision: '', title: 'Revision Request', requestName: path.basename(uri.fsPath),
       files: [], trusted: vscode.workspace.isTrusted, busy: this.busy, verified: false,
       unchangedOpacity: Math.max(0, Math.min(100, vscode.workspace.getConfiguration('revisionRequest', uri).get<number>('unchangedOpacity', 20))),
       highlightChangedLines: vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('highlightChangedLines', true),
       showOnlyChangedText: vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('showOnlyChangedText', false),
+      acceptShortcut: ['ctrlEnter', 'altEnter', 'tab', 'shiftTab', 'none'].includes(configuredShortcut) ? configuredShortcut : 'ctrlEnter',
       defaultLayout: vscode.workspace.getConfiguration('revisionRequest', uri).get<unknown>('defaultLayout', 'unified') === 'sideBySide' ? 'sideBySide' : 'unified'
     };
     try {
@@ -346,7 +349,7 @@ export class ReviewService implements vscode.Disposable {
         }
         const hunks = computeHunks(file);
         const bomLength = file.before.startsWith('\uFEFF') ? 1 : 0;
-        const inlineDeadline = Date.now() + 120;
+        const inlineChanges = includeInlineChanges ? computeFileInlineChanges(file, hunks, this.fileDecisions(file, decisions)) : undefined;
         base.files.push({
           path: file.path, before: file.before.slice(bomLength),
           currentText: currentText?.replace(/^\uFEFF/, ''), reason: file.reason, issue,
@@ -358,7 +361,7 @@ export class ReviewService implements vscode.Disposable {
             return {...preview,
               decision: decisions[keyFor(file.path, hunk.id)] ?? 'pending',
               explanation: loaded.resolved.request.request[loaded.resolved.review.entryIndexByHunkId[hunk.id]!]!.reason,
-              inlineChanges: includeInlineChanges ? computeInlineChanges(preview, Math.min(40, Math.max(0, inlineDeadline - Date.now()))) : undefined
+              inlineChanges: inlineChanges?.get(hunk.id)
             };
           })
         });
@@ -533,6 +536,42 @@ export class ReviewService implements vscode.Disposable {
       if (edited.review.expectedTarget !== target.expected) throw new Error('Editing a proposal must preserve accepted source content.');
       const committed = await this.commitReview(uri, loaded, edited.text, 'user');
       return {changed: true, revision: committed.fingerprint};
+    });
+  }
+  async editAndAccept(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before accepting a proposal.');
+    if (typeof filePath !== 'string' || typeof hunkId !== 'string' || !hunkId || typeof draft !== 'string' || typeof revision !== 'string') {
+      throw new Error('Choose a pending change and provide its complete draft text.');
+    }
+    return this.runExclusive(async () => {
+      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before accepting a proposal.');
+      await this.prepareReview(uri);
+      const loaded = await this.load(uri);
+      if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before accepting.');
+      const file = loaded.request.files.find(candidate => candidate.path === filePath);
+      if (!file) throw new Error('This file is not part of the request.');
+      const target = await this.inspectTarget(uri, file, loaded.decisions);
+      const edited = editPendingRequest(loaded.savedText, loaded.resolved.review.baseline, hunkId, draft);
+      await this.assertRawRequest(uri, loaded);
+      if (edited.review.expectedTarget !== target.expected) throw new Error('Editing a proposal must preserve accepted source content.');
+      const index = loaded.resolved.review.entryIndexByHunkId[hunkId]!;
+      // Returning to the original removes this entry. Never accept its shifted neighbor.
+      const removed = edited.request.request.length < loaded.resolved.request.request.length;
+      const text = removed ? edited.text : patchRequestStatuses(edited.text, {[index]: 'accepted'});
+      this.completionPrompts.delete(uri.toString());
+      // The draft and its decision share one source/RR journal and one guarded commit.
+      const committed = await this.commitReview(uri, loaded, text, 'user');
+      const result = {changed: true, revision: committed.fingerprint};
+      if (this.completedReview(committed)) {
+        try { await this.completionRecorder?.(uri, 'retained'); }
+        catch (error) {
+          void vscode.window.showWarningMessage('Review completed. The .rr request was kept because its completion record could not be saved: ' + failure(error));
+          return result;
+        }
+        // This is an individual acceptance, so batch confirmation does not apply.
+        await this.removeCompletedRequest(uri, committed.document, committed.fingerprint);
+      }
+      return result;
     });
   }
   private async inspectRequestDeletion(uri: vscode.Uri) {
@@ -838,6 +877,23 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               }
               editResult = await this.service.editPending(uri, message.filePath, message.hunkId, message.draft, message.revision);
               break;
+            case 'editAndAccept':
+              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' ||
+                  typeof message.draft !== 'string' || typeof message.revision !== 'string' || typeof message.editId !== 'string' ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'draft', 'revision', 'editId'].includes(key))) {
+                throw new Error('Invalid proposal acceptance.');
+              }
+              editResult = await this.service.editAndAccept(uri, message.filePath, message.hunkId, message.draft, message.revision);
+              break;
+            case 'ignoreEdited':
+              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' || !message.hunkId ||
+                  typeof message.revision !== 'string' || typeof message.editId !== 'string' ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'revision', 'editId'].includes(key))) {
+                throw new Error('Invalid proposal ignore action.');
+              }
+              await this.service.decide(uri, message.filePath, message.hunkId, 'ignored', message.revision);
+              editResult = {changed: true, revision: (await this.service.getState(uri, false)).revision};
+              break;
             case 'resolveCompletion':
               await this.service.resolveCompletion(uri, message.completionId, message.revision, message.deleteRequest, message.rememberChoice);
               completionSucceeded = true;
@@ -849,7 +905,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
             default: return;
           }
         } catch (error) { actionError = failure(error); }
-        if (message.type === 'editPending') {
+        if (['editPending', 'editAndAccept', 'ignoreEdited'].includes(message.type) && !disposed) {
           await panel.webview.postMessage({type: 'editResult', editId: message.editId, filePath: message.filePath,
             hunkId: message.hunkId, success: editResult !== undefined, error: actionError, ...editResult});
           actionError = undefined; // The draft editor owns edit errors and keeps the draft.
@@ -983,7 +1039,8 @@ export async function activate(context: vscode.ExtensionContext) {
       if (event.affectsConfiguration('revisionRequest.unchangedOpacity') ||
           event.affectsConfiguration('revisionRequest.highlightChangedLines') ||
           event.affectsConfiguration('revisionRequest.showOnlyChangedText') ||
-          event.affectsConfiguration('revisionRequest.defaultLayout')) service.changed();
+          event.affectsConfiguration('revisionRequest.defaultLayout') ||
+          event.affectsConfiguration('revisionRequest.acceptShortcut')) service.changed();
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {tree.refresh(); service.changed(); publishWorkspaces();}),
     vscode.commands.registerCommand('revisionRequest.diagnoseMcp', async (workspaceUri?: vscode.Uri) => {
@@ -1060,7 +1117,9 @@ export async function activate(context: vscode.ExtensionContext) {
         service.resolveCompletion(uri, completionId, revision, deleteRequest, rememberChoice),
       deleteRequest: (uri: vscode.Uri) => service.deleteRequest(uri),
       editPending: (uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string) =>
-        service.editPending(uri, file, hunk, draft, revision)
+        service.editPending(uri, file, hunk, draft, revision),
+      editAndAccept: (uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string) =>
+        service.editAndAccept(uri, file, hunk, draft, revision)
     } : {}),
     getState: (uri: vscode.Uri) => service.getState(uri),
     decide: (uri: vscode.Uri, file: string, hunk: string | undefined, decision: 'accepted' | 'ignored', revision: string) =>

@@ -185,7 +185,7 @@ test('render rejects stale or overlapping change groups instead of producing a c
   assert.throws(() => renderAccepted(file.before, [hunk!], { [hunk!.id]: 'typo' as Decision }), /invalid review decision/);
 });
 
-test('intraline comparison marks entire LaTeX tokens while preserving unchanged words', () => {
+test('fallback intraline comparison preserves whole whitespace chunks including adjacent commands', () => {
   const before = '\\alpha = 2x + 3y.\\label{eq:estimate}\r\n';
   const after = '\\alpha = 1x + 4y.\\label{eq:estimate}\r\n';
   const hunk = computeHunks(make(before, after))[0]!;
@@ -320,4 +320,82 @@ test('intraline work limits fall back to whole changed text without losing conte
   assert.deepEqual(computeInlineChanges({before: 'same', after: 'same'}, 0), [
     {before: [{text: 'same', changed: false}], after: [{text: 'same', changed: false}]},
   ]);
+});
+
+
+function texHighlights(before: string, after: string, oldChanged: string[], newChanged: string[], targetPath = 'paper.tex') {
+  const input = {before, after}, snapshot = {...input};
+  const [row] = computeInlineChanges(input, 100, targetPath);
+  assert.ok(row);
+  assert.equal(row.before.map(segment => segment.text).join(''), before);
+  assert.equal(row.after.map(segment => segment.text).join(''), after);
+  assert.deepEqual(row.before.filter(segment => segment.changed).map(segment => segment.text), oldChanged);
+  assert.deepEqual(row.after.filter(segment => segment.changed).map(segment => segment.text), newChanged);
+  assert.deepEqual(input, snapshot, 'Highlight rules cannot modify source text.');
+  return row;
+}
+
+test('TeX single-character groups include both delimiters and all four padding variants', () => {
+  for (const [left, right] of [['(', ')'], ['{', '}'], ['[', ']']]) {
+    for (const [lead, tail] of [['', ''], [' ', ''], ['', ' '], [' ', ' '], ['\t', '\t']]) {
+      const before = left! + lead + 'a' + tail + right, after = left! + lead + 'b' + tail + right;
+      texHighlights('f' + before, 'f' + after, [before], [after]);
+    }
+  }
+  texHighlights('(a)', '( b )', ['(a)'], ['( b )']);
+  texHighlights('( a )', '[ a ]', ['( a )'], ['[ a ]']);
+  texHighlights('{a} [ b ]', '{c} [ d ]', ['{a} [ b ]'], ['{c} [ d ]']);
+});
+
+test('TeX whitespace-only group changes never highlight identical contents or delimiters', () => {
+  texHighlights('(a)', '( a )', [], [' ', ' ']);
+  texHighlights('( a )', '(a)', [' ', ' '], []);
+  texHighlights('( a )', '(\ta  )', [' '], ['\t', ' ']);
+  texHighlights('(\\alpha)', '( \\alpha )', [], [' ', ' ']);
+  texHighlights('a[ i+1 ]', 'a[i+1 ]', [' '], []);
+});
+
+test('TeX multi-character groups keep general whitespace chunks without coloring delimiters', () => {
+  texHighlights('(x - y)', '(x + y)', ['-'], ['+']);
+  texHighlights('a[i+1]', 'a[i+2]', ['i+1'], ['i+2']);
+  texHighlights('a[ i+1 ]', 'a[ i+2 ]', ['i+1'], ['i+2']);
+  texHighlights('(old value) keep', '(new item) keep', ['old value'], ['new item']);
+  texHighlights('(a)', '(ab)', ['a'], ['ab']);
+  texHighlights('(ab)', '(a)', ['ab'], ['a']);
+});
+
+test('TeX commands are whole units and single-command groups include their delimiters', () => {
+  texHighlights('\\alpha(x)', '\\beta(x)', ['\\alpha'], ['\\beta']);
+  texHighlights('(\\alpha)', '( \\beta )', ['(\\alpha)'], ['( \\beta )']);
+  texHighlights('\\mathbb{R}', '\\mathbb{C}', ['{R}'], ['{C}']);
+  texHighlights('\\mathbb{R}', '\\mathcal{R}', ['\\mathbb'], ['\\mathcal']);
+  texHighlights('\\frac{x}{2}', '\\frac{y}{2}', ['{x}'], ['{y}']);
+  texHighlights('before \\% after', 'before \\& after', ['\\%'], ['\\&']);
+  texHighlights('\\{a\\}', '\\{b\\}', ['a'], ['b']);
+  texHighlights('\\(a\\)', '\\(b\\)', ['a'], ['b']);
+});
+
+test('TeX grouping preserves visible Unicode characters and does not swallow enclosing or malformed groups', () => {
+  for (const [before, after] of [['한', '글'], ['😀', '😃'], ['e\u0301', 'o\u0301'], ['α', 'β']]) {
+    texHighlights('(' + before + ')', '(' + after + ')', ['(' + before + ')'], ['(' + after + ')']);
+  }
+  texHighlights('((a))', '((b))', ['(a)'], ['(b)']);
+  texHighlights('(a)(b)', '(b)', ['(a)'], []);
+  texHighlights('(a)', '( b )(a)', [], ['( b )']);
+  texHighlights('((a))', '([b])', ['(a)'], ['[b]']);
+  texHighlights('([a])', '([b])', ['[a]'], ['[b]']);
+  texHighlights('([a)', '([b)', ['a'], ['b']);
+  texHighlights('(a', '(b', ['a'], ['b']);
+});
+
+test('target path selects TeX rules while unknown languages retain existing whitespace behavior', () => {
+  for (const targetPath of ['paper.tex', 'folder/file.ltx', 'folder/file.LaTeX']) {
+    texHighlights('a[i+1]', 'a[i+2]', ['i+1'], ['i+2'], targetPath);
+  }
+  for (const targetPath of [undefined, 'app.unknown', 'notes.txt', 'paper.tex.rr']) {
+    const [row] = computeInlineChanges({before: 'a[i+1]', after: 'a[i+2]'}, 100, targetPath);
+    assert.deepEqual(row, {before: [{text: 'a[i+1]', changed: true}], after: [{text: 'a[i+2]', changed: true}]});
+  }
+  assert.deepEqual(computeInlineChanges({before: '(a)', after: '(b)'}, 0, 'paper.tex'),
+    [{before: [{text: '(a)', changed: true}], after: [{text: '(b)', changed: true}]}]);
 });

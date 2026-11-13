@@ -12,6 +12,7 @@
     && typeof savedEdit.revision === 'string' && typeof savedEdit.draft === 'string'
     ? { ...savedEdit, saving: false, editId: null } : null;
   let editSequence = 0;
+  let editHistory = { undo: [], redo: [] };
   let focusAfterEdit = null;
   let completion = null;
   let splitRatio = typeof restored.splitRatio === 'number' && Number.isFinite(restored.splitRatio) ? Math.max(0.05, Math.min(0.95, restored.splitRatio)) : 0.5;
@@ -112,19 +113,19 @@
     if (side === 'right') cell.append(element('span', 'action-gutter'));
     return cell;
   }
-  function hunkControls(file, hunk, decision, busy) {
+  function hunkControls(file, hunk, decision, busy, editor = false) {
     const actions = element('div', 'inline-actions');
-    const key = file.path + ':' + hunk.id;
+    const key = editor ? 'edit' : file.path + ':' + hunk.id;
     if (decision === 'pending') {
       actions.append(
         button('Accept', 'button button-accept button-inline',
-          () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'accepted' }),
+          editor ? submitEditor : () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'accepted' }),
           { disabled: busy || !state.trusted || Boolean(file.issue), key: key + ':accept', hunk: hunk.id,
-            label: 'Accept change ' + (hunk.index + 1), title: file.issue || 'Apply this change to the original file' }),
+            label: 'Accept change ' + (hunk.index + 1), title: file.issue || (editor ? 'Apply this edited change to the original file' + editorShortcutHint() : 'Apply this change to the original file') }),
         button('Ignore', 'button button-secondary button-inline',
-          () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'ignored' }),
+          editor ? ignoreEditor : () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'ignored' }),
           { disabled: busy || !state.trusted, key: key + ':ignore', hunk: hunk.id,
-            label: 'Ignore change ' + (hunk.index + 1), title: 'Keep the original content for this change' })
+            label: 'Ignore change ' + (hunk.index + 1), title: editor ? 'Discard the draft and ignore this change' : 'Keep the original content for this change' })
       );
     } else {
       actions.append(badge(decision === 'accepted' ? '✓ Accepted' : 'Ignored', decision),
@@ -142,7 +143,7 @@
       saveViewState();
       render();
       if (openWhy) root.querySelector('.why-popover')?.focus({ preventScroll: true });
-    }, { disabled: !hasExplanation || Boolean(editing), key: key + ':why', hunk: hunk.id,
+    }, { disabled: !hasExplanation || (editor ? editing.saving : Boolean(editing)), key: key + ':why', hunk: hunk.id,
       label: 'Why change ' + (hunk.index + 1),
       title: hasExplanation ? 'Show the explanation for this change' : 'No explanation provided' });
     if (!hasExplanation) { why.classList.add('why-unavailable'); why.setAttribute('aria-hidden', 'true'); }
@@ -177,6 +178,7 @@
     const draft = hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g, '\n').replace(/\n$/, '');
     const offset = draft.split('\n').slice(0, rowIndex).reduce((sum, line) => sum + line.length + 1, 0) + columnOffset;
     openWhy = null;
+    editHistory = { undo: [], redo: [] };
     editing = { filePath: file.path, hunkId: hunk.id, revision: state.revision, draft,
       hadProposedLine: hunk.newLines > 0, rightStart: Number(directInput?.closest('.code-side').dataset.proposedLine) || hunk.oldStart,
       index: hunk.index, oldStart: hunk.oldStart, original: hunk.before, anchorIndex: rowIndex,
@@ -207,31 +209,195 @@
   function cancelEditor() {
     if (!editing || editing.saving) return;
     const previous = editing; editing = null;
+    editHistory = { undo: [], redo: [] };
     saveViewState(); render();
     (editorAnchor(previous) || root.querySelector('.filename-link'))?.focus({ preventScroll: true });
   }
-  function submitEditor() {
+  function editorAcceptSetting() {
+    const value = state?.acceptShortcut;
+    return ['ctrlEnter','altEnter','tab','shiftTab','none'].includes(value) ? value : 'ctrlEnter';
+  }
+  function editorShortcutHint() {
+    const labels = {ctrlEnter:'Ctrl/Cmd+Enter',altEnter:'Alt+Enter',tab:'Tab',shiftTab:'Shift+Tab'};
+    const label = labels[editorAcceptSetting()];
+    return label ? ' (' + label + ')' : '';
+  }
+  function matchesEditorAcceptShortcut(event) {
+    const key = editorAcceptSetting();
+    if (key === 'ctrlEnter') return event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+    if (key === 'altEnter') return event.key === 'Enter' && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+    if (key === 'tab' || key === 'shiftTab') return event.key === 'Tab' && event.shiftKey === (key === 'shiftTab') && !event.ctrlKey && !event.metaKey && !event.altKey;
+    return false;
+  }
+  function ignoreEditor() { submitEditorDecision('ignoreEdited'); }
+  function submitEditor() { submitEditorDecision('editAndAccept'); }
+  function submitEditorDecision(type) {
     if (!editing || editing.saving || !state || state.busy || awaitingDecision || !state.trusted) return;
     captureEditor();
-    if (staleEditor()) { render(); return; }
+    if (staleEditor() || (type === 'editAndAccept' && state.files.find(file => file.path === editing.filePath)?.issue)) { render(); return; }
     editing.saving = true; editing.error = null;
     editing.editId = 'edit-' + Date.now() + '-' + (++editSequence);
-    dismissedErrors.clear(); saveViewState();
-    const message = { type: 'editPending', filePath: editing.filePath, hunkId: editing.hunkId,
-      draft: editing.draft, revision: editing.revision, editId: editing.editId };
+    dismissedErrors.clear(); openWhy = null; saveViewState();
+    const message = {type, filePath:editing.filePath, hunkId:editing.hunkId,
+      ...(type === 'editAndAccept' ? {draft:editing.draft} : {}), revision:editing.revision, editId:editing.editId};
     render(); post(message);
   }
   function editorActions() {
-    const actions = element('div', 'inline-actions pending-editor-actions');
+    const file = state.files.find(item => item.path === editing.filePath) || {path:editing.filePath};
+    const hunk = file.hunks?.find(item => item.id === editing.hunkId) || {id:editing.hunkId,index:editing.index};
+    const actions = hunkControls(file,hunk,'pending',editing.saving || state.busy || awaitingDecision || staleEditor(),true);
+    actions.classList.add('pending-editor-actions');
     actions.addEventListener('keydown', event => {
-      if (event.isComposing) return;
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelEditor(); }
-      else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); submitEditor(); }
     });
-    actions.append(button(editing.saving ? 'Saving…' : 'Save', 'button button-accept button-inline', submitEditor,
-      {key: 'edit:save', disabled: editing.saving || state.busy || !state.trusted || staleEditor(), title: 'Save the proposal to the .rr request (Ctrl/Cmd+Enter)'}),
-      button('Cancel', 'button button-secondary button-inline', cancelEditor, {key: 'edit:cancel', disabled: editing.saving}));
     return actions;
+  }
+  function editorSelections(area) {
+    const primary = {start: area.selectionStart, end: area.selectionEnd, direction: area.selectionDirection};
+    const length = area.value.length, ranges = [primary];
+    for (const item of editing?.secondarySelections || []) {
+      if (Number.isInteger(item.start) && Number.isInteger(item.end)) ranges.push({
+        start: Math.max(0, Math.min(length, item.start)), end: Math.max(0, Math.min(length, item.end)), direction: item.direction || 'none'});
+    }
+    // Overlapping selections are one edit, including duplicate Alt-clicks.
+    const sorted = ranges.map((item, index) => ({...item, primary: index === 0})).sort((a,b) => a.start-b.start || a.end-b.end);
+    const merged = [];
+    for (const range of sorted) {
+      const last = merged.at(-1);
+      if (last && (range.start < last.end || (range.start === last.start && range.end === last.end))) {
+        last.end = Math.max(last.end, range.end); last.primary ||= range.primary;
+      } else merged.push(range);
+    }
+    const first = merged.find(item => item.primary);
+    return [first, ...merged.filter(item => item !== first)].map(({start,end,direction}) => ({start,end,direction}));
+  }
+  function setEditorSelections(area, selections) {
+    const [primary, ...secondary] = selections;
+    area.setSelectionRange(primary.start, primary.end, primary.direction || 'none');
+    editing.secondarySelections = secondary;
+  }
+  function editorSnapshot(area) { return {value: area.value, selections: editorSelections(area)}; }
+  function recordEditorUndo(snapshot) {
+    editHistory.undo.push(snapshot); editHistory.redo = [];
+    let size = editHistory.undo.reduce((sum,item) => sum+item.value.length, 0);
+    while (editHistory.undo.length > 1 && (size > 5 * 1024 * 1024 || editHistory.undo.length > 100)) size -= editHistory.undo.shift().value.length;
+  }
+  function updateEditor(area) {
+    captureEditor(); saveViewState(); sizeEditor();
+  }
+  function editorUndo(area, redo) {
+    const from = redo ? editHistory.redo : editHistory.undo, to = redo ? editHistory.undo : editHistory.redo;
+    const next = from.pop(); if (!next) return;
+    to.push(editorSnapshot(area)); area.value = next.value; setEditorSelections(area, next.selections); updateEditor(area);
+  }
+  function adjacentTextOffset(text, position, forward, word = false) {
+    const segments = new Intl.Segmenter(undefined, {granularity: word ? 'word' : 'grapheme'}).segment(text);
+    if (forward) {
+      for (const segment of segments) if (segment.index + segment.segment.length > position && (!word || segment.isWordLike || /\S/u.test(segment.segment))) return segment.index+segment.segment.length;
+      return text.length;
+    }
+    let offset = 0;
+    for (const segment of segments) {
+      if (segment.index >= position) break;
+      if (!word || segment.isWordLike || /\S/u.test(segment.segment)) offset = segment.index;
+    }
+    return offset;
+  }
+  function applyEditorInput(area, inputType, inserted = '') {
+    if (area.readOnly) return;
+    const before = editorSnapshot(area), text = area.value;
+    const operations = before.selections.map((selection,index) => {
+      let {start,end} = selection;
+      if (start === end && /Backward$/.test(inputType)) start = adjacentTextOffset(text,start,false,inputType.includes('Word'));
+      if (start === end && /Forward$/.test(inputType)) end = adjacentTextOffset(text,end,true,inputType.includes('Word'));
+      return {start,end,index};
+    }).sort((a,b) => a.start-b.start || a.end-b.end);
+    // Deletion ranges can meet after expansion; merge them before replacing.
+    const merged = [];
+    for (const operation of operations) {
+      const previous = merged.at(-1);
+      if (previous && operation.start < previous.end) {previous.end = Math.max(previous.end,operation.end); previous.indices.push(operation.index);}
+      else merged.push({...operation,indices:[operation.index]});
+    }
+    let result = '', previousEnd = 0;
+    const selections = [];
+    for (const operation of merged) {
+      result += text.slice(previousEnd,operation.start) + inserted;
+      for (const index of operation.indices) selections[index] = {start:result.length,end:result.length,direction:'none'};
+      previousEnd = operation.end;
+    }
+    result += text.slice(previousEnd);
+    if (result !== text) recordEditorUndo(before);
+    area.value = result; setEditorSelections(area,selections);
+    setEditorSelections(area,editorSelections(area)); updateEditor(area);
+  }
+  function mirrorRange(area, start, end = start) {
+    const mirror = area.parentElement.querySelector('.code-text'), walker = document.createTreeWalker(mirror,NodeFilter.SHOW_TEXT);
+    const range = document.createRange(); let offset = 0, first = false, last;
+    while (walker.nextNode()) {
+      const node = walker.currentNode, length = node.textContent.length; last = node;
+      if (!first && start <= offset+length) {range.setStart(node,Math.max(0,start-offset)); first = true;}
+      if (first && end <= offset+length) {range.setEnd(node,Math.max(0,end-offset)); return range;}
+      offset += length;
+    }
+    if (!last) return null;
+    if (!first) range.setStart(last,last.textContent.length);
+    range.setEnd(last,last.textContent.length); return range;
+  }
+  function caretRectangle(area, position) {
+    const rect = mirrorRange(area,position)?.getClientRects()[0];
+    if (rect && rect.height) return rect;
+    const previous = mirrorRange(area,Math.max(0,position-1),position)?.getBoundingClientRect();
+    return previous && {x:previous.right,y:previous.y,width:0,height:previous.height};
+  }
+  function editorOffsetAtPoint(area, x, y) {
+    const mirror = area.parentElement.querySelector('.code-text');
+    const previous = area.style.pointerEvents; area.style.pointerEvents = 'none';
+    const caret = document.caretRangeFromPoint?.(x,y); area.style.pointerEvents = previous;
+    if (!caret || !mirror.contains(caret.startContainer)) return null;
+    const prefix = document.createRange(); prefix.selectNodeContents(mirror); prefix.setEnd(caret.startContainer,caret.startOffset);
+    return Math.min(area.value.length,prefix.toString().length);
+  }
+  function drawEditorSelections(area) {
+    if (!area || !editing || area.dataset.hunk !== editing.hunkId) return;
+    let layer = area.parentElement.querySelector('.editor-extra-selections');
+    if (!layer) {layer = element('span','editor-extra-selections'); layer.setAttribute('aria-hidden','true'); area.parentElement.append(layer);}
+    layer.replaceChildren();
+    const selections = editorSelections(area); area.dataset.cursorCount = String(selections.length);
+    area.setAttribute('aria-description',selections.length > 1 ? selections.length+' cursors. Escape returns to one cursor.' : 'Alt+click to add a cursor within this change.');
+    if (area.dataset.composing === 'true') return;
+    const origin = area.parentElement.getBoundingClientRect();
+    for (const selection of selections.slice(1)) {
+      const rects = selection.start === selection.end ? [caretRectangle(area,selection.start)] : [...(mirrorRange(area,selection.start,selection.end)?.getClientRects() || [])];
+      for (const rect of rects) {
+        if (!rect?.height) continue;
+        const marker = element('span',selection.start === selection.end ? 'editor-extra-caret' : 'editor-extra-selection');
+        marker.style.left = (rect.x-origin.x)+'px'; marker.style.top = (rect.y-origin.y)+'px';
+        marker.style.height = rect.height+'px'; if (selection.start !== selection.end) marker.style.width = rect.width+'px';
+        layer.append(marker);
+      }
+    }
+  }
+  function moveEditorSelections(area, event) {
+    const text = area.value, word = event.ctrlKey || event.altKey;
+    const selections = editorSelections(area).map(selection => {
+      const backward = selection.direction === 'backward';
+      const anchor = backward ? selection.end : selection.start, head = backward ? selection.start : selection.end;
+      let position = head;
+      if (!event.shiftKey && selection.start !== selection.end && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) position = event.key === 'ArrowLeft' ? selection.start : selection.end;
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') position = adjacentTextOffset(text,head,event.key === 'ArrowRight',word);
+      else if (event.key === 'Home') position = event.ctrlKey || event.metaKey ? 0 : head === 0 ? 0 : text.lastIndexOf('\n',head-1)+1;
+      else if (event.key === 'End') {const end = text.indexOf('\n',head); position = event.ctrlKey || event.metaKey || end === -1 ? text.length : end;}
+      else {
+        const rect = caretRectangle(area,head), direction = event.key === 'ArrowUp' ? -1 : 1;
+        const lineHeight = parseFloat(getComputedStyle(area).lineHeight);
+        position = rect ? editorOffsetAtPoint(area,rect.x+0.1,rect.y+rect.height/2+direction*lineHeight) : null;
+        if (position === null) position = direction < 0 ? 0 : text.length;
+      }
+      return event.shiftKey ? {start:Math.min(anchor,position),end:Math.max(anchor,position),direction:position<anchor?'backward':'forward'} : {start:position,end:position,direction:'none'};
+    });
+    setEditorSelections(area,selections); setEditorSelections(area,editorSelections(area)); updateEditor(area);
   }
   function editorInput(value, hunkId, index) {
     const textarea = element('textarea', 'pending-editor-textarea');
@@ -239,18 +405,96 @@
     textarea.dataset.hunk = hunkId;
     textarea.setAttribute('aria-label', 'Proposed text for change ' + (index + 1));
     textarea.setAttribute('autocapitalize', 'off'); textarea.setAttribute('autocomplete', 'off');
-    for (const event of ['input', 'select', 'click', 'keyup', 'scroll']) textarea.addEventListener(event, () => {
-      if (!editing || editing.hunkId !== hunkId) return;
-      captureEditor(); saveViewState();
-      if (event === 'input') sizeEditor();
+    textarea.title = 'Alt+click to add a cursor within this change';
+    let pendingInput = null, composition = null;
+    const active = () => editing && editing.hunkId === hunkId;
+    textarea.addEventListener('pointerdown', event => {
+      if (!active() || textarea.readOnly || event.button !== 0 || composition) return;
+      if (event.altKey) {
+        const offset = editorOffsetAtPoint(textarea,event.clientX,event.clientY);
+        if (offset === null) return;
+        event.preventDefault(); textarea.focus({preventScroll:true});
+        const previous = editorSelections(textarea);
+        setEditorSelections(textarea,[{start:offset,end:offset,direction:'none'},...previous]);
+        setEditorSelections(textarea,editorSelections(textarea)); updateEditor(textarea);
+      } else { editing.secondarySelections = []; drawEditorSelections(textarea); }
+    });
+    for (const event of ['select', 'click', 'keyup', 'scroll']) textarea.addEventListener(event, () => {
+      if (!active()) return;
+      captureEditor(); saveViewState(); drawEditorSelections(textarea);
+    });
+    textarea.addEventListener('beforeinput', event => {
+      if (!active() || textarea.readOnly || composition || event.isComposing) return;
+      if (event.inputType === 'historyUndo' || event.inputType === 'historyRedo') {
+        event.preventDefault(); editorUndo(textarea,event.inputType === 'historyRedo'); return;
+      }
+      if (editorSelections(textarea).length > 1 && !event.cancelable) editing.secondarySelections = [];
+      if (editorSelections(textarea).length > 1 && event.cancelable) {
+        const inputType = event.inputType;
+        if (inputType === 'insertText' || inputType === 'insertReplacementText') {
+          event.preventDefault(); applyEditorInput(textarea,inputType,event.data || ''); return;
+        }
+        if (inputType === 'insertLineBreak' || inputType === 'insertParagraph') {
+          event.preventDefault(); applyEditorInput(textarea,inputType,'\n'); return;
+        }
+        if (/^delete(Content|Word)(Backward|Forward)$/.test(inputType)) {
+          event.preventDefault(); applyEditorInput(textarea,inputType); return;
+        }
+        // Unsupported native edits must never leave secondary offsets stale.
+        editing.secondarySelections = [];
+      }
+      pendingInput = editorSnapshot(textarea);
+    });
+    textarea.addEventListener('input', () => {
+      if (!active()) return;
+      if (!composition && pendingInput && pendingInput.value !== textarea.value) recordEditorUndo(pendingInput);
+      pendingInput = null; updateEditor(textarea);
+    });
+    textarea.addEventListener('paste', event => {
+      if (!active() || textarea.readOnly || composition || editorSelections(textarea).length < 2 || !event.clipboardData) return;
+      event.preventDefault(); applyEditorInput(textarea,'insertFromPaste',event.clipboardData.getData('text/plain').replace(/\r\n?/g,'\n'));
+    });
+    for (const kind of ['copy','cut']) textarea.addEventListener(kind,event => {
+      if (!active() || composition || editorSelections(textarea).length < 2 || !event.clipboardData || (kind === 'cut' && textarea.readOnly)) return;
+      const ranges = editorSelections(textarea).filter(range => range.start !== range.end).sort((a,b)=>a.start-b.start);
+      if (!ranges.length) return;
+      event.preventDefault(); event.clipboardData.setData('text/plain',ranges.map(range=>textarea.value.slice(range.start,range.end)).join('\n'));
+      if (kind === 'cut') applyEditorInput(textarea,'deleteByCut');
+    });
+    textarea.addEventListener('compositionstart', () => {
+      if (!active() || textarea.readOnly) return;
+      composition = editorSnapshot(textarea); textarea.dataset.composing = 'true'; pendingInput = null; drawEditorSelections(textarea);
+    });
+    textarea.addEventListener('compositionend', () => {
+      if (!active() || !composition) return;
+      const original = composition; composition = null; delete textarea.dataset.composing;
+      if (textarea.value === original.value) {setEditorSelections(textarea,original.selections); updateEditor(textarea); return;}
+      const primary = original.selections[0], prefix = original.value.slice(0,primary.start), suffix = original.value.slice(primary.end);
+      if (original.selections.length > 1 && textarea.value.startsWith(prefix) && textarea.value.endsWith(suffix) && textarea.value.length >= prefix.length+suffix.length) {
+        const inserted = textarea.value.slice(prefix.length,textarea.value.length-suffix.length);
+        textarea.value = original.value; setEditorSelections(textarea,original.selections);
+        applyEditorInput(textarea,'insertText',inserted);
+      } else {
+        if (original.value !== textarea.value) recordEditorUndo(original);
+        // Some IMEs replace surrounding text. Keep that native result safely.
+        if (original.selections.length > 1) editing.secondarySelections = [];
+        updateEditor(textarea);
+      }
     });
     textarea.addEventListener('keydown', event => {
-      if (!editing || editing.hunkId !== hunkId || event.isComposing) return;
-      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); cancelEditor(); }
-      else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); submitEditor(); }
-      else if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && !textarea.readOnly) {
-        event.preventDefault(); textarea.setRangeText('\t', textarea.selectionStart, textarea.selectionEnd, 'end');
-        captureEditor(); saveViewState(); sizeEditor();
+      if (!active() || event.isComposing || event.keyCode === 229 || composition) return;
+      const multiple = editorSelections(textarea).length > 1;
+      if (event.key === 'Escape') {
+        event.preventDefault(); event.stopPropagation();
+        if (multiple) {editing.secondarySelections = []; updateEditor(textarea);} else cancelEditor();
+      } else if (matchesEditorAcceptShortcut(event)) { event.preventDefault(); event.stopPropagation(); if (!event.repeat) submitEditor(); }
+      else if ((event.ctrlKey || event.metaKey) && !event.altKey && ['z','y'].includes(event.key.toLowerCase()) && !textarea.readOnly) {
+        event.preventDefault(); event.stopPropagation(); editorUndo(textarea,event.key.toLowerCase() === 'y' || event.shiftKey);
+      } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {editing.secondarySelections = []; drawEditorSelections(textarea);}
+      else if (multiple && ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)) {
+        event.preventDefault(); moveEditorSelections(textarea,event);
+      } else if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && !textarea.readOnly) {
+        event.preventDefault(); applyEditorInput(textarea,'insertText','\t');
       }
     });
     return textarea;
@@ -271,6 +515,7 @@
     cell.querySelector('.line-marker').textContent = hasProposed ? '+' : ' ';
     cell.querySelector('.line-number').textContent = hasProposed ? (editing.rightStart || editing.oldStart || '') : '';
     textarea.style.height = mirror.getBoundingClientRect().height + 'px';
+    drawEditorSelections(textarea);
     refreshOverview();
   }
   function renderEditorRow(leftText, leftStart, rightStart, inlineChanges) {
@@ -298,7 +543,7 @@
     textarea.dataset.mirrorValue = editing.draft;
     content.append(mirror, textarea);
     const stale = staleEditor();
-    const error = stale ? 'The request changed. Your draft is kept; cancel and reopen the change before saving.' : editing.error;
+    const error = stale ? 'The request changed. Your draft is kept; press Escape to cancel and reopen the change before accepting.' : editing.error;
     if (error) { const notice = element('p', 'pending-editor-error', error); notice.setAttribute('role', 'alert'); content.append(notice); }
     const gutter = element('span', 'action-gutter');
     gutter.append(editorActions()); editor.append(number, marker, content, gutter); row.append(original, editor);
@@ -1149,7 +1394,7 @@
       if (message.success === true) {
         focusAfterEdit = {filePath: editing.filePath, oldStart: editing.oldStart, index: editing.index, revision: message.revision};
         editing = null;
-      } else { editing.saving = false; editing.editId = null; editing.error = typeof message.error === 'string' ? message.error : 'The proposal could not be saved. Your draft is kept.'; }
+      } else { editing.saving = false; editing.editId = null; editing.error = typeof message.error === 'string' ? message.error : 'The review decision could not be applied. Your draft is kept.'; }
       saveViewState(); render();
       if (editing) root.querySelector('.pending-editor textarea')?.focus({preventScroll: true});
       return;

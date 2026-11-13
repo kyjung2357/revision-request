@@ -54,7 +54,7 @@ A normal agent workflow is:
 
 1. Read `rr://format` or call `rr_get_format` without arguments.
 2. Call `rr_read_target` with a workspace-relative path. It returns `path`, exact saved `content`, and its SHA-256 `hash`. Keep the text and hash together. Save or undo unsaved target edits first; reads and proposals refuse dirty targets.
-3. Prepare atomic `request` entries with original 1-based first-line numbers and exact `before`/`after` fragments or LF-separated blocks. Group related contiguous changes into one entry by default; retain separate entries for independent changes. A block must match uniquely beginning in its indicated original line. Use LF (`\n`) for logical line breaks; CR is rejected. Saved line endings and BOM are preserved separately. `reason` is optional: omit it or use `""` when no explanation is needed.
+3. Prepare atomic `request` entries with original 1-based first-line numbers and exact `before`/`after` fragments or LF-separated blocks. Use the smallest independently reviewable change. Keep prose, display math, and neighboring LaTeX environments separate; do not merge edits through unchanged lines just because they share a rename. Keep the delimiters of a complete inserted or deleted environment together. See the [grouping guidance](FORMAT.md#structure) for multiline blocks. A block must match uniquely beginning in its indicated original line. Use LF (`\n`) for logical line breaks; CR is rejected. Saved line endings and BOM are preserved separately. `reason` is optional: omit it or use `""` when no explanation is needed.
 4. Call `rr_create_request` using the returned hash as `expectedHash` and a fresh `clientRequestId` for this proposal.
 5. Use the returned request ID with `rr_open_preview` when the user should see the review.
 6. Report that the proposal is pending. Check `rr_get_request_status` later to learn what the user accepted or ignored.
@@ -104,7 +104,7 @@ If the source changed, read it again and prepare a fresh proposal. Do not substi
 
 ## Create a request from two saved files
 
-Use `rr_create_request_from_files` when a separately modified copy already exists. The server compares it with the original and groups consecutive changes into review entries. Use `rr_create_request` instead when the agent is supplying specific fragments or blocks directly.
+Use `rr_create_request_from_files` when a separately modified copy already exists. The server compares it with the original and groups changed runs into review entries. For `.tex`, `.ltx`, and `.latex` files, automatic grouping also separates recognizable prose/display-math/environment boundaries while keeping complete changed environment blocks together. Unchanged lines separate independent edits. The comparison is structural rather than a full TeX parser, so review the generated grouping. Explicit entries passed to `rr_create_request` retain the boundaries supplied by the caller. Use `rr_create_request` instead when the agent is supplying specific fragments or blocks directly.
 
 1. Call `rr_read_target` for the original, then for the modified copy. Both must be saved UTF-8 files inside the connected workspace. Keep each returned `hash`.
 2. Call `rr_create_request_from_files` with their workspace-relative paths, both hashes, and a fresh `clientRequestId`:
