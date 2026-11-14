@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -333,7 +333,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/reviewHighlight.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/reviewHighlight.test.ts test/reviewRebase.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-rebase.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",

@@ -399,6 +399,7 @@ async function clickWhy(id) {
   await settle();
 }
 async function clickMore(id) {
+  await cdp.evaluate('(() => {const button=[...document.querySelectorAll(".review-menu-toggle")].find(node=>node.dataset.whyId==='+JSON.stringify(id)+'),scroll=document.querySelector("[data-scroll-area]");if(!button)return;const r=button.getBoundingClientRect(),view=scroll.getBoundingClientRect();if(r.top<view.top||r.bottom>view.bottom)button.scrollIntoView({block:"nearest"});})()');await settle();
   await cdp.evaluate('(() => { const toggle=Array.from(document.querySelectorAll(".review-menu-toggle")).find(item=>item.dataset.whyId==='+JSON.stringify(id)+');if(!toggle || toggle.disabled)throw Error("Expected enabled actions button");toggle.click(); })()');
   await settle();
 }
@@ -1381,11 +1382,15 @@ async function runQuickReviewTests(width) {
       await quickAck(sent);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[1]);assert.equal(view.selected[0].decision,'accepted');assert.equal(view.focused.id,ids[1]);
       assert.ok(view.selected[0].rect.y>=view.scroll.rect.y-.7&&view.selected[0].rect.bottom<=view.scroll.rect.bottom+.7,'Next controls are visible');
       assert.ok(view.scroll.top<view.scroll.total-view.scroll.rect.height-50,'Advancement does not jump to the bottom');
+      assert.ok(Math.abs((view.selected[0].rect.y+view.selected[0].rect.bottom)/2-(view.scroll.rect.y+view.scroll.rect.bottom)/2)<20,'Next single-line change appears near the viewport center');
       await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",repeat:true,bubbles:true,cancelable:true}))');
       assert.equal((await quickSnapshot()).decisions.length,1,'Held Tab cannot approve the newly focused item');
       await quickKey('ArrowRight');await quickKey('Tab');const ignored=(await quickSnapshot()).decisions.at(-1);assert.equal(ignored.decision,'ignored');
       await quickAck(ignored);assert.notEqual((await quickSnapshot()).selected[0]?.id,ids[2],'Ack alone waits for the state');
       await quickResolve(ignored);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[2]);assert.equal(view.selected[0].decision,'accepted','Next item resets to Accept');
+      assert.ok(Math.abs((view.selected[0].rect.y+view.selected[0].rect.bottom)/2-(view.scroll.rect.y+view.scroll.rect.bottom)/2)<20,'Ignore also centers the next change');
+      const centeredTop=view.scroll.top;await quickKey('ArrowRight');await quickKey('ArrowLeft');
+      assert.equal((await quickSnapshot()).scroll.top,centeredTop,'Switching Accept/Ignore preserves the centered viewport');
       await screenshot('quick-review-'+width+'-'+(unified?'unified':'split')+'-on');
     });
 
@@ -1402,6 +1407,27 @@ async function runQuickReviewTests(width) {
       const block=await cdp.evaluate('(()=>{const node=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(review.hunks[1].id)+');const r=node.getBoundingClientRect();return{top:r.top,bottom:r.bottom,height:r.height};})()');
       assert.ok(block.height<view.scroll.rect.height,'The complete next block fits');
       assert.ok(block.top>=view.scroll.rect.y-.7&&block.bottom<=view.scroll.rect.bottom+.7,'All proposed lines, not only the Accept button, must be visible');
+      assert.ok(Math.abs((block.top+block.bottom)/2-(view.scroll.rect.y+view.scroll.rect.bottom)/2)<1.1,'The complete multiline block is centered');
+    });
+
+    for(const atEnd of [false,true]) await runTest(label+': '+(atEnd?'centering stops at the file end':'an oversized next block centers its proposed action row'),async()=>{
+      const next=await resetQuick(width,unified),filePath=next.files[0].path;
+      const request=parseRequestDocument(JSON.stringify({path:filePath,request:[
+        {line:5,before:'Original item 5.',after:'Revised item 5.',status:'pending'},
+        atEnd?{line:150,before:'Context line 150.',after:'Revised final line.',status:'pending'}:
+          {line:45,before:'Original item 45.',after:Array.from({length:65},(_,i)=>'Proposed line '+(i+1)+'.').join('\n'),status:'pending'}
+      ]}));
+      const review=resolveRequest(request,next.files[0].before,next.files[0].before);
+      next.files[0].hunks=review.hunks.map(hunk=>({...hunk,decision:'pending',inlineChanges:computeInlineChanges(hunk,40,filePath)}));
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();await quickToggle(true);await quickKey('Tab');await settle();
+      const view=await quickSnapshot(),control=view.selected[0];assert.equal(control.id,review.hunks[1].id);
+      assert.ok(control.rect.y>=view.scroll.rect.y-.7&&control.rect.bottom<=view.scroll.rect.bottom+.7,'Next action stays visible');
+      if(atEnd) assert.ok(Math.abs(view.scroll.top-(view.scroll.total-view.scroll.rect.height))<1.1,'No extra blank space is added beyond the end');
+      else {
+        const height=await cdp.evaluate('document.querySelector(".quick-review-selected").closest("[data-overview-hunk]").getBoundingClientRect().height');
+        assert.ok(height>view.scroll.rect.height,'This block exceeds the viewport');
+        assert.ok(Math.abs((control.rect.y+control.rect.bottom)/2-(view.scroll.rect.y+view.scroll.rect.bottom)/2)<1.1,'The oversized block action row is centered');
+      }
     });
 
     await runTest(label+': errors preserve the item and selection, and mode exits after all decisions',async()=>{
@@ -1451,6 +1477,191 @@ async function runQuickReviewTests(width) {
     });
   }
   await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+}
+
+async function originalLineSnapshot(id) {
+  return cdp.evaluate(`(() => {
+    const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)});
+    const go=block?.querySelector('.original-line-button'),buttons=[...block.querySelectorAll('.inline-actions button')];
+    const accept=buttons.find(node=>node.textContent==='Accept'),ignore=buttons.find(node=>node.textContent==='Ignore'),more=buttons.find(node=>node.classList.contains('review-menu-toggle'));
+    const rect=node=>{if(!node)return null;const r=node.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:r.width,height:r.height};};
+    return {count:block.querySelectorAll('.original-line-button').length,go:rect(go),accept:rect(accept),ignore:rect(ignore),more:rect(more),
+      original:rect(go?.closest('.code-side')),proposed:rect(accept?.closest('.code-side')),
+      text:go?.textContent,title:go?.title,disabled:go?.disabled,
+      firstRemoved:Boolean(go&&block.querySelector('.code-side.removed')===go.closest('.code-side')),
+      quickDecision:go?.dataset.quickDecision};
+  })()`);
+}
+async function clickOriginalLine(id) {
+  const point=await cdp.evaluate(`(() => {const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)}),button=block.querySelector('.original-line-button');button.scrollIntoView({block:'nearest'});const r=button.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+  await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+  await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await settle();
+}
+async function runExternalEditTests(width) {
+  const reset=async unified=>{
+    if(await editSnapshot()) {
+      const sent=await cdp.evaluate('window.__messages.filter(message=>["editAndAccept","ignoreEdited"].includes(message.type)).at(-1)');
+      if(sent)await editAck(sent,{success:false,error:'Test leaves this draft available.'});
+      await cdp.evaluate('document.querySelector(".pending-editor textarea")?.focus()');await editorKey('Escape');
+    }
+    const next=await resetQuick(width,unified);next.rawRevision='external-json';
+    await cdp.evaluate('window.__setReview('+JSON.stringify(next)+');window.__messages=[]');await settle();return next;
+  };
+  const snapshot=async id=>cdp.evaluate(`(()=>{
+    const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)});
+    const action=key=>block.querySelector('[data-focus-key$=":'+key+'"]');
+    return {text:block.textContent,notice:block.querySelector('.hunk-conflict-message')?.textContent,
+      accept:action('accept')?.disabled,ignore:action('ignore')?.disabled,undo:action('undo')?.disabled,
+      undoTitle:action('undo')?.title,go:block.querySelector('.original-line-button')?.disabled,
+      editable:block.querySelectorAll('[data-edit-hunk],.direct-editor-input').length,
+      acceptAll:document.querySelector('[data-focus-key$=":acceptFile"]').disabled,
+      ignoreAll:document.querySelector('[data-focus-key$=":ignoreFile"]').disabled,
+      counters:[...document.querySelectorAll('.summary .badge')].map(node=>node.textContent)};
+  })()`);
+  for(const unified of [false,true]) {
+    const label=width+'px '+(unified?'unified':'side-by-side')+' external edits';
+    await runTest(label+': conflicts block only unsafe actions and leave explanation and Ignore available',async()=>{
+      const next=await reset(unified),[first,second]=next.files[0].hunks;
+      first.conflict='The original changed inside this pending block.';
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();
+      let view=await snapshot(first.id);assert.equal(view.accept,true);assert.equal(view.ignore,false);assert.equal(view.go,true);assert.equal(view.editable,0);
+      assert.equal(view.acceptAll,true);assert.equal(view.ignoreAll,false);assert.equal(view.notice,first.conflict);assert.equal(view.counters[0],'4 pending');
+      assert.equal((await snapshot(second.id)).accept,false,'Unrelated pending changes remain reviewable');
+      await clickMore(first.id);
+      assert.equal(await cdp.evaluate('document.querySelector(".review-action-why").disabled'),false);
+      assert.equal(await cdp.evaluate('document.querySelector("[data-review-action=comment]").disabled'),true);
+      assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="reviewActions").length'),0,'Conflicts do not request an unsafe draft transform');
+      await editorKey('Escape');
+      await cdp.evaluate('(()=>{const button=[...document.querySelectorAll("[data-focus-key]")].find(node=>node.dataset.focusKey==='+JSON.stringify(next.files[0].path+':'+second.id+':accept')+');button.click();})()');await settle();
+      const decisions=(await quickSnapshot()).decisions;assert.equal(decisions.length,1);assert.equal(decisions[0].hunkId,second.id);
+    });
+    await runTest(label+': manually edited resolved text stays gray with badges and only its Undo blocked',async()=>{
+      const next=await reset(unified),file=next.files[0],first=file.hunks[0],second=file.hunks[1];
+      const manual='Manually maintained original text.\n',delta=manual.length-first.before.length;
+      file.before=file.before.slice(0,first.start)+manual+file.before.slice(first.end);
+      first.end=first.start+manual.length;first.before=first.after=manual;first.draftAfter=manual.trimEnd();first.decision='accepted';first.undoBlocked='Edited in the original after acceptance.';
+      first.inlineChanges=[];
+      for(const hunk of file.hunks.slice(1)){hunk.start+=delta;hunk.end+=delta;}
+      second.decision='ignored';second.after=second.before;second.draftAfter=second.before.trimEnd();second.undoBlocked='Edited in the original after ignoring this proposal.';second.inlineChanges=[];
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();
+      const view=await snapshot(first.id);assert.ok(view.text.includes('Manually maintained original text.'));assert.ok(view.text.includes('Accepted'));
+      assert.equal(view.undo,true);assert.equal(view.undoTitle,first.undoBlocked);assert.equal((await snapshot(second.id)).undo,true);
+      assert.deepEqual(view.counters,['2 pending','1 accepted','1 ignored']);assert.equal((await snapshot(file.hunks[2].id)).accept,false);
+      assert.equal(await cdp.evaluate('(()=>{const block=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(first.id)+');return block.querySelectorAll(".removed,.added").length;})()'),0);
+    });
+    await runTest(label+': Quick Review pauses at the conflict until the user explicitly ignores it',async()=>{
+      const next=await reset(unified),ids=next.files[0].hunks.map(hunk=>hunk.id);next.files[0].hunks[1].conflict='Resolve this original edit or ignore its proposal.';
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();await quickToggle(true);await quickKey('Tab');
+      let view=await quickSnapshot();assert.equal(view.selected[0].id,ids[1]);assert.equal(view.selected[0].decision,'accepted');assert.equal(view.decisions.length,1);
+      assert.ok(view.selected[0].rect.y>=view.scroll.rect.y-.7&&view.selected[0].rect.bottom<=view.scroll.rect.bottom+.7,'The conflicting next change is revealed');
+      await quickKey('Tab');view=await quickSnapshot();assert.equal(view.decisions.length,1,'Tab never approves or skips a conflict');assert.equal(view.selected[0].id,ids[1]);
+      await quickKey('ArrowRight');assert.equal((await quickSnapshot()).selected[0].decision,'ignored');await quickKey('Tab');
+      view=await quickSnapshot();assert.equal(view.decisions[1].hunkId,ids[1]);assert.equal(view.decisions[1].decision,'ignored');assert.equal(view.selected[0].id,ids[2]);
+      assert.equal(view.enabled,true);assert.equal(await cdp.evaluate('document.querySelector(".summary .pending").textContent'),'2 pending');
+    });
+    await runTest(label+': a pending deletion removed externally retains its conflict and Ignore row',async()=>{
+      const next=await reset(unified),file=next.files[0],hunk=file.hunks[0],removed=hunk.end-hunk.start;
+      file.before=file.before.slice(0,hunk.start)+file.before.slice(hunk.end);
+      hunk.end=hunk.start;hunk.before=hunk.after=hunk.draftAfter='';hunk.oldLines=hunk.newLines=0;hunk.conflict='The original deletion range was changed externally.';hunk.inlineChanges=[];
+      for(const item of file.hunks.slice(1)){item.start-=removed;item.end-=removed;item.oldStart--;item.newStart--;}
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();const view=await snapshot(hunk.id);
+      assert.equal(view.accept,true);assert.equal(view.ignore,false);assert.equal(view.notice,hunk.conflict);
+      assert.equal(view.counters[0],'4 pending','A missing source range is not automatically accepted');
+      await cdp.evaluate('(()=>{const block=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(hunk.id)+');[...block.querySelectorAll("button")].find(node=>node.dataset.focusKey?.endsWith(":ignore")).click();})()');await settle();
+      assert.equal((await quickSnapshot()).decisions.at(-1).decision,'ignored');
+    });
+    await runTest(label+': a source-only context refresh preserves and revalidates the current draft and cursor',async()=>{
+      const next=await reset(unified),id=next.files[0].hunks[0].id;await openEdit(id);await writeDraft('Personal proposal draft.');
+      await cdp.evaluate('(()=>{const area=document.querySelector(".pending-editor textarea");area.setSelectionRange(4,9);area.dispatchEvent(new Event("select"));})()');await settle();
+      const prefix='User-added gray context.\n';next.files[0].before=prefix+next.files[0].before;
+      for(const hunk of next.files[0].hunks){hunk.start+=prefix.length;hunk.end+=prefix.length;hunk.oldStart++;hunk.newStart++;}
+      next.revision='source-refreshed';await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();
+      const view=await editSnapshot();assert.equal(view.draft,'Personal proposal draft.');assert.deepEqual(view.selection,[4,9]);assert.equal(view.acceptDisabled,false);assert.equal(view.readOnly,false);
+      assert.equal(view.persisted.revision,'source-refreshed');assert.equal(view.persisted.rawRevision,'external-json');assert.ok(await cdp.evaluate('document.querySelector(".paired-document").textContent.includes("User-added gray context.")'));
+      await editorKey('Enter',{ctrlKey:true});const sent=await cdp.evaluate('window.__messages.find(message=>message.type==="editAndAccept")');assert.equal(sent.revision,'source-refreshed');assert.equal(sent.draft,'Personal proposal draft.');
+      await editAck(sent,{success:false,error:'Test keeps the proposal.'});await editorKey('Escape');
+    });
+    await runTest(label+': a conflicting source or changed JSON keeps the draft but cannot silently revalidate it',async()=>{
+      for(const sourceConflict of [true,false]) {
+        const next=await reset(unified),id=next.files[0].hunks[0].id;await openEdit(id);await writeDraft('Keep this unsaved draft.');
+        next.revision='changed-state';if(sourceConflict)next.files[0].hunks[0].conflict='The current proposal overlaps a source edit.';else next.rawRevision='changed-json';
+        await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();const view=await editSnapshot();
+        assert.equal(view.draft,'Keep this unsaved draft.');assert.equal(view.acceptDisabled,true);assert.notEqual(view.persisted.revision,next.revision);
+        if(sourceConflict)assert.equal(view.readOnly,true);await editorKey('Enter',{ctrlKey:true});assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="editAndAccept").length'),0);
+        const ignoreDisabled=await cdp.evaluate('Array.from(document.querySelectorAll("button")).find(node=>node.dataset.focusKey==="edit:ignore").disabled');
+        assert.equal(ignoreDisabled,!sourceConflict,'Only source-conflicted drafts can be explicitly discarded against the unchanged request');
+        if(sourceConflict) {
+          await cdp.evaluate('Array.from(document.querySelectorAll("button")).find(node=>node.dataset.focusKey==="edit:ignore").click()');await settle();
+          const sent=await cdp.evaluate('window.__messages.find(message=>message.type==="ignoreEdited")');assert.equal(sent.revision,next.revision);
+          await editAck(sent,{success:false,error:'Test keeps the draft available.'});
+        }
+        await editorKey('Escape');
+      }
+    });
+    await runTest(label+': source-only line shifts preserve the visible pending anchor without issuing decisions',async()=>{
+      const next=await reset(unified),id=next.files[0].hunks[2].id;
+      await cdp.evaluate('(()=>{const row=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(id)+');row.scrollIntoView({block:"start"});})()');await settle();
+      const offset=()=>cdp.evaluate('(()=>{const row=[...document.querySelectorAll("[data-overview-hunk]")].find(node=>node.dataset.overviewHunk==='+JSON.stringify(id)+');return row.getBoundingClientRect().top-document.querySelector("[data-scroll-area]").getBoundingClientRect().top;})()');
+      const before=await offset(),prefix='Extra unchanged context.\n';next.files[0].before=prefix+next.files[0].before;next.revision='context-shifted';
+      for(const hunk of next.files[0].hunks){hunk.start+=prefix.length;hunk.end+=prefix.length;hunk.oldStart++;hunk.newStart++;}
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();assert.ok(Math.abs(await offset()-before)<.8,'External gray edits preserve the pending reading position');assert.equal((await quickSnapshot()).decisions.length,0);
+    });
+  }
+  await quickToggle(false);await resetFixture(width);
+}
+
+async function runOriginalLineTests(width) {
+  const reset=async unified=>{
+    if(await editSnapshot()){await cdp.evaluate('document.querySelector(".pending-editor textarea").focus()');await editorKey('Escape');}
+    await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified!==unified)await toggleLayout();
+  };
+  const assertSize=(view,unified)=>{
+    assert.equal(view.count,1,'Each pending block has one original navigation control');
+    assert.equal(view.text,'Go to original');assert.equal(view.title,'Go to original line');assert.equal(view.firstRemoved,true);
+    assert.equal(view.go.height,view.accept.height);assert.equal(view.go.height,18);
+    assert.ok(Math.abs(view.go.width-(view.ignore.right-view.accept.x))<.7,'Navigation spans Accept and Ignore, including their gap');
+    if(unified){assert.ok(Math.abs(view.go.x-view.accept.x)<.7,'Navigation starts directly above Accept');assert.ok(view.go.right<view.more.x,'The ellipsis slot stays empty above');}
+    assert.ok(view.go.x>=view.original.x-.7&&view.go.right<=view.original.right+.7,'Navigation stays inside the original pane');
+    assert.equal(view.quickDecision,undefined,'Navigation is excluded from Quick Review decisions');
+  };
+  for(const unified of [false,true]) {
+    const label=width+'px '+(unified?'unified':'side-by-side')+' original navigation';
+    await runTest(label+': the red-row button spans only Accept and Ignore and opens without a decision',async()=>{
+      await reset(unified);const view=await originalLineSnapshot('grow');assertSize(view,unified);assert.equal(view.disabled,false);
+      const before=await cdp.evaluate('structuredClone(window.__review)');await clickOriginalLine('grow');
+      const sent=await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine")');
+      assert.deepEqual(sent,[{type:'openTargetLine',filePath:fixture.files[0].path,hunkId:'grow',revision:fixture.revision}]);
+      assert.deepEqual(await cdp.evaluate('window.__review'),before,'Navigation does not change proposals or decisions');
+      assert.equal(await cdp.evaluate('window.__messages.some(message=>["decide","decideFile","editPending","editAndAccept","ignoreEdited"].includes(message.type))'),false);
+      await screenshot('original-line-'+width+'-'+(unified?'unified':'split'));
+    });
+    await runTest(label+': editing keeps the original button and preserves an unsaved draft when opening it',async()=>{
+      await reset(unified);await openEdit('shrink');await writeDraft('Unsaved replacement.\nSecond proposed line.');
+      const before=await editSnapshot(),view=await originalLineSnapshot('shrink');assertSize(view,unified);
+      await clickOriginalLine('shrink');const after=await editSnapshot();assert.equal(after.draft,before.draft);
+      assert.deepEqual(after.selection,before.selection);assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").at(-1).hunkId'),'shrink');
+      assert.equal(await cdp.evaluate('window.__messages.some(message=>["editPending","editAndAccept","ignoreEdited"].includes(message.type))'),false,'Opening the source never saves or accepts the draft');
+    });
+    await runTest(label+': additions have no original button and pure deletion keeps both navigation and review actions',async()=>{
+      await reset(unified);assert.equal((await originalLineSnapshot('insert')).count,0);
+      const view=await originalLineSnapshot('delete');assertSize(view,unified);
+      if(unified)assert.ok(view.go.bottom<=view.accept.y+.7,'Deletion keeps navigation above its decision controls');
+      await clickOriginalLine('delete');await clickDecision('delete','ignore');
+      assert.equal((await originalLineSnapshot('delete')).count,0,'Resolved changes no longer show original-line navigation');
+      assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").length'),1);
+    });
+    await runTest(label+': stale source disables navigation and Quick Review still cycles only Accept and Ignore',async()=>{
+      await reset(unified);await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.files[0].issue="The original has changed.";window.__setReview(next);})()');await settle();
+      assert.equal((await originalLineSnapshot('grow')).disabled,true);await clickOriginalLine('grow');
+      assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").length'),0);
+      await reset(unified);await quickToggle(true);
+      for(const [key,decision] of [['ArrowRight','ignored'],['ArrowRight','accepted'],['ArrowLeft','ignored']]){
+        await quickKey(key);const view=await quickSnapshot();assert.equal(view.selected.length,1);assert.equal(view.selected[0].decision,decision);
+      }
+      assert.equal(await cdp.evaluate('document.querySelectorAll(".original-line-button.quick-review-selected").length'),0);
+    });
+  }
+  await reset(false);
 }
 
 async function runEditorButtonTests(width) {
@@ -1653,11 +1864,13 @@ async function reloadPreview(stateOverride,messagesBeforeState=[]) {
   await cdp.evaluate(stateOverride ? "window.__setReview("+JSON.stringify(stateOverride)+")" : "window.__setReview(structuredClone(window.__fixture))"); await settle();
 }
 async function runSplitterTests(width) {
+  const allowedRatio=(value,requested)=>Math.max(value.min/100,Math.min(value.max/100,requested));
   await resetFixture(width); await resetSplit();
   await runTest(width+'px: dragging the central divider resizes every paired row and keeps the fixed action rail',async()=>{
     const before=await splitSnapshot(), text=await cdp.evaluate("JSON.stringify(window.__review)");
     const moved=await dragSplitter(.35);
-    assertSplitGeometry(moved); assert.ok(moved.left<before.left-30); assert.ok(moved.right>before.right+30);
+    assertSplitGeometry(moved); assert.ok(moved.left<before.left-.5); assert.ok(moved.right>before.right+.5);
+    assert.ok(Math.abs(moved.ratio-allowedRatio(moved,.35))<.006,'Dragging stops at the exposed width limit when needed');
     assert.ok(Math.abs(moved.rail-before.rail)<.6,'The action rail retains its fixed width');
     assert.ok(Math.abs(moved.saved-moved.ratio)<.002); assert.equal(moved.dragging,false);
     assertAligned(await geometry()); await assertTextProjection(); await assertMatchingContextWraps();
@@ -1668,15 +1881,17 @@ async function runSplitterTests(width) {
     assert.ok(Math.abs(cancelled.ratio-moved.ratio)<.002,'Pointer cancellation restores the pre-drag ratio');
     assert.equal(cancelled.dragging,false);
     const refreshed=await dragSplitter(.4,false,true);
-    assert.ok(Math.abs(refreshed.ratio-.4)<.003,'A host refresh safely finishes and retains the current drag');
+    assert.ok(Math.abs(refreshed.ratio-allowedRatio(refreshed,.4))<.006,'A host refresh safely retains the drag within the exposed width limits');
     assert.equal(refreshed.dragging,false); assertAligned(await geometry());
     await resetSplit();
   });
   await runTest(width+'px: divider keyboard controls honor minimum widths and double-click restores equal panes',async()=>{
     let current=await splitKey('ArrowLeft');
-    assert.ok(Math.abs(current.ratio-.48)<.003);
+    assert.ok(Math.abs(current.ratio-allowedRatio(current,.48))<.006);
+    const previousRatio=current.ratio;
     current=await splitKey('ArrowLeft',true);
-    assert.ok(Math.abs(current.ratio-.38)<.003);
+    assert.ok(current.ratio<=previousRatio,'Shift+Left moves toward the left width limit');
+    assert.ok(Math.abs(current.ratio-allowedRatio(current,previousRatio-.1))<.006);
     current=await splitKey('Home'); assertSplitGeometry(current);
     assert.ok(Math.abs(current.ratio*100-current.min)<1);
     current=await splitKey('End'); assertSplitGeometry(current);
@@ -2273,6 +2488,7 @@ async function runLayoutTests() {
       await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop='+originalTop);await settle();
     });
     await runTest(width + 'px: Why popover renders safe text without moving comparison rows', async () => {
+      await cdp.evaluate('document.querySelector("[data-why-id=grow]").scrollIntoView({block:"nearest"})');await settle();
       const before = await geometry(); await clickWhy('grow'); await assertNoLayoutShift(before);
       const popover = await cdp.evaluate(`(() => {
         const node = document.querySelector('.why-popover'); const box = node.getBoundingClientRect();
@@ -2455,6 +2671,12 @@ async function main() {
     for (const width of [1200,620]) await runReviewActionTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'navigation') {
     for (const width of [1200,620]) {await runOpenNavigationTests(width);await runNavigationTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'splitter') {
+    for (const width of [1200,620]) await runSplitterTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'original-line') {
+    for (const width of [1200,620]) await runOriginalLineTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'external-edits') {
+    for (const width of [1200,620]) await runExternalEditTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'quick') {
     for (const width of [1200,620]) await runQuickReviewTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'create') {
@@ -2464,7 +2686,7 @@ async function main() {
   } else {
     await runDefaultLayoutTests();
     await runLayoutTests();
-    for (const width of [1200,620]) {await runQuickReviewTests(width);await runOpenNavigationTests(width);}
+    for (const width of [1200,620]) {await runQuickReviewTests(width);await runOpenNavigationTests(width);await runOriginalLineTests(width);await runExternalEditTests(width);}
     await runCreateRequestTests();
   }
   assert.equal(cdp.exceptions.length, 0, 'Production JavaScript must not throw browser exceptions');

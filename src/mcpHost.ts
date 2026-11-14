@@ -171,7 +171,7 @@ export class McpHost {
   private unavailable(record: RequestRecord, issue: string): McpStatus {
     return {
       requestId: record.requestId, requestPath: path.relative(vscode.Uri.parse(record.workspaceUri).fsPath, vscode.Uri.parse(record.uri).fsPath).split(path.sep).join('/'),
-      path: record.path, revision: record.rawRevision ?? record.fingerprint, status: 'unavailable', pending: 0, accepted: 0, ignored: 0, hunks: [], issue,
+      path: record.path, revision: record.rawRevision ?? record.fingerprint, rawRevision: record.rawRevision, status: 'unavailable', pending: 0, accepted: 0, ignored: 0, hunks: [], issue,
     };
   }
   private async status(record: RequestRecord): Promise<McpStatus> {
@@ -187,7 +187,7 @@ export class McpHost {
       // clean text model. Wait briefly for that model, but never follow a different
       // proposal or file generation and never treat a mismatched revision as valid.
       const deadline = Date.now() + 1500;
-      while (state.revision !== inspected.revision && inspected.stamp === record.stamp &&
+      while ((state.rawRevision ?? state.revision) !== inspected.revision && inspected.stamp === record.stamp &&
           inspected.fingerprint === record.fingerprint && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 25));
         state = await this.service.getState(uri, false);
@@ -197,16 +197,17 @@ export class McpHost {
     if (inspected.stamp !== record.stamp || inspected.fingerprint !== record.fingerprint) {
       return this.unavailable(record, 'This path now contains changed contents or a different request generation. List requests again.');
     }
-    if (state.error || state.revision !== inspected.revision) return this.unavailable(record, state.error ?? 'The request changed while its status was being read. Try again.');
+    if (state.error || (state.rawRevision ?? state.revision) !== inspected.revision) return this.unavailable(record, state.error ?? 'The request changed while its status was being read. Try again.');
     const file = state.files[0];
-    const hunks = file?.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision}) => ({id, oldStart, newStart, oldLines, newLines, decision})) ?? [];
+    const hunks = file?.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision, conflict, undoBlocked}) =>
+      ({id, oldStart, newStart, oldLines, newLines, decision, ...(conflict ? {conflict} : {}), ...(undoBlocked ? {undoBlocked} : {})})) ?? [];
     const decisions = inspected.request.request.map(item => item.status);
     const pending = decisions.filter(value => value === 'pending').length;
     const accepted = decisions.filter(value => value === 'accepted').length;
     const ignored = decisions.filter(value => value === 'ignored').length;
     const issue = file?.issue || (!state.verified ? state.verificationIssue || 'The recorded decisions could not be verified against the current source.' : undefined);
     const result: McpStatus = {
-      ...this.unavailable(record, ''), revision: inspected.revision,
+      ...this.unavailable(record, ''), revision: state.revision, rawRevision: inspected.revision,
       status: issue ? 'stale' : pending || !decisions.length ? 'pending' : 'completed',
       pending, accepted, ignored, hunks, issue,
     };
@@ -237,7 +238,7 @@ export class McpHost {
     if (checkedState.error || checkedState.revision !== status.revision || checkedState.files[0]?.issue ||
         (!checkedState.verified || checkedState.verifiedTargetHash !== targetHash)) return;
     const receipt: McpStatus = {...status, status: 'completed', cleanup: 'retained', completedAt: new Date().toISOString(), targetHash,
-      hunks: status.hunks.map(({id, oldStart, newStart, oldLines, newLines, decision}) => ({id, oldStart, newStart, oldLines, newLines, decision}))};
+      hunks: status.hunks.map(hunk => ({...hunk}))};
     await this.mutate(async records => {
       const current = records.find(item => item.requestId === record.requestId);
       if (current) current.receipt = receipt;
@@ -435,6 +436,7 @@ export class McpHost {
         const status = await this.status(record);
         if (status.status === 'unavailable' || status.cleanup === 'deleted') throw new McpBridgeError('REQUEST_UNAVAILABLE', 'This request is no longer available for decisions.');
         const revision = requiredString(args.revision, 'revision', 64);
+        if (revision !== status.revision) throw new McpBridgeError('REQUEST_CHANGED', 'The review changed. Read its current status before deciding.');
         const uri = vscode.Uri.parse(record.uri);
         if (method === 'undo') {
           await this.service.undo(uri, record.path, requiredString(args.hunkId, 'hunkId', 256), revision, 'agent');

@@ -12,6 +12,7 @@ const root = path.resolve(__dirname, '..');
 let scratch;
 const documents = new Map();
 const sourceWrites = [];
+const sourceNavigations = [];
 const settings = new Map([['autoDeleteCompleted', false], ['skipCompletedDeleteConfirmation', false]]);
 let sourceFault;
 class Uri {
@@ -22,7 +23,10 @@ class Uri {
   static joinPath(uri, ...parts) { return new Uri(path.join(uri.fsPath, ...parts)); }
 }
 const vscode = {
-  Uri, ConfigurationTarget: {Global: 1, Workspace: 2, WorkspaceFolder: 3},
+  Uri, ViewColumn: {Active: -1}, TextEditorRevealType: {InCenter: 1},
+  Position: class {constructor(line, character) {this.line = line; this.character = character;}},
+  Range: class {constructor(start, end) {this.start = start; this.end = end;}},
+  ConfigurationTarget: {Global: 1, Workspace: 2, WorkspaceFolder: 3},
   EventEmitter: class { constructor() {this.event = () => ({dispose(){}});} fire(){} dispose(){} },
   TabInputText: class {},
   workspace: {
@@ -38,7 +42,8 @@ const vscode = {
     async openTextDocument(uri) {
       if (!documents.has(uri.toString())) documents.set(uri.toString(), {
         uri, isDirty: false, isClosed: false,
-        getText() {return this.staleText ?? syncFs.readFileSync(uri.fsPath, 'utf8').replace(/^\uFEFF/, '');}
+        getText() {return this.staleText ?? syncFs.readFileSync(uri.fsPath, 'utf8').replace(/^\uFEFF/, '');},
+        get lineCount() {return this.getText().split(/\r\n|\r|\n/).length;}
       });
       return documents.get(uri.toString());
     },
@@ -56,7 +61,12 @@ const vscode = {
       delete: uri => fs.unlink(uri.fsPath)
     }
   },
-  window: {tabGroups: {all: [], close: async () => true}, showWarningMessage: () => undefined},
+  window: {tabGroups: {all: [], close: async () => true}, showWarningMessage: () => undefined,
+    async showTextDocument(document, options) {
+      const navigation = {document, options}; sourceNavigations.push(navigation);
+      return {revealRange: (range, type) => {navigation.reveal = {range, type};}};
+    }
+  },
 };
 const load = Module._load;
 Module._load = function(name, parent, main) { return name === 'vscode' ? vscode : load.call(this, name, parent, main); };
@@ -184,7 +194,7 @@ test('external status tampering cannot make an unchanged source verified/complet
   const item = await fixture(); const {api} = service(); await ready(api, item);
   const raw = JSON.parse(await read(item.request)); raw.request.forEach(entry => {entry.status = 'accepted';});
   await fs.writeFile(item.request.fsPath, JSON.stringify(raw)); const state = await api.getState(item.request);
-  assert.equal(state.closed, true); assert.equal(state.verified, false); assert.ok(state.verificationIssue); assert.equal(state.files[0].issue, state.verificationIssue); assert.equal(state.files[0].currentText, item.before); assert.equal(await read(item.target), item.before);
+  assert.equal(state.closed, true); assert.equal(state.verified, false); assert.ok(state.verificationIssue); assert.equal(state.files.length, 0, 'Tampered decisions cannot produce a verified comparison'); assert.equal(await read(item.target), item.before);
 });
 
 test('Ignore and Undo ignored persist status without a source write', async () => {
@@ -901,4 +911,163 @@ test('original comments preserve UTF-8 BOM, line endings and final-newline state
     await api.undo(item.request,item.relative,accepted.files[0].hunks[0].id,accepted.revision);
     assert.equal(await read(item.target),item.before);
   }
+});
+
+
+test('original-line navigation accounts only for earlier accepted edits including same-anchor insertion', async () => {
+  const item = await fixture('drop\nexpand\nkeep\nfocus\nlast\n', [
+    {line:1,before:'drop',after:null,status:'pending'},
+    {line:2,before:'expand',after:'one\ntwo\nthree',status:'pending'},
+    {line:3,before:'keep',after:'ignored\nextra',status:'pending'},
+    {line:4,before:null,after:'insert a\ninsert b',status:'pending'},
+    {line:4,before:'focus',after:'FOCUS',status:'pending'}
+  ]);
+  const {api} = service(); let state = await ready(api,item);
+  for(const [index,decision] of [[0,'accepted'],[1,'accepted'],[2,'ignored'],[3,'accepted']]) {
+    await api.decide(item.request,item.relative,state.files[0].hunks[index].id,decision,state.revision);
+    state = await ready(api,item);
+  }
+  const beforeSource=await read(item.target),beforeRequest=await read(item.request),writes=sourceWrites.length;
+  await api.openTargetLine(item.request,item.relative,state.files[0].hunks[4].id,state.revision);
+  const navigation=sourceNavigations.at(-1),selection=navigation.options.selection;
+  assert.equal(navigation.document.uri.toString(),item.target.toString());
+  assert.deepEqual([selection.start.line,selection.start.character,selection.end.line,selection.end.character],[6,0,6,0]);
+  assert.equal(navigation.document.getText().split('\n')[selection.start.line],'focus');
+  assert.equal(navigation.options.preserveFocus,false);assert.equal(navigation.options.preview,false);
+  assert.equal(navigation.options.viewColumn,vscode.ViewColumn.Active);
+  assert.deepEqual(navigation.reveal,{range:selection,type:vscode.TextEditorRevealType.InCenter});
+  assert.equal(await read(item.target),beforeSource);assert.equal(await read(item.request),beforeRequest);assert.equal(sourceWrites.length,writes);
+});
+
+test('original-line navigation works with BOM and all line endings without requiring workspace write trust', async () => {
+  for(const ending of ['\n','\r\n','\r']) {
+    const item=await fixture('\uFEFFhead'+ending+'focus'+ending,[{line:2,before:'focus',after:'FOCUS',status:'pending'}]);
+    const {api}=service(),state=await ready(api,item);
+    vscode.workspace.isTrusted=false;
+    try {await api.openTargetLine(item.request,item.relative,state.files[0].hunks[0].id,state.revision);}
+    finally {vscode.workspace.isTrusted=true;}
+    assert.equal(sourceNavigations.at(-1).options.selection.start.line,1);
+    assert.equal(await read(item.target),item.before);
+  }
+});
+
+test('original-line navigation refuses stale requests, source mismatches, dirty buffers and unavailable original rows', async () => {
+  for(const kind of ['revision','source','dirty-source','dirty-request','stale-model','unknown-hunk','unknown-file','resolved','insertion']) {
+    const item=kind==='insertion'?await fixture(undefined,[{line:1,before:null,after:'inserted',status:'pending'}]):await fixture();
+    const {api}=service();let state=await ready(api,item),hunkId=state.files[0].hunks[0].id,dirty;
+    if(kind==='source')await fs.writeFile(item.target.fsPath,'external\n'+item.before);
+    if(kind.startsWith('dirty-')) {dirty=await vscode.workspace.openTextDocument(kind==='dirty-source'?item.target:item.request);dirty.isDirty=true;}
+    if(kind==='stale-model') {dirty=await vscode.workspace.openTextDocument(item.target);dirty.staleText='outdated model';}
+    if(kind==='resolved') {await api.decide(item.request,item.relative,hunkId,'ignored',state.revision);state=await ready(api,item);}
+    const beforeSource=await read(item.target),beforeRequest=await read(item.request),opens=sourceNavigations.length,writes=sourceWrites.length;
+    try {
+      await assert.rejects(api.openTargetLine(item.request,kind==='unknown-file'?'../outside.txt':item.relative,
+        kind==='unknown-hunk'?'missing':hunkId,kind==='revision'?'obsolete':state.revision),
+        /request changed|original has changed|unsaved|Save the .rr|original changed|existing original line|Unknown request file/i);
+      assert.equal(sourceNavigations.length,opens);assert.equal(sourceWrites.length,writes);
+      assert.equal(await read(item.target),beforeSource);assert.equal(await read(item.request),beforeRequest);
+    } finally {if(dirty){dirty.isDirty=false;delete dirty.staleText;}}
+  }
+});
+
+test('external gray edits preserve request bytes and IDs, shift current lines, and survive Accept Undo and restart', async () => {
+  const item=await fixture(), first=service();let state=await ready(first.api,item);
+  const ids=state.files[0].hunks.map(h=>h.id), raw=await read(item.request), oldRevision=state.revision, oldRawRevision=state.rawRevision;
+  const manual='heading\none\ncontext revised manually\nextra context\nthree\n';
+  await fs.writeFile(item.target.fsPath,manual);
+  state=await ready(first.api,item);
+  assert.equal(await read(item.request),raw);assert.equal(state.rawRevision,oldRawRevision);
+  assert.notEqual(state.revision,oldRevision);assert.deepEqual(state.files[0].hunks.map(h=>h.id),ids);
+  assert.deepEqual(state.files[0].hunks.map(h=>h.oldStart),[2,5]);assert.ok(state.files[0].hunks.every(h=>!h.conflict));
+  await assert.rejects(first.api.decide(item.request,item.relative,ids[1],'accepted',oldRevision),/request changed/i);
+  const restarted=service(first.state).api;state=await ready(restarted,item);
+  await restarted.openTargetLine(item.request,item.relative,ids[1],state.revision);
+  assert.equal(sourceNavigations.at(-1).options.selection.start.line,4);
+  const comparison=await restarted.snapshots(item.request,item.relative,state.revision);
+  assert.equal(comparison.before,manual);assert.equal(comparison.after,manual.replace('one\n','ONE\n').replace('three\n','THREE\n'));
+  await restarted.decide(item.request,item.relative,ids[1],'accepted',state.revision);state=await ready(restarted,item);
+  assert.equal(await read(item.target),manual.replace('three\n','THREE\n'));
+  await restarted.undo(item.request,item.relative,ids[1],state.revision);
+  assert.equal(await read(item.target),manual);assert.deepEqual(JSON.parse(await read(item.request)).request.map(e=>e.line),[1,3]);
+});
+
+test('external pending overlap blocks only that Accept while unrelated decisions and explicit conflict Ignore preserve the source', async () => {
+  const item=await fixture(),{api}=service();let state=await ready(api,item);const ids=state.files[0].hunks.map(h=>h.id);
+  const manual='manually replaced\ncontext\nthree\n';await fs.writeFile(item.target.fsPath,manual);state=await ready(api,item);
+  assert.ok(state.files[0].hunks[0].conflict);assert.equal(state.files[0].hunks[1].conflict,undefined);assert.equal(state.files[0].issue,undefined);
+  const raw=await read(item.request),writes=sourceWrites.length;
+  await assert.rejects(api.decide(item.request,item.relative,undefined,'accepted',state.revision),/original changed|pending block|ambiguous/i);
+  await assert.rejects(api.editAndAccept(item.request,item.relative,ids[0],'edited',state.revision),/original changed|pending block|ambiguous/i);
+  assert.equal(await read(item.request),raw);assert.equal(sourceWrites.length,writes);
+  await api.decide(item.request,item.relative,ids[1],'accepted',state.revision);state=await ready(api,item);
+  assert.equal(await read(item.target),manual.replace('three\n','THREE\n'));assert.equal(state.closed,false);
+  const approvedSource=await read(item.target);await api.decide(item.request,item.relative,ids[0],'ignored',state.revision);state=await ready(api,item);
+  assert.equal(await read(item.target),approvedSource);assert.deepEqual(await statuses(item),['ignored','accepted']);
+  assert.ok(state.files[0].hunks[0].undoBlocked);assert.equal(state.closed,true);
+  await assert.rejects(api.undo(item.request,item.relative,ids[0],state.revision),/Undo is unavailable/i);
+  await api.undo(item.request,item.relative,ids[1],state.revision);assert.equal(await read(item.target),manual);
+});
+
+test('external edits to decided gray text retain statuses and block only affected Undo', async () => {
+  for(const decision of ['accepted','ignored']) {
+    const item=await fixture(),created=service();let state=await ready(created.api,item);const ids=state.files[0].hunks.map(h=>h.id);
+    await created.api.decide(item.request,item.relative,ids[0],decision,state.revision);
+    await fs.writeFile(item.target.fsPath,'manual decided text\ncontext\nthree\n');
+    const restarted=service(created.state).api;state=await ready(restarted,item);
+    assert.equal(state.files[0].hunks[0].decision,decision);assert.ok(state.files[0].hunks[0].undoBlocked);
+    assert.equal(state.files[0].hunks[0].before,'manual decided text\n');assert.equal(state.files[0].hunks[0].after,'manual decided text\n');
+    await assert.rejects(restarted.undo(item.request,item.relative,ids[0],state.revision),/Undo is unavailable/i);
+    await restarted.decide(item.request,item.relative,ids[1],'accepted',state.revision);
+    assert.equal(await read(item.target),'manual decided text\ncontext\nTHREE\n');
+  }
+});
+
+test('external gray edits survive editing a proposal and removing a no-op without deciding its neighbor', async () => {
+  const item=await fixture(),created=service();let state=await ready(created.api,item);
+  await fs.writeFile(item.target.fsPath,'heading\none\ncontext changed\nthree\n');state=await ready(created.api,item);
+  await created.api.editPending(item.request,item.relative,state.files[0].hunks[1].id,'edited third',state.revision);
+  let api=service(created.state).api;state=await ready(api,item);
+  await api.editAndAccept(item.request,item.relative,state.files[0].hunks[0].id,'one',state.revision);
+  state=await ready(api,item);assert.equal(state.files[0].hunks.length,1);assert.equal(state.files[0].hunks[0].decision,'pending');
+  assert.equal(await read(item.target),'heading\none\ncontext changed\nthree\n');
+  await api.editAndAccept(item.request,item.relative,state.files[0].hunks[0].id,'final third',state.revision);
+  assert.equal(await read(item.target),'heading\none\ncontext changed\nfinal third\n');
+});
+
+test('external dirty original pauses synchronization until save and unknown imports never relocate themselves', async () => {
+  const item=await fixture(),created=service();let state=await ready(created.api,item);const old=state.revision;
+  const document=await vscode.workspace.openTextDocument(item.target);document.isDirty=true;
+  try {
+    const paused=await created.api.getState(item.request);assert.equal(paused.verified,false);assert.match(paused.files[0].issue,/unsaved/i);
+    await assert.rejects(created.api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',old),/unsaved/i);
+    await fs.writeFile(item.target.fsPath,'header\n'+item.before);
+  } finally {document.isDirty=false;}
+  state=await ready(created.api,item);assert.equal(state.files[0].hunks[0].oldStart,2);assert.notEqual(state.revision,old);
+  const imported=await service().api.getState(item.request);assert.equal(imported.verified,false);assert.ok(imported.error);assert.equal(await read(item.target),'header\n'+item.before);
+});
+
+test('external source updates serialize with refresh and a late edit prevents source writes', async () => {
+  const item=await fixture(),created=service();let state=await ready(created.api,item);
+  await fs.writeFile(item.target.fsPath,'heading\n'+item.before);
+  const views=await Promise.all(Array.from({length:5},()=>created.api.getState(item.request)));
+  assert.ok(views.every(view=>view.verified));assert.equal(new Set(views.map(view=>view.revision)).size,1);
+  state=views[0];const source=await read(item.target),request=await read(item.request),writes=sourceWrites.length;
+  const update=created.state.workspaceState.update;let injected=false;
+  created.state.workspaceState.update=async(key,value)=>{
+    await update(key,value);
+    if(!injected&&key.endsWith('.transaction')&&value){injected=true;await fs.writeFile(item.target.fsPath,source+'late edit\n');}
+  };
+  await assert.rejects(created.api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision),/original changed/i);
+  assert.equal(sourceWrites.length,writes);assert.equal(await read(item.request),request);assert.equal(await read(item.target),source+'late edit\n');
+});
+
+test('external gray edits survive interrupted accepted write and exact metadata-only recovery', async () => {
+  const item=await fixture(),created=service();let state=await ready(created.api,item);
+  const manual='heading\none\nmanual context\nthree\n';await fs.writeFile(item.target.fsPath,manual);state=await ready(created.api,item);
+  created.requestFault.remaining=2;const writes=sourceWrites.length;
+  await assert.rejects(created.api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision),/Injected RR/);
+  assert.equal(await read(item.target),manual.replace('one\n','ONE\n'));assert.equal(journals(created.state).length,1);
+  state=await ready(service(created.state).api,item);
+  assert.deepEqual(await statuses(item),['accepted','pending']);assert.equal(journals(created.state).length,0);assert.equal(sourceWrites.length,writes+1);
+  assert.equal(state.files[0].before,manual.replace('one\n','ONE\n'));
 });

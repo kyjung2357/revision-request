@@ -100,7 +100,7 @@ Each entry is one atomic decision on a fragment or consecutive block. `line` ide
 
 New entries must start pending. Agents must not write accepted/ignored JSON statuses to claim that a human reviewed the proposal. Status metadata alone never applies or undoes source changes; cached source verification also prevents mismatched states from being reported as completed review. Use the authorized review UI or, only when explicitly enabled, the MCP decision tools.
 
-If the source changed, read it again and prepare a fresh proposal. Do not substitute a guessed hash or reuse an old snapshot. Retrying the **same `clientRequestId` with the same payload** is idempotent, including when the client lost the first response. Reusing that ID for a different payload is not a new proposal; use a new ID instead. An existing request file is not silently overwritten. Idempotency records share the bounded local request registry; this is not permanent retry history. If an old record has expired, inspect the current source and requests before submitting again.
+If the source changed before request creation, read it again and prepare a fresh proposal. Do not substitute a guessed hash or reuse an old snapshot. Retrying the **same `clientRequestId` with the same payload** is idempotent, including when the client lost the first response. Reusing that ID for a different payload is not a new proposal; use a new ID instead. An existing request file is not silently overwritten. Idempotency records share the bounded local request registry; this is not permanent retry history. If an old record has expired, inspect the current source and requests before submitting again.
 
 ## Create a request from two saved files
 
@@ -146,7 +146,15 @@ Paths are relative to the connected workspace. Request IDs, revisions, hunk IDs,
 
 Request discovery scans up to 1,000 `.rr` files and excludes dependency, Git metadata, and internal work folders. A live completed request can appear even without `includeCompleted`; that option adds stored completion receipts. Keep the returned request ID when creating a request, including one in an excluded folder.
 
-Decision calls must use the current raw JSON revision returned by the server. Accept/Ignore/Undo save entry statuses in the JSON, so the revision changes but the MCP request ID remains stable. Automatic creation-time insertion also preserves the proposal identity. Editing proposal contents creates a different generation and requires a refreshed request ID. A changed proposal must be reviewed again. Accepted changes and accepted-block Undo also reject stale or unsaved target edits. Undo of an ignored block changes review metadata only.
+Decision calls must use the latest returned `revision`, an opaque review token that includes the current verified source state. It can change when the original changes even if the `.rr` JSON does not. The separate `rawRevision` identifies the saved JSON and is not a substitute for the decision token. Accept/Ignore/Undo save entry statuses in the JSON; source-only updates and status changes preserve the MCP request ID. Automatic creation-time insertion also preserves the proposal identity. Editing proposal contents creates a different generation and requires a refreshed request ID. A changed proposal must be reviewed again. Read status again after a stale decision error; do not retry approval blindly.
+
+## Manual source edits during an active review
+
+When a prior local review record exists, saved manual edits outside pending blocks are preserved and proposal positions are updated without rewriting the request's original line numbers or fragments. A fresh or imported request without that record still uses exact line and fragment validation; mismatches are not automatically relocated. The format contains no full-source hash and does not establish equality of unrelated source text.
+
+Status hunks can include `conflict` and `undoBlocked` explanations. A conflicting hunk stays pending; it cannot be accepted or edited, but it may be explicitly ignored without touching the source. Other hunks can still be reviewed, so a per-hunk conflict does not by itself make the whole status stale. Bulk Accept refuses pending conflicts rather than silently accepting a subset. Bulk Ignore preserves the source and discards pending proposals. A later manual edit to a resolved area keeps its decision history and blocks that hunk's Undo. Never interpret a matching manually edited result as agent or human acceptance.
+
+Unsaved original edits and unverifiable source state still block writes. The host checks the source-aware revision and actual source before applying a decision. AI decision permissions are unchanged and remain disabled by default.
 
 ## Open the human review
 
@@ -173,11 +181,11 @@ A retained request with no pending entries shows **This revision request is clos
 
 MCP status retains a completion receipt so an agent can learn the final accepted/ignored result after cleanup. These are bounded local outcome records, not copies of the full source snapshots. Storage is limited to 256 receipts, so older results can expire.
 
-Status includes the request ID and revision, pending/accepted/ignored counts, and individual hunk decisions. Its `status` is `pending`, `completed`, `stale`, or `unavailable`; a completed receipt can also report cleanup as `retained`, `deleted`, or `failed`. A completed review may contain ignored blocks, so completion is not the same as accepting everything.
+Status includes the request ID, current review `revision`, saved JSON `rawRevision`, pending/accepted/ignored counts, and individual hunk decisions with any `conflict` or `undoBlocked` explanation. Its `status` is `pending`, `completed`, `stale`, or `unavailable`; a completed receipt can also report cleanup as `retained`, `deleted`, or `failed`. A completed review may contain ignored blocks, so completion is not the same as accepting everything.
 
 **A missing `.rr` file is not proof of acceptance.** Use the status or completion receipt. A request can be removed or changed outside the review; an unavailable or unknown request must not be reported as accepted.
 
-Per-block Undo requires the request to remain available. Keep it with **No** at the deletion prompt or leave automatic deletion off if you want completed requests and their Undo controls retained. Undo still validates the actual source before writing, including in a closed request. A completion receipt records the result; it is not a substitute for a live request that can still be undone. Native editor Undo is not guaranteed for the extension's exact filesystem writes.
+Per-block Undo requires the request to remain available. Keep it with **No** at the deletion prompt or leave automatic deletion off if you want completed requests and their Undo controls retained. Undo still validates the actual source before writing, including in a closed request, and remains unavailable for resolved entries touched by a later manual edit. A completion receipt records the result; it is not a substitute for a live request that can still be undone. Native editor Undo is not guaranteed for the extension's exact filesystem writes.
 
 ## Connection and validation errors
 

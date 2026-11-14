@@ -24,15 +24,15 @@ Each `.rr` file contains a revision request for one existing UTF-8 text file (fo
 
 Try the [example requests](examples/README.md) for replacements, added and deleted lines, an empty starting file, and clearing all content.
 
-Accepting changes requires workspace trust. Unsaved or conflicting changes to the original block Accept and Undo of accepted changes. If the original has changed outside this review, generate a fresh request from the current file.
+Accepting changes requires workspace trust and a saved original. During a tracked review, saved edits outside pending blocks are preserved automatically, including line additions and deletions. Edits inside a pending block mark that item as conflicting; other items remain reviewable. Editing an already accepted or ignored area preserves its decision but disables its Undo. See [editing the original during review](docs/REVIEW_ACTIONS.md#edit-the-original-during-review).
 
 ### Buttons
 
 - **Accept**: Apply and save the selected change to the original file.
 - **Ignore**: Record the decision without changing the original.
 - **Quick Review**: Use the button in the preview action row, or the sidebar lightning icon. Either Left or Right arrow switches between Accept and Ignore; Tab applies the choice and moves to the next pending change. Escape exits. See [keyboard review](docs/REVIEW_ACTIONS.md#quick-review).
-- **Accept all / Ignore all**: Decide all remaining pending changes in the request.
-- **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and the original still matches the recorded changes.
+- **Accept all / Ignore all**: Decide all remaining pending changes in the request. Accept all is unavailable while a pending conflict remains; Ignore all keeps your current source and discards the proposals.
+- **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and that entry has not been changed by a later manual source edit.
 - **Change menu (⋯)**: Open **Show change explanation** or **Keep original as comments**. The latter preserves the original complete lines as comments before the active proposed text. Unsupported contexts and pure insertions disable it. It edits the pending draft only; **Accept** saves it to the original. Escape discards the draft, and the editor undo shortcut reverses the transformation. See [language actions](docs/REVIEW_ACTIONS.md).
 - **File link**: Click the filename beneath **FILE** (unified) or **ORIGINAL** (side-by-side) to open the editable target file.
 - **Toggle Comparison Layout**: Use the preview title-bar button to switch between side-by-side columns and a unified view with removed text followed by added text. Unified is the default; choose another default in Settings. The preview remembers your choice.
@@ -80,6 +80,8 @@ Saved-file and CLI comparisons preserve line endings and the UTF-8 BOM. Git comp
 ## Other functions
 
 - **Navigate changes**: Opening or reopening a preview moves to its first pending change, or the top when none remain. The 15px scrollbar marks pending changes in red/green; click a marker to jump or drag the thumb to scroll. It sits between side-by-side columns or at the right edge in unified view. Accept, Ignore, Undo, and ordinary refreshes preserve your place; Quick Review advances after each decision.
+
+- **Go to original**: Use the button on a pending change's red row to open the actual source file at that line. Earlier accepted changes and tracked manual line additions and deletions are accounted for.
 
 - **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 

@@ -104,13 +104,18 @@
   function focusQuickSelection(scrollIntoView=false) {
     updateQuickPresentation();
     if (!quickReview || quickPaused() || state?.busy || awaitingDecision) return;
-    const control=quickControl();if (!control || control.disabled) return;
+    const control=quickControl();if (!control) return;
     if (scrollIntoView) {
       const scroll=root.querySelector('[data-scroll-area]');
       if (scroll) {
         const view=scroll.getBoundingClientRect(),controlRect=control.getBoundingClientRect();
         const block=control.closest('[data-overview-hunk]'),blockRect=block?.getBoundingClientRect();
-        if (blockRect && blockRect.height<=view.height-16) {
+        if (scrollIntoView==='center') {
+          // Keep the next change in the reading area, even when it is already visible.
+          // For an oversized block, center its proposed action row instead of hiding the controls.
+          const target=blockRect && blockRect.height<=view.height-16?blockRect:controlRect;
+          scroll.scrollTop+=target.top+target.height/2-view.top-view.height/2;
+        } else if (blockRect && blockRect.height<=view.height-16) {
           if (blockRect.top<view.top+8) scroll.scrollTop+=blockRect.top-view.top-8;
           else if (blockRect.bottom>view.bottom-8) scroll.scrollTop+=blockRect.bottom-view.bottom+8;
         } else if (blockRect && blockRect.height>view.height-16) {
@@ -123,7 +128,9 @@
         onComparisonScroll();
       }
     }
-    control.focus({preventScroll:true});quickFocusRequested=false;quickScrollRequested=false;
+    // A conflicting next item still receives scroll/focus; Tab cannot approve its disabled action.
+    (control.disabled ? control.closest('[data-overview-hunk]') : control)?.focus({preventScroll:true});
+    quickFocusRequested=false;quickScrollRequested=false;
   }
   function reconcileQuickReview() {
     if (!quickReview) return;
@@ -141,7 +148,7 @@
       const next=order.slice(at+1).concat(order.slice(0,at)).map(id=>byId.get(id)).find(Boolean) ||
         candidates.find(item=>item.index>=quickPending.index) || candidates[0];
       quickSelection=next?{...next,decision:'accepted'}:null;quickPending=null;
-      quickFocusRequested=true;quickScrollRequested=true;return;
+      quickFocusRequested=true;quickScrollRequested='center';return;
     }
     if (!candidates.some(item=>item.hunkId===quickSelection?.hunkId && item.filePath===quickSelection?.filePath)) {
       const next=candidates.find(item=>item.index>=(quickSelection?.index ?? 0)) || candidates[0];
@@ -181,6 +188,11 @@
   function post(message) { vscode.postMessage(message); }
   function decide(message) {
     if (!state || state.busy || awaitingDecision || quickPending || editing) return;
+    const file = state.files.find(item => item.path === message.filePath);
+    const hunk = file?.hunks.find(item => item.id === message.hunkId);
+    if (message.decision === 'accepted' && (file?.issue || (message.type === 'decideFile'
+      ? file?.hunks.some(item => decisionOf(item) === 'pending' && item.conflict) : hunk?.conflict))) return;
+    if (message.type === 'undo' && hunk?.undoBlocked) return;
     message.revision = state.revision;
     if (quickReview && message.type==='decide') {
       const item=quickCandidates().find(candidate=>candidate.hunkId===message.hunkId && candidate.filePath===message.filePath);
@@ -256,6 +268,15 @@
     if (side === 'right') cell.append(element('span', 'action-gutter'));
     return cell;
   }
+  function addOriginalNavigation(cell, file, hunk, busy) {
+    const gutter = element('span', 'action-gutter original-action-gutter');
+    const actions = element('div', 'original-actions');
+    actions.append(button('Go to original', 'button button-secondary button-inline original-line-button',
+      () => post({type: 'openTargetLine', filePath: file.path, hunkId: hunk.id, revision: state.revision}),
+      {disabled: busy || Boolean(file.issue || hunk.conflict), key: file.path + ':' + hunk.id + ':original',
+        title: file.issue || hunk.conflict || 'Go to original line', label: 'Go to original line for change ' + (hunk.index + 1)}));
+    gutter.append(actions); cell.classList.add('with-original-action'); cell.append(gutter);
+  }
   function hunkControls(file, hunk, decision, busy, editor = false) {
     const actions = element('div', 'inline-actions');
     const key = editor ? 'edit' : file.path + ':' + hunk.id;
@@ -263,8 +284,8 @@
       actions.append(
         button('Accept', 'button button-accept button-inline',
           editor ? submitEditor : () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'accepted' }),
-          { disabled: busy || !state.trusted || Boolean(file.issue), key: key + ':accept', hunk: hunk.id,
-            label: 'Accept change ' + (hunk.index + 1), title: file.issue || (editor ? 'Apply this edited change to the original file' + editorShortcutHint() : 'Apply this change to the original file') }),
+          { disabled: busy || !state.trusted || Boolean(file.issue || hunk.conflict), key: key + ':accept', hunk: hunk.id,
+            label: 'Accept change ' + (hunk.index + 1), title: file.issue || hunk.conflict || (editor ? 'Apply this edited change to the original file' + editorShortcutHint() : 'Apply this change to the original file') }),
         button('Ignore', 'button button-secondary button-inline',
           editor ? ignoreEditor : () => decide({ type: 'decide', filePath: file.path, hunkId: hunk.id, decision: 'ignored' }),
           { disabled: busy || !state.trusted, key: key + ':ignore', hunk: hunk.id,
@@ -274,9 +295,9 @@
       actions.append(badge(decision === 'accepted' ? '✓ Accepted' : 'Ignored', decision),
         button('Undo', 'button button-secondary button-inline',
           () => decide({ type: 'undo', filePath: file.path, hunkId: hunk.id }),
-          { disabled: busy || !state.trusted || (decision === 'accepted' && Boolean(file.issue)),
+          { disabled: busy || !state.trusted || Boolean(hunk.undoBlocked) || (decision === 'accepted' && Boolean(file.issue)),
             key: key + ':undo', hunk: hunk.id, label: 'Undo ' + decision + ' change ' + (hunk.index + 1),
-            title: decision === 'accepted' && file.issue ? file.issue : 'Restore this change to pending review' }));
+            title: hunk.undoBlocked || (decision === 'accepted' && file.issue ? file.issue : 'Restore this change to pending review') }));
       return actions;
     }
     if (!editor) {
@@ -324,13 +345,13 @@
   }
   function openEditor(file, hunk, rowIndex, columnOffset = 0, directInput = null) {
     if (editing) { root.querySelector('.pending-editor textarea')?.focus({ preventScroll: true }); return; }
-    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted || decisionOf(hunk) !== 'pending') return;
+    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted || file.issue || hunk.conflict || decisionOf(hunk) !== 'pending') return;
     if (quickReview && quickSelection?.hunkId!==hunk.id) quickSelection={filePath:file.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart,decision:'accepted'};
     const draft = hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g, '\n').replace(/\n$/, '');
     const offset = draft.split('\n').slice(0, rowIndex).reduce((sum, line) => sum + line.length + 1, 0) + columnOffset;
     openWhy = null; closeActionMenu();
     editHistory = { undo: [], redo: [] };
-    editing = { filePath: file.path, hunkId: hunk.id, revision: state.revision, draft,
+    editing = { filePath: file.path, hunkId: hunk.id, revision: state.revision, rawRevision: state.rawRevision, draft,
       hadProposedLine: hunk.newLines > 0, rightStart: Number(directInput?.closest('.code-side').dataset.proposedLine) || hunk.oldStart,
       index: hunk.index, oldStart: hunk.oldStart, original: hunk.before, anchorIndex: rowIndex,
       selectionStart: Math.min(offset, draft.length), selectionEnd: Math.min(offset, draft.length),
@@ -381,23 +402,39 @@
     if (key === 'tab' || key === 'shiftTab') return event.key === 'Tab' && event.shiftKey === (key === 'shiftTab') && !event.ctrlKey && !event.metaKey && !event.altKey;
     return false;
   }
+  function canIgnoreEditor() {
+    if (!editing || !state) return false;
+    const file = state.files.find(item => item.path === editing.filePath);
+    const hunk = file?.hunks.find(item => item.id === editing.hunkId);
+    return Boolean(hunk && decisionOf(hunk) === 'pending' && (!staleEditor() ||
+      (!file.issue && typeof editing.rawRevision === 'string' && editing.rawRevision === state.rawRevision)));
+  }
   function ignoreEditor() { submitEditorDecision('ignoreEdited'); }
   function submitEditor() { submitEditorDecision('editAndAccept'); }
   function submitEditorDecision(type) {
     if (!editing || editing.saving || !state || state.busy || awaitingDecision || !state.trusted) return;
     captureEditor();
-    if (staleEditor() || (type === 'editAndAccept' && state.files.find(file => file.path === editing.filePath)?.issue)) { render(); return; }
+    const file = state.files.find(item => item.path === editing.filePath);
+    const hunk = file?.hunks.find(item => item.id === editing.hunkId);
+    const ignoreCurrent = type === 'ignoreEdited' && canIgnoreEditor();
+    if ((staleEditor() && !ignoreCurrent) || (type === 'editAndAccept' && (file?.issue || hunk?.conflict))) { render(); return; }
     editing.saving = true; editing.error = null;
     editing.editId = 'edit-' + Date.now() + '-' + (++editSequence);
     dismissedErrors.clear(); openWhy = null; closeActionMenu(); saveViewState();
     const message = {type, filePath:editing.filePath, hunkId:editing.hunkId,
-      ...(type === 'editAndAccept' ? {draft:editing.draft} : {}), revision:editing.revision, editId:editing.editId};
+      ...(type === 'editAndAccept' ? {draft:editing.draft} : {}), revision:ignoreCurrent ? state.revision : editing.revision, editId:editing.editId};
     render(); post(message);
   }
   function editorActions() {
     const file = state.files.find(item => item.path === editing.filePath) || {path:editing.filePath};
     const hunk = file.hunks?.find(item => item.id === editing.hunkId) || {id:editing.hunkId,index:editing.index};
-    const actions = hunkControls(file,hunk,'pending',editing.saving || state.busy || awaitingDecision || staleEditor(),true);
+    const busy = editing.saving || state.busy || awaitingDecision;
+    const actions = hunkControls(file,hunk,'pending',busy,true);
+    if (staleEditor()) {
+      actions.querySelector('[data-focus-key="edit:accept"]').disabled = true;
+      actions.querySelector('[data-focus-key="edit:ignore"]').disabled = Boolean(busy || !state.trusted || !canIgnoreEditor());
+      if (!canIgnoreEditor()) actions.querySelector('[data-focus-key="edit:why"]').disabled = true;
+    }
     actions.classList.add('pending-editor-actions');
     actions.addEventListener('keydown', event => {
       if (event.isComposing || event.keyCode === 229) return;
@@ -739,6 +776,12 @@
     const original = element('div', 'editing-original');
     const originalLines = sourceLines(leftText);
     originalLines.forEach((line, index) => original.append(codeSide('left', 'removed', leftStart + index, line, inlineChanges?.[index]?.before)));
+    if (originalLines.length) {
+      const file = state.files.find(item => item.path === editing.filePath);
+      const hunk = file?.hunks.find(item => item.id === editing.hunkId);
+      if (hunk) addOriginalNavigation(original.firstElementChild, file, hunk,
+        Boolean(state.busy || awaitingDecision || editing.saving || staleEditor()));
+    }
     if (!originalLines.length) original.append(codeSide('left', 'empty', null, ''));
     const hasProposed = editing.hadProposedLine !== false || editing.draft.length > 0;
     const editor = element('section', 'code-side right pending-editor ' + (hasProposed ? 'added' : 'empty'));
@@ -752,11 +795,13 @@
     const mirror = element('span', 'code-text', editing.draft + (!editing.draft || /\n$/.test(editing.draft) ? '\u200b' : ''));
     mirror.setAttribute('aria-hidden', 'true');
     const textarea = editorInput(editing.draft, editing.hunkId, editing.index);
-    textarea.readOnly = Boolean(editing.saving); textarea.dataset.focusKey = 'edit:draft';
+    const currentFile = state.files.find(item => item.path === editing.filePath);
+    const currentHunk = currentFile?.hunks.find(item => item.id === editing.hunkId);
+    textarea.readOnly = Boolean(editing.saving || currentFile?.issue || currentHunk?.conflict); textarea.dataset.focusKey = 'edit:draft';
     textarea.dataset.mirrorValue = editing.draft;
     content.append(mirror, textarea);
     const stale = staleEditor();
-    const error = stale ? 'The request changed. Your draft is kept; press Escape to cancel and reopen the change before accepting.' : editing.error;
+    const error = currentHunk?.conflict || (stale ? 'The request changed. Your draft is kept; press Escape to cancel and reopen the change before accepting.' : editing.error);
     if (error) { const notice = element('p', 'pending-editor-error', error); notice.setAttribute('role', 'alert'); content.append(notice); }
     const gutter = element('span', 'action-gutter');
     gutter.append(editorActions()); editor.append(number, marker, content, gutter); row.append(original, editor);
@@ -780,7 +825,7 @@
   function appendPairs(container, leftText, rightText, pending, cursor, controls) {
     const left = sourceLines(leftText);
     const right = sourceLines(rightText);
-    const length = Math.max(left.length, right.length, controls && controls.decision !== 'pending' ? 1 : 0);
+    const length = Math.max(left.length, right.length, controls && (controls.decision !== 'pending' || controls.hunk.conflict) ? 1 : 0);
     for (let index = 0; index < length; index += 1) {
       const rowKey = controls ? 'hunk:' + controls.hunk.id + ':' + index : 'context:' + cursor.offset + ':' + index;
       const proposedLine = cursor.right;
@@ -805,7 +850,7 @@
         leftNumber, hasLeft ? left[index] : '', inline && inline.before);
       const proposed = codeSide('right', hasRight ? pending ? 'added' : 'context' : 'empty',
         rightNumber, hasRight ? right[index] : '', inline && inline.after);
-      if (pending && controls) {
+      if (pending && controls && !controls.hunk.conflict && !controls.file.issue) {
         proposed.dataset.proposedLine = String(proposedLine);
         const source = proposed.querySelector('.code-source');
         source.tabIndex = index === 0 ? 0 : -1;
@@ -850,6 +895,9 @@
             else openEditor(controls.file, controls.hunk, index);
           }
         });
+      }
+      if (index === 0 && pending && hasLeft && controls) {
+        addOriginalNavigation(original, controls.file, controls.hunk, controls.busy);
       }
       if (index === 0 && controls) {
         row.dataset.hunkRow = controls.hunk.id;
@@ -912,12 +960,19 @@
     if (!hasAdded && removed.length) {
       const original = removed[0].firstElementChild;
       const gutter = firstProposed?.querySelector('.action-gutter');
-      if (gutter) original.append(gutter);
+      if (gutter) {
+        const navigation = original.querySelector('.original-action-gutter');
+        if (navigation) {
+          navigation.classList.add('has-review-controls');
+          navigation.append(...gutter.children);
+        } else original.append(gutter);
+      }
       original.dataset.hunkId = hunk.id; original.tabIndex = -1;
       removed[0].dataset.hunkRow = hunk.id;
       // A deletion has no proposed row to click. Its removed text opens the
       // same in-place draft editor, initially containing the empty proposal.
       const source = original.querySelector('.code-source');
+      if (!hunk.conflict && !file.issue) {
       source.classList.add('editable-source'); source.tabIndex = 0;
       source.dataset.editHunk = hunk.id; source.dataset.editRow = '0';
       source.dataset.focusKey = file.path + ':' + hunk.id + ':edit'; source.dataset.hunk = hunk.id;
@@ -930,7 +985,13 @@
           event.preventDefault(); openEditor(file, hunk, 0);
         }
       });
+      }
     }
+    // A manually removed conflicting deletion has no text but still needs its Ignore control.
+    if (!removed.length && !added.length && firstProposed) added.push((() => {
+      const row = element('div', 'diff-row unified-row'); row.dataset.pair = 'code';
+      row.dataset.rowKey = 'hunk:' + hunk.id + ':0'; row.dataset.hunkRow = hunk.id; row.append(firstProposed); return row;
+    })());
     block.replaceChildren(...removed, ...added);
   }
   function unifiedClosedDocument(documentView) {
@@ -977,6 +1038,7 @@
       block.dataset.removed = String(decision === 'pending' && sourceLines(hunk.before).length > 0);
       block.dataset.added = String(decision === 'pending' && sourceLines(hunk.after).length > 0);
       block.setAttribute('aria-label', 'Change ' + (hunk.index + 1) + ', ' + decision);
+      if (hunk.conflict) {block.classList.add('hunk-conflict');block.tabIndex = -1;}
       if (editing && decision === 'pending' && editing.filePath === file.path && editing.hunkId === hunk.id) {
         block.classList.add('hunk-editing');
         block.append(renderEditorRow(leftText, cursor.left, cursor.right, hunk.inlineChanges));
@@ -985,6 +1047,10 @@
       } else if (appendPairs(block, leftText, rightText, decision === 'pending', cursor, {file, hunk, decision, busy})) {
         if (layout === 'unified' && decision === 'pending') unifiedPendingBlock(block, file, hunk);
         output.append(block);
+      }
+      if (hunk.conflict) {
+        const notice = element('p', 'hunk-conflict-message', hunk.conflict); notice.setAttribute('role', 'status');
+        block.append(notice);
       }
       projectedLeft += decision === 'accepted' ? physicalAfter : hunk.before;
       projectedRight += decision === 'ignored' ? hunk.before : physicalAfter;
@@ -1056,12 +1122,12 @@
     captureEditor(); closeExplanation(); closeActionMenu();
     const requestId = 'menu-' + Date.now() + '-' + (++menuSequence);
     const draft = editing?.draft ?? hunk.draftAfter ?? hunk.after.replace(/\r\n|\r/g,'\n').replace(/\n$/,'');
-    openMenu = {filePath:file.path,hunkId:hunk.id,revision:state.revision,requestId,loading:true,actions:hunk.reviewActions};
+    openMenu = {filePath:file.path,hunkId:hunk.id,revision:state.revision,requestId,loading:!hunk.conflict && !file.issue,actions:hunk.reviewActions,error:hunk.conflict || file.issue};
     render(); focusMenuItem();
-    post({type:'reviewActions',filePath:file.path,hunkId:hunk.id,revision:state.revision,draft,editId:requestId});
+    if (!hunk.conflict && !file.issue) post({type:'reviewActions',filePath:file.path,hunkId:hunk.id,revision:state.revision,draft,editId:requestId});
   }
   function transformDraft(file, hunk, action) {
-    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted) return;
+    if (!state || state.busy || awaitingDecision || quickPending || !state.trusted || file.issue || hunk.conflict) return;
     closeActionMenu(); closeExplanation();
     if (!editing) openEditor(file,hunk,0);
     if (!editing || editing.saving || staleEditor()) return;
@@ -1088,8 +1154,8 @@
     why.setAttribute('role','menuitem'); menu.append(why);
     for (const fallback of fallbackActions) {
       const item = openMenu.actions?.find(action => action.id === fallback.id) || {...fallback,enabled:false,reason:'This action is unavailable for this change.'};
-      const reason = openMenu.loading ? 'Checking this draft…' : !state.trusted ? 'Trust this workspace to edit proposals.' : openMenu.error || item.reason;
-      const enabled = !openMenu.loading && !openMenu.error && item.enabled === true && state.trusted && !state.busy && !awaitingDecision;
+      const reason = hunk.conflict || file.issue || (openMenu.loading ? 'Checking this draft…' : !state.trusted ? 'Trust this workspace to edit proposals.' : openMenu.error || item.reason);
+      const enabled = !hunk.conflict && !file.issue && !openMenu.loading && !openMenu.error && item.enabled === true && state.trusted && !state.busy && !awaitingDecision;
       const control = button('', 'review-menu-item',()=>transformDraft(file,hunk,item.id),
         {disabled:!enabled,label:item.label || fallback.label,key:'menu:'+item.id,title:reason});
       control.dataset.reviewAction = item.id; control.setAttribute('role','menuitem');
@@ -1233,7 +1299,7 @@
       decisionFocus = {key: active.dataset.focusKey, hunk: active.dataset.hunk};
     }
     root.querySelector('.review-app')?.setAttribute('aria-busy', 'true');
-    for (const control of root.querySelectorAll('.inline-actions button,.file-actions button,.quick-review-toggle')) control.disabled = true;
+    for (const control of root.querySelectorAll('.inline-actions button,.original-line-button,.file-actions button,.quick-review-toggle')) control.disabled = true;
     for (const input of root.querySelectorAll('.pending-editor-textarea')) input.readOnly = true;
     closeExplanation();
   }
@@ -1433,7 +1499,7 @@
     const actionGroup = root.querySelector('.file-action-group');
     const actionPadding = actionGroup ? parseFloat(getComputedStyle(actionGroup).paddingLeft) || 0 : 0;
     const quickWidth = root.querySelector('.quick-review-toggle')?.getBoundingClientRect().width || 0;
-    let minimumLeft = Math.max(160, gutter + 80 + 15, summaryWidth + originalPadding);
+    let minimumLeft = Math.max(160, gutter + actions + 80 + 15, summaryWidth + originalPadding);
     let minimumRight = Math.max(gutter + actions + 80 + 8, quickWidth + actionPadding + actions);
     // Tiny windows cannot satisfy both ideals. Retain both panes proportionally.
     if (minimumLeft + minimumRight > available) {
@@ -1462,7 +1528,7 @@
     const css = getComputedStyle(root);
     const gutter = parseFloat(css.getPropertyValue('--rr-gutter')) || 66;
     const actions = parseFloat(css.getPropertyValue('--rr-action-gutter')) || 152;
-    const leftCode = metrics.available * ratio - gutter - 15;
+    const leftCode = metrics.available * ratio - gutter - actions - 15;
     const rightCode = metrics.available * (1 - ratio) - gutter - actions - 8;
     root.style.setProperty('--rr-code-width', Math.max(0, Math.min(leftCode, rightCode)) + 'px');
     const separator = root.querySelector('.pane-splitter');
@@ -1616,7 +1682,7 @@
         actions.append(
           button('Accept all', 'button button-accept button-inline',
             () => decide({ type: 'decideFile', filePath: file.path, decision: 'accepted' }),
-            { disabled: busy || !state.trusted || Boolean(file.issue) || !totals.pending, key: file.path + ':acceptFile', title: 'Apply all pending changes to the original' }),
+            { disabled: busy || !state.trusted || Boolean(file.issue) || file.hunks.some(hunk => decisionOf(hunk) === 'pending' && hunk.conflict) || !totals.pending, key: file.path + ':acceptFile', title: file.hunks.some(hunk => decisionOf(hunk) === 'pending' && hunk.conflict) ? 'Resolve or ignore conflicting changes before accepting all' : 'Apply all pending changes to the original' }),
           button('Ignore all', 'button button-secondary button-inline',
             () => decide({ type: 'decideFile', filePath: file.path, decision: 'ignored' }),
             { disabled: busy || !state.trusted || !totals.pending, key: file.path + ':ignoreFile' })
@@ -1698,7 +1764,7 @@
       const source = hunk ? editorAnchor({hunkId: hunk.id, anchorIndex: 0}) : null;
       if (quickReview && hunk) {
         quickSelection={filePath:focusFile.path,hunkId:hunk.id,index:hunk.index,oldStart:hunk.oldStart,decision:'accepted'};
-        quickFocusRequested=true;quickScrollRequested=true;
+        quickFocusRequested=true;quickScrollRequested='center';
       } else (source || root.querySelector('.filename-link'))?.focus({preventScroll:true});
       focusAfterEdit = null;
     }
@@ -1803,6 +1869,14 @@
     if (state && message.error && message.error !== state.error) dismissedErrors.delete(message.error);
     const activeErrors = new Set([message.error, ...(Array.isArray(message.files) ? message.files.map(file => file.issue) : [])]);
     for (const error of dismissedErrors) if (!activeErrors.has(error)) dismissedErrors.delete(error);
+    if (editing && !editing.saving && typeof editing.rawRevision === 'string' && editing.rawRevision === message.rawRevision) {
+      const file = message.files?.find(item => item.path === editing.filePath);
+      const hunk = file?.hunks.find(item => item.id === editing.hunkId);
+      // A source-only refresh cannot change this proposal; keep the user's draft and cursor alive.
+      if (hunk && decisionOf(hunk) === 'pending' && !file.issue && !hunk.conflict && hunk.before === editing.original) {
+        editing.revision = message.revision;
+      }
+    }
     state = message;
     saveViewState();
     awaitingDecision = false;

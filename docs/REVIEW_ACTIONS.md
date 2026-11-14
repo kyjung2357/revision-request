@@ -8,6 +8,22 @@ Opening a request or using **Open Preview** moves to its first pending change, s
 
 The 15px scrollbar marks pending changes in red and green. Click a marker to jump to it, or drag its thumb to scroll. In side-by-side view, drag the divider immediately left of the scrollbar to resize the columns; double-click it to restore equal widths. Both code areas keep the same wrapping width.
 
+**Go to original** on the first removed row opens the actual source file and places the cursor at the start of that change. Earlier accepted changes and tracked manual insertions and deletions are included when locating the current line. The button works in both layouts and while editing a proposal; it does not apply or discard the draft. Insertions without original rows have no navigation button. Unsaved source edits must be saved or undone first; navigation is unavailable for a conflicting or unverifiable entry.
+
+## Edit the original during review
+
+Once the extension has verified a local review, you can edit the original directly and save it. Changes outside pending blocks are adopted automatically: gray context updates, remaining proposals follow shifted lines, and later Accept operations preserve your manual edits. The request's original line numbers and proposal text stay in the JSON; current positions and the last verified source are stored in VS Code's local review state and checked again when reopening.
+
+| Manual source edit | Review behavior |
+| --- | --- |
+| Unrelated gray text, or lines added/deleted before a proposal | Adopt the saved edit and update current positions. |
+| An accepted or ignored area | Keep the manual text and its decision badge; disable Undo for that entry. |
+| A pending original block, its insertion anchor, or an ambiguous location | Mark that entry as conflicting. Accept, proposal editing, Keep original as comments, and Go to original are unavailable for it. Other entries remain reviewable. |
+
+The complete original block of a pending entry is protected, including common characters without stronger highlights. Manually typing the proposed result does not mark the entry Accepted. Ignore can discard a conflicting proposal without changing your current source. Accept all is unavailable while any pending conflict remains; Ignore all still discards all pending proposals. Quick Review stops at a conflict instead of silently skipping or deciding it. Conflicts remain pending and do not trigger completion cleanup.
+
+Unsaved original edits pause application until saved or undone. Source changes also invalidate older review actions; the extension checks the latest source again immediately before writing. A prior local review record is required for automatic tracking. A newly received request still uses exact line and fragment validation, and a mismatch is not automatically relocated.
+
 ## Edit a pending proposal
 
 Click proposed code to edit it in place, in either layout. Multiline blocks remain one decision. **Alt+click** adds cursors within that block for simultaneous typing, deletion, and pasting. Changes stay highlighted while editing. As you type, both the original and proposed highlights update against the current draft using the same language-specific rules as the preview.
@@ -60,9 +76,9 @@ Quick Review starts off when a preview is created or reloaded. While off, the bu
 | Key | Action |
 | --- | --- |
 | **Left** or **Right arrow** | Toggle between Accept and Ignore; both arrows cycle between those two choices. The **⋯** menu is excluded. |
-| **Tab** | Execute the selected decision. After it succeeds, select Accept on the next pending change and scroll when needed. |
+| **Tab** | Execute the selected decision. After it succeeds, select Accept on the next pending change and center that block in the viewport. For a block taller than the viewport, center its proposed action row. Scrolling stops at the file boundaries. |
 | **Escape** | Close an open menu or explanation first; otherwise turn Quick Review off. |
 
 Enabling the mode selects Accept for the first visible or nearest pending block. Opening a request through the sidebar starts at the first pending change. Toggling the current preview does not reset it to the beginning.
 
-Mouse review remains available. Keys pause while a menu, explanation, confirmation, or code editor is active; editing uses its configured Accept shortcut. A decision must finish before another can run. A failed decision keeps the same selection, and finishing all pending changes turns the mode off.
+Mouse review remains available. Quick Review pauses on a conflicting item; use its Ignore action or review another item explicitly. Keys pause while a menu, explanation, confirmation, or code editor is active; editing uses its configured Accept shortcut. A decision must finish before another can run. A failed decision keeps the same selection, and finishing all pending changes turns the mode off.

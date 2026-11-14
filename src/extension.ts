@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import { computeHunks, computeFileInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
 import { getReviewHtml, getReviewRestoreErrorHtml } from './webview';
+import { createTrackedReview, rebaseTrackedReview, reconfigureTrackedReview, transitionTrackedReview, projectTrackedReview, validateTrackedReview, type TrackedReview } from './reviewRebase';
 import { parseRequestDocument, proposalIdentity, resolveRequest, patchRequestStatuses, editPendingRequest, ensureRequestTime, type RevisionRequest } from './request';
 import { McpHost } from './mcpHost';
 import { startMcpBridge } from './mcpBridge';
@@ -31,6 +32,7 @@ export interface CompletionPrompt {
 }
 interface ReviewTransaction {
   generation: string; baseline: string; oldRequest: string; newRequest: string;
+  oldTracking?: TrackedReview; newTracking?: TrackedReview;
 }
 class ResolutionError extends Error {
   constructor(readonly request: RevisionRequest, readonly revision: string, cause: unknown) {
@@ -39,10 +41,10 @@ class ResolutionError extends Error {
 }
 interface ReviewFile {
   path: string; before: string; currentText?: string; reason?: string; issue?: string;
-  hunks: (ReturnType<typeof computeHunks>[number] & {decision: Decision; explanation?: string; inlineChanges?: InlineChangeLine[]})[];
+  hunks: (ReturnType<typeof computeHunks>[number] & {decision: Decision; explanation?: string; inlineChanges?: InlineChangeLine[]; conflict?: string; undoBlocked?: string})[];
 }
 export interface ReviewState {
-  type: 'state'; revision: string; title: string; description?: string;
+  type: 'state'; revision: string; rawRevision?: string; title: string; description?: string;
   requestName: string; files: ReviewFile[]; trusted: boolean; busy: boolean; unchangedOpacity: number;
   highlightChangedLines: boolean; showOnlyChangedText: boolean; defaultLayout: 'unified' | 'sideBySide'; error?: string;
   acceptShortcut: 'ctrlEnter' | 'altEnter' | 'tab' | 'shiftTab' | 'none';
@@ -72,6 +74,7 @@ export class ReviewService implements vscode.Disposable {
   private readonly completed = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidDeleteRequest = this.completed.event;
   private queue: Promise<unknown> = Promise.resolve();
+  private readonly trackingQueues = new Map<string, Promise<unknown>>();
   private readonly completionPrompts = new Map<string, CompletionPrompt>();
   private readonly attemptedPreparation = new Map<string, string>();
   busy = false;
@@ -133,6 +136,19 @@ export class ReviewService implements vscode.Disposable {
   private baselineKey(uri: vscode.Uri, generation: string, identity: string) {
     return this.reviewPrefix(uri) + 'baseline.' + requestFingerprint(generation) + '.' + identity;
   }
+  private trackingKey(uri: vscode.Uri, generation: string, identity: string) {
+    return this.reviewPrefix(uri) + 'source.' + requestFingerprint(generation) + '.' + identity;
+  }
+  private withTracking<T>(uri: vscode.Uri, action: () => Promise<T>): Promise<T> {
+    const key = uri.toString(), previous = this.trackingQueues.get(key) ?? Promise.resolve();
+    const task = previous.then(action, action);
+    this.trackingQueues.set(key, task);
+    void task.finally(() => { if (this.trackingQueues.get(key) === task) this.trackingQueues.delete(key); }).catch(() => undefined);
+    return task;
+  }
+  private trackedRevision(rawRevision: string, tracking?: TrackedReview) {
+    return tracking ? requestFingerprint(rawRevision + '\n' + JSON.stringify(tracking)) : rawRevision;
+  }
   private gitOriginalKey(uri: vscode.Uri, generation: string) {
     return this.reviewPrefix(uri) + 'git-original.' + requestFingerprint(generation);
   }
@@ -148,20 +164,23 @@ export class ReviewService implements vscode.Disposable {
     resolveRequest(raw.request, '', baseline);
     await this.assertRawRequest(uri, raw);
     if (!vscode.workspace.isTrusted) throw new Error('The selected workspace is no longer trusted.');
+    // Discard a speculative live-file snapshot read before the Git origin was registered.
+    await this.context.workspaceState.update(this.trackingKey(uri, raw.generation, proposalIdentity(raw.request)), undefined);
     await this.context.workspaceState.update(this.gitOriginalKey(uri, raw.generation), {
       path: raw.request.path, hash: requestFingerprint(baseline), commit: selection.commit
     });
   }
-  private async load(uri: vscode.Uri) {
+  private load(uri: vscode.Uri) { return this.withTracking(uri, () => this.loadReview(uri)); }
+  private async loadReview(uri: vscode.Uri) {
     const raw = await this.readRequest(uri);
     const request = raw.request;
     try {
+      if (this.context.workspaceState.get(this.journalKey(uri))) throw new Error('A review action needs to finish before the source can be refreshed.');
       const identity = proposalIdentity(request);
       const key = this.baselineKey(uri, raw.generation, identity);
-      const gitOriginal = this.context.workspaceState.get<{path: string; hash: string; commit: string}>(
-        this.gitOriginalKey(uri, raw.generation));
+      const sourceKey = this.trackingKey(uri, raw.generation, identity);
+      const gitOriginal = this.context.workspaceState.get<{path: string; hash: string; commit: string}>(this.gitOriginalKey(uri, raw.generation));
       let cached = this.context.workspaceState.get<string>(key);
-      // A preview may have read the newly created file while its origin was being recorded.
       if (gitOriginal && cached !== undefined && requestFingerprint(requestModelText(cached)) !== gitOriginal.hash) cached = undefined;
       const target = await this.targetUri(uri, {path: request.path, before: '', after: ''});
       const current = decode(await vscode.workspace.fs.readFile(target));
@@ -170,10 +189,32 @@ export class ReviewService implements vscode.Disposable {
         throw new Error('This request uses Git commit ' + gitOriginal.commit.slice(0, 8) +
           ' as its original. Review it in a workspace whose target matches that version.');
       }
+      const savedTracking = this.context.workspaceState.get<TrackedReview>(sourceKey);
+      let tracking: TrackedReview | undefined;
+      const dirty = vscode.workspace.textDocuments.some(document => document.uri.toString() === target.toString() && document.isDirty);
+      if (savedTracking !== undefined) {
+        tracking = validateTrackedReview(savedTracking);
+        const originalHunks = new Map(review.hunks.map(hunk => [hunk.id, hunk]));
+        if (tracking.path !== request.path || tracking.entries.length !== review.hunks.length || tracking.entries.some(entry => {
+          const hunk = originalHunks.get(entry.hunk.id);
+          return !hunk || hunk.before !== entry.hunk.before || hunk.after !== entry.hunk.after ||
+            hunk.start !== entry.hunk.start || hunk.end !== entry.hunk.end || hunk.index !== entry.hunk.index ||
+            hunk.oldStart !== entry.hunk.oldStart || hunk.oldLines !== entry.hunk.oldLines || hunk.newLines !== entry.hunk.newLines ||
+            review.decisions[hunk.id] !== entry.decision;
+        })) throw new Error('The stored request statuses or proposals do not match this review. Create a fresh request.');
+        if (!dirty) tracking = rebaseTrackedReview(tracking, current);
+      } else if (!dirty && current === review.expectedTarget) {
+        // First establish an exact local baseline. Unknown/imported mismatches are never relocated.
+        tracking = createTrackedReview(review.file, review.decisions);
+      }
+      await this.assertRawRequest(uri, raw);
+      if (decode(await vscode.workspace.fs.readFile(target)) !== current) throw new Error('The original changed while refreshing this review. Try again.');
       if (cached === undefined) await this.context.workspaceState.update(key, review.baseline);
+      if (tracking && JSON.stringify(tracking) !== JSON.stringify(savedTracking)) await this.context.workspaceState.update(sourceKey, tracking);
       const decisions: Decisions = {};
       for (const [hunk, decision] of Object.entries(review.decisions)) decisions[keyFor(request.path, hunk)] = decision;
-      return {...raw, request: {title: path.basename(request.path), files: [review.file]}, decisions,
+      return {...raw, revision: this.trackedRevision(raw.fingerprint, tracking), tracking,
+        request: {title: path.basename(request.path), files: [review.file]}, decisions,
         resolved: {request, review, identity}};
     } catch (error) { throw new ResolutionError(request, raw.fingerprint, error); }
   }
@@ -208,7 +249,10 @@ export class ReviewService implements vscode.Disposable {
     const request = parseRequestDocument(text);
     return {request, review: resolveRequest(request, '', baseline)};
   }
-  private async recoverReview(uri: vscode.Uri): Promise<'old' | 'new' | undefined> {
+  private recoverReview(uri: vscode.Uri): Promise<'old' | 'new' | undefined> {
+    return this.withTracking(uri, () => this.recoverReviewUnlocked(uri));
+  }
+  private async recoverReviewUnlocked(uri: vscode.Uri): Promise<'old' | 'new' | undefined> {
     const journal = this.context.workspaceState.get<ReviewTransaction>(this.journalKey(uri));
     if (!journal) return;
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before recovering an interrupted review.');
@@ -223,22 +267,26 @@ export class ReviewService implements vscode.Disposable {
     const open = vscode.workspace.textDocuments.find(document => document.uri.toString() === target.toString());
     if (open?.isDirty) throw new Error('Save or undo unsaved original edits before recovering this review.');
     const current = decode(await vscode.workspace.fs.readFile(target));
-    const matchesOld = current === old.review.expectedTarget;
-    const matchesNew = current === next.review.expectedTarget;
+    const oldTracking = journal.oldTracking && validateTrackedReview(journal.oldTracking);
+    const newTracking = journal.newTracking && validateTrackedReview(journal.newTracking);
+    const matchesOld = current === (oldTracking?.text ?? old.review.expectedTarget);
+    const matchesNew = current === (newTracking?.text ?? next.review.expectedTarget);
     if (!matchesOld && !matchesNew) throw new Error('An interrupted review conflicts with newer original contents. The files were kept unchanged.');
     // Recovery only reconciles metadata with the saved source; it NEVER writes the original.
     const outcome = matchesNew && (!matchesOld || raw.savedText === journal.newRequest) ? 'new' : 'old';
     const chosen = outcome === 'new' ? next : old;
     const text = outcome === 'new' ? journal.newRequest : journal.oldRequest;
+    const tracking = outcome === 'new' ? newTracking : oldTracking;
     if (text !== raw.savedText) {
       await this.assertRawRequest(uri, raw);
       if (decode(await vscode.workspace.fs.readFile(target)) !== current || open?.isDirty) throw new Error('The original changed during recovery.');
       await this.writeRawRequest(uri, raw, text);
     }
-    if (decode(await vscode.workspace.fs.readFile(target)) !== chosen.review.expectedTarget || open?.isDirty) {
+    if (decode(await vscode.workspace.fs.readFile(target)) !== (tracking?.text ?? chosen.review.expectedTarget) || open?.isDirty) {
       throw new Error('The original changed during recovery.');
     }
     await this.context.workspaceState.update(this.baselineKey(uri, journal.generation, chosen.review.identity), journal.baseline);
+    if (tracking) await this.context.workspaceState.update(this.trackingKey(uri, journal.generation, chosen.review.identity), tracking);
     await this.context.workspaceState.update(this.journalKey(uri), undefined);
     return outcome;
   }
@@ -251,39 +299,49 @@ export class ReviewService implements vscode.Disposable {
     const text = ensureRequestTime(raw.savedText, new Date(created).toISOString());
     if (text !== raw.savedText) await this.writeRawRequest(uri, raw, text);
   }
-  private async commitReview(uri: vscode.Uri, loaded: Awaited<ReturnType<ReviewService['load']>>, text: string, origin: DecisionOrigin) {
-    const next = this.projection(text, loaded.resolved.review.baseline);
-    if (next.request.path !== loaded.resolved.request.path) throw new Error('A review cannot change its target path.');
-    const target = await this.inspectTarget(uri, loaded.request.files[0]!, loaded.decisions);
-    await this.assertRawRequest(uri, loaded);
-    const journal: ReviewTransaction = {generation: loaded.generation, baseline: loaded.resolved.review.baseline,
-      oldRequest: loaded.savedText, newRequest: text};
-    await this.context.workspaceState.update(this.journalKey(uri), journal);
-    try {
+  private commitReview(uri: vscode.Uri, loaded: Awaited<ReturnType<ReviewService['load']>>, text: string, origin: DecisionOrigin, editedHunkId?: string) {
+    return this.withTracking(uri, async () => {
+      const next = this.projection(text, loaded.resolved.review.baseline);
+      if (next.request.path !== loaded.resolved.request.path) throw new Error('A review cannot change its target path.');
+      const target = await this.inspectTarget(uri, loaded.request.files[0]!, loaded.decisions, loaded.tracking);
       await this.assertRawRequest(uri, loaded);
-      const open = vscode.workspace.textDocuments.find(document => document.uri.toString() === target.uri.toString());
-      if (open?.isDirty || decode(await vscode.workspace.fs.readFile(target.uri)) !== target.expected) throw new Error('The original changed while preparing this action. Nothing was applied.');
-      assertDecisionOrigin(origin);
-      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before applying changes.');
-      if (next.review.expectedTarget !== target.expected) {
-        await vscode.workspace.fs.writeFile(target.uri, Buffer.from(next.review.expectedTarget, 'utf8'));
-        if (decode(await vscode.workspace.fs.readFile(target.uri)) !== next.review.expectedTarget) throw new Error('The original changed while applying this action.');
+      const oldTracking = loaded.tracking ?? createTrackedReview(loaded.resolved.review.file, loaded.resolved.review.decisions);
+      const oldEntries = loaded.resolved.review.entryIndexByHunkId;
+      const removedIndex = editedHunkId && next.request.request.length < loaded.resolved.request.request.length ? oldEntries[editedHunkId] : undefined;
+      const oldByIndex = new Map(Object.entries(oldEntries).map(([id, index]) => [index, id]));
+      const mappings: Record<string, string> = {};
+      for (const hunk of next.review.hunks) {
+        const index = next.review.entryIndexByHunkId[hunk.id]!;
+        const prior = oldByIndex.get(removedIndex !== undefined && index >= removedIndex ? index + 1 : index);
+        if (prior) mappings[hunk.id] = prior;
       }
-      // Once the authorized source write commits, finish its matching status metadata.
-      await this.writeRawRequest(uri, loaded, text);
-      if (open?.isDirty || decode(await vscode.workspace.fs.readFile(target.uri)) !== next.review.expectedTarget) {
-        throw new Error('The original changed while saving the review status.');
+      const newTracking = reconfigureTrackedReview(oldTracking, next.review.file, next.review.decisions, mappings);
+      const journal: ReviewTransaction = {generation: loaded.generation, baseline: loaded.resolved.review.baseline,
+        oldRequest: loaded.savedText, newRequest: text, oldTracking, newTracking};
+      await this.context.workspaceState.update(this.journalKey(uri), journal);
+      try {
+        await this.assertRawRequest(uri, loaded);
+        const open = vscode.workspace.textDocuments.find(document => document.uri.toString() === target.uri.toString());
+        if (open?.isDirty || decode(await vscode.workspace.fs.readFile(target.uri)) !== target.expected) throw new Error('The original changed while preparing this action. Nothing was applied.');
+        assertDecisionOrigin(origin);
+        if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before applying changes.');
+        if (newTracking.text !== target.expected) {
+          await vscode.workspace.fs.writeFile(target.uri, Buffer.from(newTracking.text, 'utf8'));
+          if (decode(await vscode.workspace.fs.readFile(target.uri)) !== newTracking.text) throw new Error('The original changed while applying this action.');
+        }
+        await this.writeRawRequest(uri, loaded, text);
+        if (open?.isDirty || decode(await vscode.workspace.fs.readFile(target.uri)) !== newTracking.text) throw new Error('The original changed while saving the review status.');
+        await this.context.workspaceState.update(this.baselineKey(uri, loaded.generation, next.review.identity), journal.baseline);
+        await this.context.workspaceState.update(this.trackingKey(uri, loaded.generation, next.review.identity), newTracking);
+        await this.context.workspaceState.update(this.journalKey(uri), undefined);
+      } catch (error) {
+        const outcome = await this.recoverReviewUnlocked(uri).catch(() => undefined);
+        if (outcome !== 'new') throw error;
       }
-      await this.context.workspaceState.update(this.baselineKey(uri, loaded.generation, next.review.identity), journal.baseline);
-      await this.context.workspaceState.update(this.journalKey(uri), undefined);
-    } catch (error) {
-      // A write can commit and still reject. Reconcile exact known states without
-      // rolling back or replaying original-file writes, then report actual outcome.
-      const outcome = await this.recoverReview(uri).catch(() => undefined);
-      if (outcome !== 'new') throw error;
-    }
-    return this.load(uri);
+      return this.loadReview(uri);
+    });
   }
+
   private fileDecisions(file: RequestFile, decisions: Decisions): Decisions {
     const result: Decisions = {};
     for (const hunk of computeHunks(file)) result[hunk.id] = decisions[keyFor(file.path, hunk.id)] ?? 'pending';
@@ -317,14 +375,14 @@ export class ReviewService implements vscode.Disposable {
     this.watchedTargets.add(uri.toString());
     return uri;
   }
-  private async inspectTarget(requestUri: vscode.Uri, file: RequestFile, decisions: Decisions) {
+  private async inspectTarget(requestUri: vscode.Uri, file: RequestFile, decisions: Decisions, tracking?: TrackedReview) {
     if (file.before.startsWith('\uFEFF') !== file.after.startsWith('\uFEFF')) {
       throw new Error('Keep the original UTF-8 BOM unchanged in the proposal.');
     }
     const uri = await this.targetUri(requestUri, file);
     const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
     if (open?.isDirty) throw new Error('This file has unsaved edits. Save or undo them before accepting a proposal.');
-    const expected = renderAccepted(file.before, computeHunks(file), this.fileDecisions(file, decisions));
+    const expected = tracking?.text ?? renderAccepted(file.before, computeHunks(file), this.fileDecisions(file, decisions));
     const current = decode(await vscode.workspace.fs.readFile(uri));
     if (current !== expected) {
       throw new Error('The original has changed since this request was created. Create a fresh request to review the current file.');
@@ -344,7 +402,7 @@ export class ReviewService implements vscode.Disposable {
     };
     try {
       const raw = await this.readRequest(uri);
-      base.revision = raw.fingerprint;
+      base.revision = raw.fingerprint; base.rawRevision = raw.fingerprint;
       base.requestIdentity = proposalIdentity(raw.request);
       base.closed = raw.request.request.length > 0 && raw.request.request.every(entry => entry.status !== 'pending');
       const needsPreparation = this.context.workspaceState.get(this.journalKey(uri)) !== undefined ||
@@ -358,16 +416,17 @@ export class ReviewService implements vscode.Disposable {
       }
       const loaded = await this.load(uri);
       const {request, fingerprint, decisions} = loaded;
-      base.revision = fingerprint;
+      base.revision = loaded.revision; base.rawRevision = fingerprint;
       base.title = request.title;
       base.requestIdentity = loaded.resolved.identity;
       base.closed = loaded.resolved.request.request.length > 0 && loaded.resolved.request.request.every(entry => entry.status !== 'pending');
       base.verified = true;
       for (const file of request.files) {
+        const display = loaded.tracking ? projectTrackedReview(loaded.tracking).file : file;
         let issue: string | undefined;
         let currentText: string | undefined;
         try {
-          const target = await this.inspectTarget(uri, file, decisions);
+          const target = await this.inspectTarget(uri, file, decisions, loaded.tracking);
           currentText = target.current;
           base.verifiedTargetHash = requestFingerprint(target.current);
         } catch (error) {
@@ -376,11 +435,12 @@ export class ReviewService implements vscode.Disposable {
             try { currentText = decode(await vscode.workspace.fs.readFile(await this.targetUri(uri, file))); } catch { /* A closed summary may have no current source. */ }
           }
         }
-        const hunks = computeHunks(file);
-        const bomLength = file.before.startsWith('\uFEFF') ? 1 : 0;
-        const inlineChanges = includeInlineChanges ? computeFileInlineChanges(file, hunks, this.fileDecisions(file, decisions)) : undefined;
+        const hunks = computeHunks(display);
+        const trackedEntries = new Map(loaded.tracking?.entries.map(entry => [entry.hunk.id, entry]));
+        const bomLength = display.before.startsWith('\uFEFF') ? 1 : 0;
+        const inlineChanges = includeInlineChanges ? computeFileInlineChanges(display, hunks, this.fileDecisions(file, decisions)) : undefined;
         base.files.push({
-          path: file.path, before: file.before.slice(bomLength),
+          path: file.path, before: display.before.slice(bomLength),
           currentText: currentText?.replace(/^\uFEFF/, ''), reason: file.reason, issue,
           hunks: hunks.map(hunk => {
             // An insertion after an unterminated final row needs a physical
@@ -389,6 +449,8 @@ export class ReviewService implements vscode.Disposable {
               after: hunk.displayAfter ?? hunk.after};
             return {...preview,
               decision: decisions[keyFor(file.path, hunk.id)] ?? 'pending',
+              conflict: trackedEntries.get(hunk.id)?.conflict,
+              undoBlocked: trackedEntries.get(hunk.id)?.undoBlocked,
               explanation: loaded.resolved.request.request[loaded.resolved.review.entryIndexByHunkId[hunk.id]!]!.reason,
               inlineChanges: inlineChanges?.get(hunk.id)
             };
@@ -397,7 +459,7 @@ export class ReviewService implements vscode.Disposable {
       }
     } catch (error) {
       if (error instanceof ResolutionError) {
-        base.revision = error.revision;
+        base.revision = error.revision; base.rawRevision = error.revision;
         base.requestIdentity = proposalIdentity(error.request);
         base.closed = error.request.request.length > 0 && error.request.request.every(entry => entry.status !== 'pending');
       }
@@ -434,7 +496,7 @@ export class ReviewService implements vscode.Disposable {
       await this.prepareReview(uri);
       if (decision !== 'accepted' && decision !== 'ignored') throw new Error('Invalid review decision.');
       const loaded = await this.load(uri);
-      if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before deciding.');
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before deciding.');
       const file = loaded.request.files.find(candidate => candidate.path === filePath);
       if (!file) throw new Error('This file is not part of the request.');
       const hunks = computeHunks(file);
@@ -468,7 +530,7 @@ export class ReviewService implements vscode.Disposable {
     }
     if (origin === 'user' &&
         !vscode.workspace.getConfiguration('revisionRequest', uri).get<boolean>('skipCompletedDeleteConfirmation', false)) {
-      const completionPrompt: CompletionPrompt = {completionId: randomUUID(), revision: committed.fingerprint, requestName: path.basename(uri.fsPath)};
+      const completionPrompt: CompletionPrompt = {completionId: randomUUID(), revision: committed.revision, requestName: path.basename(uri.fsPath)};
       this.completionPrompts.set(uri.toString(), completionPrompt);
       return completionPrompt;
     }
@@ -499,8 +561,8 @@ export class ReviewService implements vscode.Disposable {
           let current = false;
           try {
             const loaded = await this.load(uri);
-            current = loaded.fingerprint === revision && this.completedReview(loaded);
-            if (current) await this.assertRequestUnchanged(uri, loaded.document, revision);
+            current = loaded.revision === revision && this.completedReview(loaded);
+            if (current) await this.assertRequestUnchanged(uri, loaded.document, loaded.fingerprint);
           } catch { current = false; }
           if (current) await this.rememberCompletionChoice(uri, false);
         }
@@ -509,17 +571,17 @@ export class ReviewService implements vscode.Disposable {
       }
       if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before deleting a request.');
       const loaded = await this.load(uri);
-      if (loaded.fingerprint !== revision || !this.completedReview(loaded)) {
+      if (loaded.revision !== revision || !this.completedReview(loaded)) {
         throw new Error('The request changed or has pending changes. The .rr request was kept.');
       }
-      await this.assertRequestUnchanged(uri, loaded.document, revision);
+      await this.assertRequestUnchanged(uri, loaded.document, loaded.fingerprint);
       if (rememberChoice) await this.rememberCompletionChoice(uri, true);
       await this.trashRequest(uri, true, async () => {
         const latest = await this.load(uri);
-        if (latest.fingerprint !== revision || !this.completedReview(latest)) {
+        if (latest.revision !== revision || !this.completedReview(latest)) {
           throw new Error('The request changed or has pending changes. The .rr request was kept.');
         }
-        await this.assertRequestUnchanged(uri, latest.document, revision);
+        await this.assertRequestUnchanged(uri, latest.document, latest.fingerprint);
       });
       return {deleted: true};
     });
@@ -535,7 +597,7 @@ export class ReviewService implements vscode.Disposable {
       if (typeof hunkId !== 'string' || !hunkId) throw new Error('Choose a specific change to undo.');
       await this.prepareReview(uri);
       const loaded = await this.load(uri);
-      if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before undoing.');
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before undoing.');
       const file = loaded.request.files.find(candidate => candidate.path === filePath);
       if (!file) throw new Error('This file is not part of the request.');
       const hunk = computeHunks(file).find(candidate => candidate.id === hunkId);
@@ -549,6 +611,10 @@ export class ReviewService implements vscode.Disposable {
       await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, {[index]: 'pending'}), origin);
     });
   }
+  private assertEditable(loaded: Awaited<ReturnType<ReviewService['load']>>, hunkId: string) {
+    const entry = loaded.tracking?.entries.find(item => item.hunk.id === hunkId);
+    if (entry?.conflict) throw new Error(entry.conflict);
+  }
   /** Review-menu operations return a local draft; they do not save either file. */
   private async reviewActionContext(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
     if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before editing a proposal.');
@@ -557,21 +623,18 @@ export class ReviewService implements vscode.Disposable {
     }
     if (this.busy) throw new Error('Wait for the current review action to finish.');
     const loaded = await this.load(uri);
-    if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before editing.');
+    if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before editing.');
     const file = loaded.request.files.find(item => item.path === filePath);
     if (!file) throw new Error('This file is not part of the request.');
     const hunks = computeHunks(file), hunk = hunks.find(item => item.id === hunkId);
     if (!hunk || (loaded.decisions[keyFor(file.path, hunk.id)] ?? 'pending') !== 'pending') {
       throw new Error('Only pending changes can be edited.');
     }
-    const target = await this.inspectTarget(uri, file, loaded.decisions);
+    this.assertEditable(loaded, hunkId);
+    const target = await this.inspectTarget(uri, file, loaded.decisions, loaded.tracking);
     // This validates Unicode, size, and entry boundaries without saving the draft.
     editPendingRequest(loaded.savedText, loaded.resolved.review.baseline, hunkId, draft);
-    let start = hunk.start;
-    for (const previous of hunks) {
-      if (previous === hunk) break;
-      if (loaded.decisions[keyFor(file.path, previous.id)] === 'accepted') start += previous.after.length - previous.before.length;
-    }
+    const start = loaded.tracking?.entries.find(item => item.hunk.id === hunkId)?.start ?? hunk.start;
     const input: ReviewActionInput = {path: file.path, hasOriginal: hunk.end > hunk.start, hasProposed: hunk.newLines > 0,
       before: hunk.before.replace(/\r\n|\r/g, '\n').replace(/\n$/, ''),
       after: draft.replace(/\r\n|\r/g, '\n'), prefix: target.current.slice(0, start).replace(/^\uFEFF/, '').replace(/\r\n|\r/g, '\n')};
@@ -603,16 +666,17 @@ export class ReviewService implements vscode.Disposable {
       if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before editing a proposal.');
       await this.prepareReview(uri);
       const loaded = await this.load(uri);
-      if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before editing.');
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before editing.');
       const file = loaded.request.files.find(candidate => candidate.path === filePath);
       if (!file) throw new Error('This file is not part of the request.');
-      const target = await this.inspectTarget(uri, file, loaded.decisions);
+      this.assertEditable(loaded, hunkId);
+      const target = await this.inspectTarget(uri, file, loaded.decisions, loaded.tracking);
       const edited = editPendingRequest(loaded.savedText, loaded.resolved.review.baseline, hunkId, draft);
       await this.assertRawRequest(uri, loaded);
-      if (!edited.changed) return {changed: false, revision: loaded.fingerprint};
-      if (edited.review.expectedTarget !== target.expected) throw new Error('Editing a proposal must preserve accepted source content.');
-      const committed = await this.commitReview(uri, loaded, edited.text, 'user');
-      return {changed: true, revision: committed.fingerprint};
+      if (!edited.changed) return {changed: false, revision: loaded.revision};
+      if (edited.review.expectedTarget !== loaded.resolved.review.expectedTarget) throw new Error('Editing a proposal must preserve accepted source content.');
+      const committed = await this.commitReview(uri, loaded, edited.text, 'user', hunkId);
+      return {changed: true, revision: committed.revision};
     });
   }
   async editAndAccept(uri: vscode.Uri, filePath: string, hunkId: string, draft: string, revision: string) {
@@ -624,22 +688,23 @@ export class ReviewService implements vscode.Disposable {
       if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before accepting a proposal.');
       await this.prepareReview(uri);
       const loaded = await this.load(uri);
-      if (loaded.fingerprint !== revision) throw new Error('The request changed. Review its refreshed contents before accepting.');
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before accepting.');
       const file = loaded.request.files.find(candidate => candidate.path === filePath);
       if (!file) throw new Error('This file is not part of the request.');
-      const target = await this.inspectTarget(uri, file, loaded.decisions);
+      this.assertEditable(loaded, hunkId);
+      const target = await this.inspectTarget(uri, file, loaded.decisions, loaded.tracking);
       const edited = editPendingRequest(loaded.savedText, loaded.resolved.review.baseline, hunkId, draft);
       await this.assertRawRequest(uri, loaded);
-      if (edited.review.expectedTarget !== target.expected) throw new Error('Editing a proposal must preserve accepted source content.');
+      if (edited.review.expectedTarget !== loaded.resolved.review.expectedTarget) throw new Error('Editing a proposal must preserve accepted source content.');
       const index = loaded.resolved.review.entryIndexByHunkId[hunkId]!;
       // Returning to the original removes this entry. Never accept its shifted neighbor.
       const removed = edited.request.request.length < loaded.resolved.request.request.length;
       const text = removed ? edited.text : patchRequestStatuses(edited.text, {[index]: 'accepted'});
       this.completionPrompts.delete(uri.toString());
       // The draft and its decision share one source/RR journal and one guarded commit.
-      const committed = await this.commitReview(uri, loaded, text, 'user');
+      const committed = await this.commitReview(uri, loaded, text, 'user', hunkId);
       const completionPrompt = await this.finishCompletedReview(uri, committed, 'user');
-      return {changed: true, revision: committed.fingerprint, completionPrompt};
+      return {changed: true, revision: committed.revision, completionPrompt};
     });
   }
   private async inspectRequestDeletion(uri: vscode.Uri) {
@@ -701,17 +766,46 @@ export class ReviewService implements vscode.Disposable {
     if (!file) throw new Error('Unknown request file.');
     return vscode.window.showTextDocument(await this.targetUri(requestUri, file), {viewColumn: vscode.ViewColumn.Active, preserveFocus: true, preview: false, ...options});
   }
-  async snapshots(requestUri: vscode.Uri, filePath: string, revision: string) {
-    const {request, fingerprint, decisions} = await this.load(requestUri);
-    if (fingerprint !== revision) throw new Error('The request changed. Open the comparison again.');
-    const file = request.files.find(item => item.path === filePath);
+  async openTargetLine(requestUri: vscode.Uri, filePath: string, hunkId: string, revision: string) {
+    const loaded = await this.load(requestUri);
+    if (loaded.revision !== revision) throw new Error('The request changed. Refresh the preview before navigating to the original.');
+    const file = loaded.request.files.find(item => item.path === filePath);
     if (!file) throw new Error('Unknown request file.');
-    const hunks = computeHunks(file);
-    const current = this.fileDecisions(file, decisions);
-    const proposed = {...current};
-    for (const hunk of hunks) if (proposed[hunk.id] === 'pending') proposed[hunk.id] = 'accepted';
-    return {before: renderAccepted(file.before, hunks, current), after: renderAccepted(file.before, hunks, proposed)};
+    const hunks = computeHunks(file), decisions = this.fileDecisions(file, loaded.decisions);
+    const index = hunks.findIndex(item => item.id === hunkId), hunk = hunks[index];
+    if (!hunk || hunk.oldLines === 0 || decisions[hunk.id] !== 'pending') {
+      throw new Error('Choose an existing original line in a pending change.');
+    }
+    this.assertEditable(loaded, hunkId);
+    const target = await this.inspectTarget(requestUri, file, loaded.decisions, loaded.tracking);
+    const document = await vscode.workspace.openTextDocument(target.uri);
+    await this.assertRequestUnchanged(requestUri, loaded.document, loaded.fingerprint);
+    if (document.isDirty) throw new Error('Save or undo unsaved original edits before navigating to this request line.');
+    if (requestModelText(document.getText()) !== requestModelText(target.current.replace(/^\uFEFF/, ''))) {
+      throw new Error('The original changed while opening its line. Refresh the preview and try again.');
+    }
+    const mapped = loaded.tracking?.entries.find(item => item.hunk.id === hunkId);
+    const line = mapped ? target.current.slice(0, mapped.start).split(/\r\n|\r|\n/).length - 1 :
+      hunk.oldStart - 1 + hunks.slice(0, index).reduce((offset, item) => offset + (decisions[item.id] === 'accepted' ? item.newLines - item.oldLines : 0), 0);
+    if (line < 0 || line >= document.lineCount) throw new Error('The original line is no longer available. Refresh the preview.');
+    const position = new vscode.Position(line, 0), selection = new vscode.Range(position, position);
+    const editor = await vscode.window.showTextDocument(document, {
+      viewColumn: vscode.ViewColumn.Active, preserveFocus: false, preview: false, selection
+    });
+    editor.revealRange(selection, vscode.TextEditorRevealType.InCenter);
+    return editor;
   }
+  async snapshots(requestUri: vscode.Uri, filePath: string, revision: string) {
+    const loaded = await this.load(requestUri);
+    if (loaded.revision !== revision) throw new Error('The request changed. Open the comparison again.');
+    const file = loaded.request.files.find(item => item.path === filePath);
+    if (!file) throw new Error('Unknown request file.');
+    const target = await this.inspectTarget(requestUri, file, loaded.decisions, loaded.tracking);
+    const tracking = loaded.tracking ?? createTrackedReview(file, this.fileDecisions(file, loaded.decisions));
+    const changes = Object.fromEntries(tracking.entries.filter(entry => entry.decision === 'pending').map(entry => [entry.hunk.id, 'accepted' as Decision]));
+    return {before: target.current, after: transitionTrackedReview(tracking, changes).text};
+  }
+
 }
 
 class SnapshotProvider implements vscode.TextDocumentContentProvider {
@@ -1096,6 +1190,14 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               completionSucceeded = true;
               break;
             case 'deleteRequest': await this.service.deleteRequest(uri); break;
+            case 'openTargetLine':
+              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' ||
+                  typeof message.revision !== 'string' ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'revision'].includes(key))) {
+                throw new Error('Invalid original-line navigation.');
+              }
+              await this.service.openTargetLine(uri, message.filePath, message.hunkId, message.revision);
+              break;
             case 'openTarget': await this.service.openTarget(uri, message.filePath, {preserveFocus: false}); break;
             case 'openSource': await this.openSource(uri); break;
             case 'openDiff': await this.openDiff(uri, message.filePath, message.revision); break;

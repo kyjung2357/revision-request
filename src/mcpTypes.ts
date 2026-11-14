@@ -60,6 +60,7 @@ export interface McpStatus {
   requestPath: string;
   path: string;
   revision: string;
+  rawRevision?: string;
   status: 'pending' | 'completed' | 'unavailable' | 'stale';
   pending: number;
   accepted: number;
@@ -69,7 +70,7 @@ export interface McpStatus {
   completedAt?: string;
   targetHash?: string;
   hunks: { id: string; oldStart: number; newStart: number; oldLines: number; newLines: number;
-    decision: 'pending' | 'accepted' | 'ignored'; explanation?: string }[];
+    decision: 'pending' | 'accepted' | 'ignored'; explanation?: string; conflict?: string; undoBlocked?: string }[];
 }
 export class McpBridgeError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = 'McpBridgeError'; }

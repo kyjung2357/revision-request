@@ -758,3 +758,21 @@ test('toggling Quick Review in its active preview preserves position; revealing 
   assert.equal(count(), 2, 'Revealing a hidden preview is an ordinary reopening');
   assert.equal(panel.reveals, 3);
 });
+
+
+test('original-line messages bind navigation to the panel request, hunk and revision', async t => {
+  const {editor,uri,service}=setup(t),calls=[];
+  service.openTargetLine=async(...args)=>{calls.push(args);};
+  await editor.openPreview(uri);const panel=current.created[0];
+  const message={type:'openTargetLine',filePath:'inventory_report.py',hunkId:'pending-id',revision:'current-revision'};
+  panel.received.fire(message);await tick();
+  assert.deepEqual(calls,[[uri,message.filePath,message.hunkId,message.revision]]);
+  for(const invalid of [{...message,revision:undefined},{...message,hunkId:1},{...message,filePath:[]},{...message,line:9000}]) {
+    panel.webview.messages=[];panel.received.fire(invalid);await tick();
+    assert.equal(calls.length,1,'The webview cannot supply a raw line or malformed identity');
+    assert.match(panel.webview.messages.find(item=>item.error)?.error??'',/Invalid original-line navigation/);
+  }
+  service.openTargetLine=async()=>{throw Error('The original has changed since this request was created.');};
+  panel.webview.messages=[];panel.received.fire(message);await tick();
+  assert.match(panel.webview.messages.find(item=>item.error)?.error??'',/original has changed/);
+});
