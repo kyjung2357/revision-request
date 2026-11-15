@@ -11,10 +11,16 @@
   const cancel = document.getElementById('cancel');
   const selectOriginal = document.getElementById('select-original');
   const selectProposed = document.getElementById('select-proposed');
+  const generatePdf = document.getElementById('generate-pdf');
+  const pdfOption = document.getElementById('pdf-option');
+  const pdfHint = document.getElementById('pdf-hint');
   let blocked = false;
   const send = command => { if (!blocked) vscode.postMessage({command}); };
   selectOriginal.addEventListener('click', () => send('selectOriginal'));
   selectProposed.addEventListener('click', () => send('selectProposed'));
+  generatePdf.addEventListener('change', () => {
+    if (!blocked && !generatePdf.disabled) vscode.postMessage({command:'setGeneratePdf',value:generatePdf.checked});
+  });
   create.addEventListener('click', () => {if (!create.disabled) send('create');});
   cancel.addEventListener('click', () => send('cancel'));
   document.addEventListener('keydown', event => {if (event.key === 'Escape' && !blocked) send('cancel');});
@@ -26,6 +32,12 @@
     revision.textContent = state.originalRevision || '';
     revision.hidden = !state.originalRevision;
     gitNotice.hidden = state.originalMode !== 'git';
+    generatePdf.disabled = blocked || !state.pdfSupported;
+    generatePdf.checked = Boolean(state.pdfSupported && state.generatePdf);
+    pdfOption.classList.toggle('disabled', generatePdf.disabled);
+    pdfHint.textContent = state.originalMode === 'git'
+      ? 'PDF generation currently requires a saved workspace original.'
+      : 'Available for LaTeX originals (.tex, .ltx, .latex).';
     proposed.textContent = state.proposed || 'No file selected';
     output.textContent = state.output || 'Choose an original to see where the request will be saved.';
     error.textContent = state.error || '';

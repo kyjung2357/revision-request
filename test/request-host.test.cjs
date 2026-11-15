@@ -13,6 +13,8 @@ let scratch;
 const documents = new Map();
 const sourceWrites = [];
 const sourceNavigations = [];
+const pdfCommands = [];
+let workshopAvailable = true, workshopActivate, pdfCommandHook;
 const settings = new Map([['autoDeleteCompleted', false], ['skipCompletedDeleteConfirmation', false]]);
 let sourceFault;
 class Uri {
@@ -27,8 +29,15 @@ const vscode = {
   Position: class {constructor(line, character) {this.line = line; this.character = character;}},
   Range: class {constructor(start, end) {this.start = start; this.end = end;}},
   ConfigurationTarget: {Global: 1, Workspace: 2, WorkspaceFolder: 3},
-  EventEmitter: class { constructor() {this.event = () => ({dispose(){}});} fire(){} dispose(){} },
+  EventEmitter: class {
+    listeners = new Set();
+    event = listener => {this.listeners.add(listener); return {dispose: () => this.listeners.delete(listener)};};
+    fire(value) {for (const listener of this.listeners) listener(value);}
+    dispose() {this.listeners.clear();}
+  },
   TabInputText: class {},
+  TabInputCustom: class {constructor(uri,viewType){this.uri=uri;this.viewType=viewType;}},
+  TabInputWebview: class {constructor(viewType){this.viewType=viewType;}},
   workspace: {
     isTrusted: true,
     get workspaceFolders() { return scratch ? [{uri: Uri.file(scratch), name: 'request-test'}] : []; },
@@ -41,7 +50,7 @@ const vscode = {
     }; },
     async openTextDocument(uri) {
       if (!documents.has(uri.toString())) documents.set(uri.toString(), {
-        uri, isDirty: false, isClosed: false,
+        uri, isDirty: false, isClosed: false, languageId: /\.(tex|ltx|latex)$/i.test(uri.fsPath) ? 'latex' : 'plaintext',
         getText() {return this.staleText ?? syncFs.readFileSync(uri.fsPath, 'utf8').replace(/^\uFEFF/, '');},
         get lineCount() {return this.getText().split(/\r\n|\r|\n/).length;}
       });
@@ -61,10 +70,37 @@ const vscode = {
       delete: uri => fs.unlink(uri.fsPath)
     }
   },
-  window: {tabGroups: {all: [], close: async () => true}, showWarningMessage: () => undefined,
+  extensions: {getExtension(id) {
+    assert.equal(id, 'James-Yu.latex-workshop');
+    return workshopAvailable ? {activate: async () => {await workshopActivate?.();}} : undefined;
+  }},
+  commands: {async executeCommand(command, ...args) {
+    pdfCommands.push({command, args, editor: vscode.window.activeTextEditor});
+    const source=vscode.window.activeTextEditor;
+    const handled=await pdfCommandHook?.(command,args);
+    if(command==='latex-workshop.view' && handled!=='handled' && source) {
+      const uri=Uri.file(source.document.uri.fsPath.replace(/\.[^.]+$/,'.pdf'));
+      const tab={input:new vscode.TabInputCustom(uri,'latex-workshop-pdf-hook'),isActive:true};
+      const group={viewColumn:source.viewColumn+1,tabs:[tab],activeTab:tab};
+      vscode.window.tabGroups.all=[group];
+    }
+    if(command==='vscode.openWith') {
+      const [uri,viewType,options]=args;
+      const group=vscode.window.tabGroups.all.find(group=>group.viewColumn===options.viewColumn);
+      const tab=group?.tabs.find(tab=>tab.input instanceof vscode.TabInputCustom&&tab.input.uri.toString()===uri.toString()&&tab.input.viewType===viewType);
+      if(!tab)throw Error('Wrong PDF tab');
+      group.activeTab=tab;for(const item of group.tabs)item.isActive=item===tab;
+      vscode.window.activeTextEditor=undefined;vscode.window.tabGroups.activeTabGroup=group;
+    }
+  }},
+  window: {tabGroups: {all: [], close: async () => true}, showWarningMessage: (_message, _options, action) => action === 'Build PDF' ? action : undefined,
     async showTextDocument(document, options) {
       const navigation = {document, options}; sourceNavigations.push(navigation);
-      return {revealRange: (range, type) => {navigation.reveal = {range, type};}};
+      const editor = {document, viewColumn: options.viewColumn === -1 ? 2 : options.viewColumn, selection: options.selection, revealRange: (range, type) => {navigation.reveal = {range, type};}};
+      const group=vscode.window.tabGroups.all.find(group=>group.viewColumn===editor.viewColumn);
+      if(group){const input=new vscode.TabInputText();input.uri=document.uri;const tab={input,isActive:true};for(const t of group.tabs)t.isActive=false;group.tabs.push(tab);group.activeTab=tab;}
+      vscode.window.activeTextEditor = editor;
+      return editor;
     }
   },
 };
@@ -76,11 +112,11 @@ const {McpHost} = require('../src/mcpHost.ts');
 Module._load = load;
 function context() {
   const values = new Map();
-  return {workspaceState: {get: (key, fallback) => values.has(key) ? structuredClone(values.get(key)) : fallback,
+  return {globalStorageUri: Uri.file(path.join(scratch, '.codex-storage')), workspaceState: {get: (key, fallback) => values.has(key) ? structuredClone(values.get(key)) : fallback,
     update: async (key, value) => {if (value === undefined) values.delete(key); else values.set(key, structuredClone(value));},
     keys: () => [...values.keys()]}};
 }
-function service(state = context(), requestFault = {remaining: 0, when: 'before'}) {
+function service(state = context(), requestFault = {remaining: 0, when: 'before'}, pdfTools) {
   return {state, requestFault, api: new ReviewService(state, async (uri, bytes) => {
     if (requestFault.remaining > 0 && requestFault.when === 'before') {requestFault.remaining--; throw new Error('Injected RR failure before write');}
     const previous = requestFault.lagMilliseconds ? await fs.readFile(uri.fsPath, 'utf8') : undefined;
@@ -93,7 +129,7 @@ function service(state = context(), requestFault = {remaining: 0, when: 'before'
       }
       requestFault.remaining--; throw new Error('Injected RR failure after write');
     }
-  })};
+  }, pdfTools)};
 }
 let serial = 0;
 async function fixture(beforeText = 'one\ncontext\nthree\n', entries = [{line: 1, before: 'one', after: 'ONE', status: 'pending'}, {line: 3, before: 'three', after: 'THREE', status: 'pending'}], withTime = true, extension = 'txt') {
@@ -1070,4 +1106,1001 @@ test('external gray edits survive interrupted accepted write and exact metadata-
   state=await ready(service(created.state).api,item);
   assert.deepEqual(await statuses(item),['accepted','pending']);assert.equal(journals(created.state).length,0);assert.equal(sourceWrites.length,writes+1);
   assert.equal(state.files[0].before,manual.replace('one\n','ONE\n'));
+});
+
+
+test('warm parsing and projection caches still reject changed JSON, dirty buffers and pending source conflicts', async () => {
+  const item = await fixture(); const {api} = service();
+  const original = await ready(api, item);
+  await ready(api, item); await ready(api, item);
+  const raw = await read(item.request), writes = sourceWrites.length;
+  await fs.writeFile(item.request.fsPath, raw.replace('"ONE"', '"NEW"'));
+  await assert.rejects(api.decide(item.request, item.relative, original.files[0].hunks[0].id, 'accepted', original.revision), /request changed/i);
+  let latest = await ready(api, item);
+  assert.notEqual(latest.revision, original.revision);
+  assert.equal(latest.files[0].hunks[0].after, 'NEW\n');
+  const document = await vscode.workspace.openTextDocument(item.target); document.isDirty = true;
+  const dirty = await api.getState(item.request); assert.equal(dirty.verified, false); assert.match(dirty.verificationIssue, /unsaved/i);
+  await assert.rejects(api.decide(item.request, item.relative, latest.files[0].hunks[0].id, 'accepted', latest.revision), /unsaved/i);
+  document.isDirty = false;
+  await fs.writeFile(item.target.fsPath, 'manual\ncontext\nthree\n');
+  latest = await ready(api, item); assert.ok(latest.files[0].hunks[0].conflict);
+  await assert.rejects(api.decide(item.request, item.relative, latest.files[0].hunks[0].id, 'accepted', latest.revision), /changed inside|conflict/i);
+  assert.equal(sourceWrites.length, writes); assert.equal(await read(item.target), 'manual\ncontext\nthree\n');
+  await fs.writeFile(item.request.fsPath, '{invalid');
+  assert.match((await api.getState(item.request)).error, /JSON syntax error/);
+});
+
+test('decisions retain their persisted baseline without rewriting it and new proposal generations still survive restart', async () => {
+  const item = await fixture(), state = context(), updates = [];
+  const update = state.workspaceState.update;
+  state.workspaceState.update = async (key, value) => {updates.push(key); await update(key, value);};
+  const {api} = service(state); let view = await ready(api, item);
+  updates.length = 0;
+  await api.decide(item.request, item.relative, view.files[0].hunks[0].id, 'accepted', view.revision);
+  assert.equal(updates.filter(key => key.includes('.baseline.')).length, 0, 'A status-only action has no immutable baseline storage roundtrip');
+  assert.equal(updates.filter(key => key.endsWith('.transaction')).length, 2, 'Journal creation and cleanup still both persist');
+  assert.equal(updates.filter(key => key.includes('.source.')).length, 1, 'The new tracked source still persists before journal cleanup');
+  view = await ready(api, item); updates.length = 0;
+  await api.editPending(item.request, item.relative, view.files[0].hunks[1].id, 'revised', view.revision);
+  assert.equal(updates.filter(key => key.includes('.baseline.')).length, 1, 'A new proposal generation gets its own persisted baseline');
+  view = await ready(service(state).api, item);
+  assert.deepEqual(view.files[0].hunks.map(hunk => hunk.decision), ['accepted', 'pending']);
+  assert.equal(view.files[0].hunks[1].after, 'revised\n');
+  assert.equal(await read(item.target), 'ONE\ncontext\nthree\n');
+});
+
+
+test('acceptThrough accepts the inclusive visual prefix once while preserving reviewed and later entries', async () => {
+  const before='one\ntwo\nthree\nfour\nfive\nsix\n';
+  const entries=[5,1,4,2,3,6].map(line=>({line,before:['one','two','three','four','five','six'][line-1],after:['ONE','TWO','THREE','FOUR','FIVE','SIX'][line-1],status:'pending'}));
+  const item=await fixture(before,entries),{api}=service();let state=await ready(api,item);
+  const at=line=>state.files[0].hunks.find(h=>h.oldStart===line);
+  await api.decide(item.request,item.relative,at(1).id,'accepted',state.revision);state=await ready(api,item);
+  await api.decide(item.request,item.relative,at(2).id,'ignored',state.revision);state=await ready(api,item);
+  const writes=sourceWrites.length;
+  const result=await api.acceptThrough(item.request,item.relative,at(4).id,state.revision);
+  assert.equal(sourceWrites.length-writes,1,'The whole prefix uses one source write');
+  assert.equal(await read(item.target),'ONE\ntwo\nTHREE\nFOUR\nfive\nsix\n');
+  assert.deepEqual(await statuses(item),['pending','accepted','accepted','ignored','accepted','pending']);
+  assert.equal(result.completionPrompt,undefined);assert.equal(result.changed,true);
+});
+
+test('acceptThrough respects array order for insertions sharing a source anchor', async () => {
+  const item=await fixture('head\nanchor\ntail\n',[
+    {line:2,before:null,after:'first',status:'pending'},
+    {line:2,before:null,after:'second',status:'pending'},
+    {line:2,before:'anchor',after:'ANCHOR',status:'pending'},
+    {line:3,before:'tail',after:'TAIL',status:'pending'}]);
+  const {api}=service(),state=await ready(api,item);
+  const anchor=state.files[0].hunks.find(h=>h.index===1);
+  await api.acceptThrough(item.request,item.relative,anchor.id,state.revision);
+  assert.equal(await read(item.target),'head\nfirst\nsecond\nanchor\ntail\n');
+  assert.deepEqual(await statuses(item),['accepted','accepted','pending','pending']);
+});
+
+test('acceptThrough preserves adopted gray edits and prompts only when the selected prefix completes review', async () => {
+  const item=await fixture();const {api}=service();let state=await ready(api,item);
+  await fs.writeFile(item.target.fsPath,'header\none\ncontext\nthree\nmanual footer\n');state=await ready(api,item);
+  const result=await api.acceptThrough(item.request,item.relative,state.files[0].hunks.at(-1).id,state.revision);
+  assert.equal(await read(item.target),'header\nONE\ncontext\nTHREE\nmanual footer\n');
+  assert.deepEqual(await statuses(item),['accepted','accepted']);
+  assert.ok(result.completionPrompt);assert.equal(result.completionPrompt.revision,result.revision);
+});
+
+test('acceptThrough rejects a conflict in the prefix without partially accepting safe entries', async () => {
+  const item=await fixture();const {api}=service();let state=await ready(api,item);
+  await fs.writeFile(item.target.fsPath,'manual\ncontext\nthree\n');state=await ready(api,item);
+  assert.ok(state.files[0].hunks[0].conflict);
+  const raw=await read(item.request),source=await read(item.target),writes=sourceWrites.length;
+  await assert.rejects(api.acceptThrough(item.request,item.relative,state.files[0].hunks[1].id,state.revision),/original changed|pending block|ambiguous/i);
+  assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);assert.equal(sourceWrites.length,writes);
+});
+
+test('acceptThrough ignores later conflicts outside its selected prefix', async () => {
+  const item=await fixture();const {api}=service();let state=await ready(api,item);
+  await fs.writeFile(item.target.fsPath,'one\ncontext\nmanual\n');state=await ready(api,item);
+  assert.ok(state.files[0].hunks[1].conflict);
+  await api.acceptThrough(item.request,item.relative,state.files[0].hunks[0].id,state.revision);
+  assert.equal(await read(item.target),'ONE\ncontext\nmanual\n');assert.deepEqual(await statuses(item),['accepted','pending']);
+});
+
+test('acceptThrough rejects stale, dirty, untrusted, missing and resolved anchors without writes', async () => {
+  for(const kind of ['request','source','dirty-source','dirty-request','untrusted','missing','resolved','invalid-draft']) {
+    const item=await fixture(),{api}=service();let state=await ready(api,item);let anchor=state.files[0].hunks[0].id;
+    if(kind==='resolved'){await api.decide(item.request,item.relative,anchor,'ignored',state.revision);state=await ready(api,item);}
+    if(kind==='request')await fs.appendFile(item.request.fsPath,' ');
+    if(kind==='source')await fs.writeFile(item.target.fsPath,'manual\ncontext\nthree\n');
+    if(kind==='dirty-source')(await vscode.workspace.openTextDocument(item.target)).isDirty=true;
+    if(kind==='dirty-request')(await vscode.workspace.openTextDocument(item.request)).isDirty=true;
+    if(kind==='untrusted')vscode.workspace.isTrusted=false;
+    if(kind==='missing')anchor='absent';
+    const raw=await read(item.request),source=await read(item.target),writes=sourceWrites.length;
+    try {await assert.rejects(api.acceptThrough(item.request,item.relative,anchor,state.revision,kind==='invalid-draft'?'bad\0text':undefined));}
+    finally {vscode.workspace.isTrusted=true;}
+    assert.equal(await read(item.request),raw,kind);assert.equal(await read(item.target),source,kind);assert.equal(sourceWrites.length,writes,kind);
+  }
+});
+
+test('acceptThrough atomically includes the current multiline draft and keeps other accepted changes on Undo', async () => {
+  const item=await fixture('one\ntwo\nthree\nfour\n',[
+    {line:1,before:'one',after:'ONE',status:'pending'},
+    {line:2,before:'two',after:'TWO',status:'pending'},
+    {line:4,before:'four',after:'FOUR',status:'pending'}]);
+  const {api}=service();let state=await ready(api,item);const writes=sourceWrites.length;
+  await api.acceptThrough(item.request,item.relative,state.files[0].hunks[1].id,state.revision,'edited\nsecond');
+  assert.equal(sourceWrites.length-writes,1);assert.equal(await read(item.target),'ONE\nedited\nsecond\nthree\nfour\n');
+  assert.deepEqual(await statuses(item),['accepted','accepted','pending']);state=await ready(api,item);
+  await api.undo(item.request,item.relative,state.files[0].hunks.find(h=>h.index===1).id,state.revision);
+  assert.equal(await read(item.target),'ONE\ntwo\nthree\nfour\n');assert.deepEqual(await statuses(item),['accepted','pending','pending']);
+});
+
+test('acceptThrough no-op draft removal remaps unordered JSON indices without deciding the shifted later entry', async () => {
+  const item=await fixture('one\ntwo\nthree\nfour\n',[
+    {line:3,before:'three',after:'THREE',status:'pending'},
+    {line:1,before:'one',after:'ONE',status:'pending'},
+    {line:2,before:'two',after:'TWO',status:'pending'},
+    {line:4,before:'four',after:'FOUR',status:'pending'}]);
+  const {api}=service();const state=await ready(api,item);
+  await api.acceptThrough(item.request,item.relative,state.files[0].hunks.find(h=>h.oldStart===3).id,state.revision,'three');
+  assert.equal(await read(item.target),'ONE\nTWO\nthree\nfour\n');assert.deepEqual(await statuses(item),['accepted','accepted','pending']);
+  assert.deepEqual(JSON.parse(await read(item.request)).request.map(entry=>entry.line),[1,2,4]);
+  const solo=await fixture('old\n',[{line:1,before:'old',after:'new',status:'pending'}]);const initial=await ready(api,solo),writes=sourceWrites.length;
+  const result=await api.acceptThrough(solo.request,solo.relative,initial.files[0].hunks[0].id,initial.revision,'old');
+  assert.ok(result.completionPrompt);assert.deepEqual(await statuses(solo),[]);assert.equal(sourceWrites.length,writes);assert.equal(await read(solo.target),'old\n');
+});
+
+test('acceptThrough recovers an interrupted prefix status save without replaying source changes', async () => {
+  const item=await fixture(),created=service();const initial=await ready(created.api,item),writes=sourceWrites.length;
+  created.requestFault.remaining=2;
+  await assert.rejects(created.api.acceptThrough(item.request,item.relative,initial.files[0].hunks[1].id,initial.revision),/Injected RR failure/);
+  assert.equal(await read(item.target),'ONE\ncontext\nTHREE\n');assert.equal(sourceWrites.length-writes,1);
+  const restarted=service(created.state);await ready(restarted.api,item);
+  assert.deepEqual(await statuses(item),['accepted','accepted']);assert.equal(sourceWrites.length-writes,1);assert.equal(journals(created.state).length,0);
+});
+
+
+test('PDF navigation uses the mapped original cursor and awaits root discovery before SyncTeX without writing', async () => {
+  const item=await fixture('head\nold\ncontext\nfocus\n',[
+    {line:2,before:'old',after:'new\nextra',status:'pending'},
+    {line:4,before:'focus',after:'FOCUS',status:'pending'}],true,'tex');
+  const first=service();let state=await ready(first.api,item);
+  await first.api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision);
+  await fs.writeFile(item.target.fsPath,'manual header\n'+await read(item.target));
+  state=await ready(first.api,item);
+  const api=service(first.state).api;state=await ready(api,item);
+  const raw=await read(item.request),source=await read(item.target),writes=sourceWrites.length,start=pdfCommands.length,opens=sourceNavigations.length;
+  let activated=false;
+  workshopActivate=async()=>{activated=true;};
+  pdfCommandHook=async command=>{
+    assert.equal(activated,true);
+    const editor=vscode.window.activeTextEditor;
+    assert.equal(editor.document.uri.toString(),item.target.toString());
+    assert.equal(editor.selection.start.line,5);
+    assert.equal(editor.selection.start.character,0);
+    assert.equal(editor.document.getText().split('\n')[5],'focus');
+    if(command==='latex-workshop.view')vscode.window.activeTextEditor=undefined;
+  };
+  try {await api.openTargetPdf(item.request,item.relative,state.files[0].hunks[1].id,state.revision);}
+  finally {workshopActivate=pdfCommandHook=undefined;}
+  assert.deepEqual(pdfCommands.slice(start).map(({command,args})=>({command,args})),[
+    {command:'latex-workshop.view',args:[]},{command:'latex-workshop.synctex',args:[]},
+    {command:'vscode.openWith',args:[Uri.file(item.target.fsPath.replace(/\.tex$/,'.pdf')),'latex-workshop-pdf-hook',{viewColumn:3,preserveFocus:false,preview:false}]}
+  ]);
+  assert.equal(vscode.window.activeTextEditor,undefined,'PDF, not TeX, has final focus');
+  assert.equal(vscode.window.tabGroups.activeTabGroup.activeTab.input.viewType,'latex-workshop-pdf-hook');
+  assert.equal(sourceNavigations.length,opens+2,'Restore source focus after the PDF viewer opens');
+  assert.equal(sourceNavigations.at(-1).options.viewColumn,2,'Keep the original source editor group when PDF view changes focus');
+  assert.equal(sourceWrites.length,writes);assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);
+});
+
+test('PDF navigation requires LaTeX Workshop and a trusted LaTeX target, and reports activation failures', async () => {
+  for(const kind of ['missing-workshop','untrusted','not-tex','activation','language']) {
+    const item=await fixture(undefined,undefined,true,kind==='not-tex'?'py':'tex'),{api}=service(),state=await ready(api,item);
+    const raw=await read(item.request),source=await read(item.target),start=pdfCommands.length,opens=sourceNavigations.length;
+    workshopAvailable=kind!=='missing-workshop';vscode.workspace.isTrusted=kind!=='untrusted';
+    if(kind==='activation')workshopActivate=async()=>{throw Error('disabled extension');};
+    if(kind==='language')(await vscode.workspace.openTextDocument(item.target)).languageId='plaintext';
+    try {
+      await assert.rejects(api.openTargetPdf(item.request,item.relative,state.files[0].hunks[0].id,state.revision),
+        /Install or enable LaTeX Workshop|Trust this workspace|LaTeX source files only|Could not activate LaTeX Workshop: disabled extension|LaTeX language mode/);
+    } finally {workshopAvailable=true;vscode.workspace.isTrusted=true;workshopActivate=undefined;}
+    assert.equal(pdfCommands.length,start);
+    assert.equal(sourceNavigations.length,opens+(kind==='language'?1:0));
+    assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);
+  }
+});
+
+test('PDF navigation shares original-line guards and never dispatches commands for invalid requests', async () => {
+  for(const kind of ['revision','source','dirty-source','dirty-request','stale-model','unknown-hunk','unknown-file','resolved','insertion']) {
+    const item=await fixture(undefined,kind==='insertion'?[{line:1,before:null,after:'inserted',status:'pending'}]:undefined,true,'tex');
+    const {api}=service();let state=await ready(api,item),hunkId=state.files[0].hunks[0].id,dirty;
+    if(kind==='source')await fs.writeFile(item.target.fsPath,'external\n'+item.before);
+    if(kind.startsWith('dirty-')) {dirty=await vscode.workspace.openTextDocument(kind==='dirty-source'?item.target:item.request);dirty.isDirty=true;}
+    if(kind==='stale-model') {dirty=await vscode.workspace.openTextDocument(item.target);dirty.staleText='outdated model';}
+    if(kind==='resolved') {await api.decide(item.request,item.relative,hunkId,'ignored',state.revision);state=await ready(api,item);}
+    const raw=await read(item.request),source=await read(item.target),start=pdfCommands.length,opens=sourceNavigations.length;
+    try {
+      await assert.rejects(api.openTargetPdf(item.request,kind==='unknown-file'?'../outside.tex':item.relative,
+        kind==='unknown-hunk'?'missing':hunkId,kind==='revision'?'obsolete':state.revision),
+        /request changed|original has changed|unsaved|Save the .rr|original changed|existing original line|Unknown request file/i);
+    } finally {if(dirty){dirty.isDirty=false;delete dirty.staleText;}}
+    assert.equal(pdfCommands.length,start);assert.equal(sourceNavigations.length,opens);
+    assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);
+  }
+});
+
+test('PDF navigation rechecks source and request after awaiting the viewer and propagates command errors', async () => {
+  for(const kind of ['source','request','dirty','view-error','synctex-error']) {
+    const item=await fixture(undefined,undefined,true,'tex'),{api}=service(),state=await ready(api,item);
+    const start=pdfCommands.length,writes=sourceWrites.length;
+    pdfCommandHook=async command=>{
+      if(command==='latex-workshop.view') {
+        if(kind==='source')await fs.writeFile(item.target.fsPath,'external\n'+item.before);
+        if(kind==='request'){const raw=JSON.parse(await read(item.request));raw.request[0].after='changed';await fs.writeFile(item.request.fsPath,JSON.stringify(raw));}
+        if(kind==='dirty')(await vscode.workspace.openTextDocument(item.target)).isDirty=true;
+        if(kind==='view-error')throw Error('PDF unavailable');
+      }
+      if(command==='latex-workshop.synctex'&&kind==='synctex-error')throw Error('SyncTeX unavailable');
+    };
+    try {
+      await assert.rejects(api.openTargetPdf(item.request,item.relative,state.files[0].hunks[0].id,state.revision),
+        /request changed|unsaved|PDF unavailable|SyncTeX unavailable/i);
+    } finally {pdfCommandHook=undefined;const document=documents.get(item.target.toString());if(document)document.isDirty=false;}
+    assert.deepEqual(pdfCommands.slice(start).map(item=>item.command),kind==='synctex-error'?['latex-workshop.view','latex-workshop.synctex']:['latex-workshop.view']);
+    assert.equal(sourceWrites.length,writes);
+  }
+});
+
+
+// Host tests exercise real source/RR/sidecar files; compiler/form internals have
+// their own artifact tests and are injected here to make transaction faults exact.
+function fakePdfTools(hooks = {}) {
+  const calls = {compile: [], read: 0};
+  const tools = {
+    async compile(input, onProgress) {calls.compile.push(input); await hooks.compile?.(input, onProgress); return {pdf: Buffer.from('compiled'), anchors: input.entries.map((entry, index) => ({entryId: entry.id, page: 0, x: 1, y: 100 - index})), warnings: ['Host test compiler']};},
+    async create(_pdf, manifest, anchors) {assert.deepEqual(anchors.map(item => item.entryId), manifest.entries.map(item => item.id)); return Buffer.from(JSON.stringify({manifest, decisions: Object.fromEntries(manifest.entries.map(entry => [entry.id, 'pending']))}));},
+    async read(bytes) {calls.read++; await hooks.read?.(); const value = JSON.parse(Buffer.from(bytes).toString('utf8')); return {...value, pdfHash: require('node:crypto').createHash('sha256').update(bytes).digest('hex')};}
+  };
+  return {tools, calls};
+}
+async function importReady(api, item) {
+  const state = await ready(api, item);
+  await api.importPdfReview(item.request, state.revision);
+  return ready(api, item);
+}
+async function pdfFixture(hooks, entries, beforeText) {
+  const item = await fixture(beforeText, entries, true, 'tex');
+  const fake = fakePdfTools(hooks), created = service(undefined, undefined, fake.tools);
+  let state = await ready(created.api, item);
+  await created.api.generateReviewPdf(item.request, state.revision);
+  state = await importReady(created.api, item);
+  return {...item, ...created, ...fake, preview: state};
+}
+async function setAndImportPdfDecisions(item, decisions, shouldImport = true) {
+  const filename = item.request.fsPath + '.pdf', value = JSON.parse(await fs.readFile(filename, 'utf8'));
+  for (const [index, entry] of value.manifest.entries.entries()) value.decisions[entry.id] = decisions[index];
+  await fs.writeFile(filename, JSON.stringify(value));
+  if (shouldImport) await importReady(item.api, item);
+  return value;
+}
+
+test('PDF export preserves source and local statuses without implicitly importing its pending entries', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), created = service(undefined, undefined, fake.tools);
+  let state = await ready(created.api, item);
+  await created.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision);
+  state = await ready(created.api, item);
+  const source = await read(item.target), raw = await read(item.request), count = sourceWrites.length;
+  await created.api.generateReviewPdf(item.request, state.revision);
+  state = await ready(created.api, item);
+  assert.equal(await read(item.target), source); assert.equal(await read(item.request), raw); assert.equal(sourceWrites.length, count);
+  assert.equal(fake.calls.compile.length, 1); assert.equal(fake.calls.compile[0].source, source);
+  assert.equal(fake.calls.compile[0].entries.length, 1); assert.equal(fake.calls.compile[0].entries[0].index, 1);
+  assert.equal(state.pdfReview.available, true); assert.equal(state.pdfReview.imported, false); assert.equal(state.pdfReview.pending, undefined); assert.equal(state.pdfReview.canApply, false);
+  assert.equal(state.pdfReview.error, undefined, state.pdfReview.error);
+  await ready(created.api, item); assert.equal(fake.calls.read, 0, 'opening and refreshing never parse PDF bytes');
+  await created.api.importPdfReview(item.request, state.revision); assert.equal(fake.calls.read, 1, 'manual Import reads exact form bytes');
+  state = await ready(created.api, item); assert.equal(state.pdfReview.imported, true); assert.equal(state.pdfReview.pending, 1);
+  await ready(created.api, item); assert.equal(fake.calls.read, 1, 'refresh uses only the explicitly imported snapshot');
+  const artifact = JSON.parse(await fs.readFile(item.request.fsPath + '.pdf', 'utf8'));
+  assert.deepEqual(artifact.manifest.request.request.map(entry => entry.status), ['accepted', 'pending']);
+  assert.equal(artifact.manifest.entries[0].originalDecision, 'pending');
+  assert.equal((await fs.readdir(path.join(created.state.globalStorageUri.fsPath, '.codex-pdf-review'))).length, 0, 'owned compiler scratch is removed');
+});
+
+test('opening/importing PDF decisions never applies them; explicit Apply commits once and survives restart', async () => {
+  const item = await pdfFixture(); const raw = await read(item.request), count = sourceWrites.length;
+  await setAndImportPdfDecisions(item, ['accepted', 'ignored']);
+  let state = await ready(item.api, item);
+  assert.equal(state.pdfReview.accepted, 1); assert.equal(state.pdfReview.ignored, 1); assert.equal(state.pdfReview.pending, 0);
+  assert.equal(state.pdfReview.canApply, true); assert.equal(state.pdfReview.applied, false);
+  await item.api.importPdfReview(item.request, state.revision);
+  assert.equal(await read(item.target), item.before); assert.equal(await read(item.request), raw); assert.equal(sourceWrites.length, count);
+  const result = await item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+  assert.ok(result.completionPrompt); assert.equal(await read(item.target), 'ONE\ncontext\nthree\n');
+  assert.deepEqual(await statuses(item), ['accepted', 'ignored']); assert.equal(sourceWrites.length, count + 1);
+  const restarted = service(item.state, undefined, item.tools).api;
+  state = await ready(restarted, item); assert.equal(state.pdfReview.imported, false);
+  state = await importReady(restarted, item); assert.equal(state.pdfReview.applied, true); assert.equal(state.pdfReview.canApply, false);
+  assert.equal(await restarted.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), undefined);
+  assert.equal(sourceWrites.length, count + 1, 'the same applied export must never replay source writes');
+});
+
+test('partial PDF review and a changed PDF hash cannot apply source or JSON decisions', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'pending']);
+  let state = await ready(item.api, item); const raw = await read(item.request);
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), /Complete every PDF decision/);
+  await setAndImportPdfDecisions(item, ['accepted', 'ignored']); state = await ready(item.api, item);
+  await setAndImportPdfDecisions(item, ['ignored', 'accepted']);
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), /PDF changed/);
+  assert.equal(await read(item.target), item.before); assert.equal(await read(item.request), raw);
+});
+
+test('PDF identity checks reject unrelated source edits while ordinary unaffected pending review still works', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']);
+  const updated = item.before.replace('context', 'manually revised context'); await fs.writeFile(item.target.fsPath, updated);
+  let state = await ready(item.api, item);
+  assert.match(state.pdfReview.error, /original or local review decisions changed/); assert.equal(state.pdfReview.canApply, false);
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), /changed since|not been imported/);
+  assert.equal(await read(item.target), updated); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  await item.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision);
+  assert.equal(await read(item.target), updated.replace('one', 'ONE'));
+});
+
+test('local decisions and edited proposal generations cannot be overwritten by an older PDF', async () => {
+  for (const mode of ['decision', 'proposal']) {
+    const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'accepted']);
+    let state = await ready(item.api, item);
+    if (mode === 'decision') await item.api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'ignored', state.revision);
+    else await item.api.editPending(item.request, item.relative, state.files[0].hunks[0].id, 'OTHER', state.revision);
+    state = await ready(item.api, item); const raw = await read(item.request);
+    assert.ok(state.pdfReview.error); assert.equal(state.pdfReview.canApply, false);
+    await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash));
+    assert.equal(await read(item.request), raw); assert.equal(await read(item.target), item.before);
+  }
+});
+
+test('foreign and flattened PDFs fail only PDF review; source previews remain usable', async () => {
+  const item = await pdfFixture(); const original = await fs.readFile(item.request.fsPath + '.pdf');
+  const foreign = JSON.parse(original); foreign.manifest.exportId = 'another-export'; await fs.writeFile(item.request.fsPath + '.pdf', JSON.stringify(foreign));
+  let state = await ready(item.api, item); assert.equal(state.pdfReview.imported, false); assert.equal(state.error, undefined);
+  await assert.rejects(item.api.importPdfReview(item.request, state.revision), /does not match/);
+  await fs.writeFile(item.request.fsPath + '.pdf', '%PDF-1.7 flattened without review fields');
+  state = await ready(item.api, item); assert.equal(state.pdfReview.imported, false); assert.equal(state.error, undefined);
+  await assert.rejects(item.api.importPdfReview(item.request, state.revision));
+  await fs.writeFile(item.request.fsPath + '.pdf', original);
+  const unrelated = service(undefined, undefined, item.tools).api;
+  state = await ready(unrelated, item); assert.equal(state.pdfReview.imported, false);
+  await assert.rejects(unrelated.importPdfReview(item.request, state.revision), /does not match/, 'PDF embedded claims are not local export authority');
+});
+
+test('explicit regeneration confirms replacement, cancellation keeps prior file, and compilation failure preserves it', async () => {
+  let fail = false; const item = await pdfFixture({compile: () => {if (fail) throw Error('Compile failure');}});
+  await setAndImportPdfDecisions(item, ['accepted', 'ignored']); let state = await ready(item.api, item);
+  const bytes = await fs.readFile(item.request.fsPath + '.pdf'), warning = vscode.window.showWarningMessage;
+  await assert.rejects(item.api.generateReviewPdf(item.request, state.revision), /already exists/);
+  const prompts = []; vscode.window.showWarningMessage = async (...args) => {prompts.push(args); return undefined;};
+  try {
+    await item.api.generateReviewPdf(item.request, state.revision, true);
+    assert.deepEqual(await fs.readFile(item.request.fsPath + '.pdf'), bytes); assert.equal(item.calls.compile.length, 1);
+    assert.equal(prompts[0][1].modal, true); assert.equal(prompts[0][2], 'Build PDF');
+    assert.match(prompts[0][1].detail, /saved review decisions discarded/);
+    vscode.window.showWarningMessage = async () => 'Build PDF'; fail = true;
+    await assert.rejects(item.api.generateReviewPdf(item.request, state.revision, true), /Compile failure/);
+    assert.deepEqual(await fs.readFile(item.request.fsPath + '.pdf'), bytes);
+    state = await ready(item.api, item); assert.equal(state.pdfReview.canApply, true);
+    fail = false; await item.api.generateReviewPdf(item.request, state.revision, true);
+    state = await ready(item.api, item); assert.equal(state.pdfReview.imported, false);
+    state = await importReady(item.api, item); assert.equal(state.pdfReview.pending, 2); assert.equal(state.pdfReview.accepted, 0);
+  } finally {vscode.window.showWarningMessage = warning;}
+});
+
+test('generation rechecks source, request, and companion after compilation without overwriting newer work', async () => {
+  for (const mode of ['source', 'request', 'companion']) {
+    const item = await fixture(undefined, undefined, true, 'tex');
+    const fake = fakePdfTools({compile: async () => {
+      if (mode === 'source') await fs.writeFile(item.target.fsPath, item.before.replace('context', 'new context'));
+      else if (mode === 'request') await fs.appendFile(item.request.fsPath, ' ');
+      else await fs.writeFile(item.request.fsPath + '.pdf', 'new incoming PDF');
+    }}), {api} = service(undefined, undefined, fake.tools), state = await ready(api, item), count = sourceWrites.length;
+    await assert.rejects(api.generateReviewPdf(item.request, state.revision), /changed/);
+    assert.equal(sourceWrites.length, count);
+    if (mode === 'companion') assert.equal(await fs.readFile(item.request.fsPath + '.pdf', 'utf8'), 'new incoming PDF');
+    else await assert.rejects(fs.stat(item.request.fsPath + '.pdf'), {code: 'ENOENT'});
+  }
+});
+
+test('generation rejects untrusted, unsupported, dirty, conflicted, and empty requests', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), {api} = service(undefined, undefined, fake.tools);
+  let state = await ready(api, item); vscode.workspace.isTrusted = false;
+  try {await assert.rejects(api.generateReviewPdf(item.request, state.revision), /Trust/);} finally {vscode.workspace.isTrusted = true;}
+  const targetDoc = await vscode.workspace.openTextDocument(item.target); targetDoc.isDirty = true;
+  try {await assert.rejects(api.generateReviewPdf(item.request, state.revision), /[Ss]ave|unsaved/);} finally {targetDoc.isDirty = false;}
+  await fs.writeFile(item.target.fsPath, item.before.replace('one', 'conflicting'));
+  state = await ready(api, item); await assert.rejects(api.generateReviewPdf(item.request, state.revision), /conflicts/);
+  const empty = await fixture('nothing\n', [], true, 'tex'); state = await ready(api, empty);
+  await assert.rejects(api.generateReviewPdf(empty.request, state.revision), /no pending/);
+  const text = await fixture(); state = await ready(api, text); assert.equal(state.pdfReview.supported, false);
+  await assert.rejects(api.generateReviewPdf(text.request, state.revision), /LaTeX/);
+  assert.equal(fake.calls.compile.length, 0);
+});
+
+test('PDF apply uses existing source/RR recovery and its receipt prevents replay after a failed status write', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']);
+  const state = await ready(item.api, item), count = sourceWrites.length; item.requestFault.remaining = Infinity;
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), /Injected RR failure/);
+  assert.equal(await read(item.target), 'ONE\ncontext\nthree\n'); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  const restarted = service(item.state, undefined, item.tools).api, recovered = await importReady(restarted, item);
+  assert.deepEqual(await statuses(item), ['accepted', 'ignored']); assert.equal(recovered.pdfReview.applied, true);
+  await restarted.applyPdfReview(item.request, recovered.revision, recovered.pdfReview.pdfHash);
+  assert.equal(sourceWrites.length, count + 1);
+});
+
+test('failed source apply can retry without marking imported decisions applied', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']); let state = await ready(item.api, item);
+  sourceFault = {path: item.target.fsPath, when: 'before'};
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash), /Injected source failure/);
+  state = await ready(item.api, item); assert.equal(state.pdfReview.applied, false); assert.equal(state.pdfReview.canApply, true);
+  await item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+  assert.deepEqual(await statuses(item), ['accepted', 'ignored']);
+});
+
+test('applied PDF decisions cannot be changed to overwrite newer local work', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']); let state = await ready(item.api, item);
+  await item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+  await setAndImportPdfDecisions(item, ['ignored', 'accepted'], false); state = await ready(item.api, item);
+  await assert.rejects(item.api.importPdfReview(item.request, state.revision), /different decisions/); assert.equal(state.pdfReview.canApply, false);
+  const raw = await read(item.request), current = await read(item.target);
+  await assert.rejects(item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash));
+  assert.equal(await read(item.request), raw); assert.equal(await read(item.target), current);
+});
+
+test('hard-linked companion PDF cannot be read as authority or overwritten', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), {api} = service(undefined, undefined, fake.tools);
+  const victim = path.join(scratch, 'do-not-overwrite-' + serial + '.pdf'); await fs.writeFile(victim, 'precious PDF');
+  await fs.link(victim, item.request.fsPath + '.pdf'); const state = await ready(api, item);
+  assert.match(state.pdfReview.error, /regular, unlinked/);
+  await assert.rejects(api.generateReviewPdf(item.request, state.revision, true), /regular, unlinked/);
+  assert.equal(await fs.readFile(victim, 'utf8'), 'precious PDF');
+});
+
+
+test('real PDF AcroForm outcomes bind to the retained export and apply through the host transaction', async () => {
+  const {PDFDocument} = require('pdf-lib'), {createPortableReviewPdf, readPortableReviewPdf} = require('../src/portableReviewPdf.ts');
+  const item = await fixture(undefined, undefined, true, 'tex');
+  const tools = {
+    create: createPortableReviewPdf, read: readPortableReviewPdf,
+    async compile(input) {const pdf = await PDFDocument.create(); pdf.addPage([595, 842]); return {pdf: await pdf.save(), anchors: input.entries.map((entry, index) => ({entryId: entry.id, page: 0, x: 30, y: 720 - index * 80})), warnings: []};}
+  };
+  const created = service(undefined, undefined, tools); let state = await ready(created.api, item);
+  await created.api.generateReviewPdf(item.request, state.revision);
+  state = await importReady(created.api, item); assert.equal(state.pdfReview.error, undefined, state.pdfReview.error); assert.equal(state.pdfReview.pending, 2);
+  const filename = item.request.fsPath + '.pdf', doc = await PDFDocument.load(await fs.readFile(filename));
+  const groups = doc.getForm().getFields().filter(field => field.getName().startsWith('RRDecision_'));
+  assert.equal(groups.length, 2); groups[0].select('accepted'); groups[1].select('ignored'); await fs.writeFile(filename, await doc.save());
+  state = await importReady(created.api, item); assert.equal(state.pdfReview.canApply, true, state.pdfReview.error);
+  const count = sourceWrites.length; await created.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+  assert.equal(await read(item.target), 'ONE\ncontext\nthree\n'); assert.deepEqual(await statuses(item), ['accepted', 'ignored']); assert.equal(sourceWrites.length, count + 1);
+  assert.equal((await ready(created.api, item)).pdfReview.applied, true);
+});
+
+
+test('PDF export metadata and late-file failures preserve the previous companion and export authority', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']); let state = await ready(item.api, item);
+  const filename = item.request.fsPath + '.pdf', previous = await fs.readFile(filename), update = item.state.workspaceState.update;
+  const warning = vscode.window.showWarningMessage; vscode.window.showWarningMessage = async () => 'Build PDF';
+  try {
+    item.state.workspaceState.update = async (key, value) => {if (key.endsWith('pdf-export')) throw Error('Export metadata unavailable'); return update(key, value);};
+    await assert.rejects(item.api.generateReviewPdf(item.request, state.revision, true), /metadata unavailable/);
+    assert.deepEqual(await fs.readFile(filename), previous);
+    item.state.workspaceState.update = update;
+    state = await ready(item.api, item); assert.equal(state.pdfReview.canApply, true, state.pdfReview.error);
+    let replaced = false;
+    item.state.workspaceState.update = async (key, value) => {
+      await update(key, value);
+      if (key.endsWith('pdf-export') && !replaced) {replaced = true; await fs.writeFile(filename, 'new externally returned review');}
+    };
+    await assert.rejects(item.api.generateReviewPdf(item.request, state.revision, true), /companion PDF.*changed/);
+    assert.equal(await fs.readFile(filename, 'utf8'), 'new externally returned review');
+    item.state.workspaceState.update = update;
+    await fs.writeFile(filename, previous); state = await importReady(item.api, item); assert.equal(state.pdfReview.canApply, true, state.pdfReview.error);
+    assert.equal((await fs.readdir(path.dirname(filename))).some(name => name.startsWith('.codex-pdf-review-')), false);
+  } finally {item.state.workspaceState.update = update; vscode.window.showWarningMessage = warning;}
+});
+
+
+test('preview and watcher only inspect PDF metadata; explicit Import alone refreshes decisions', async () => {
+  const item = await pdfFixture(), filename = item.request.fsPath + '.pdf';
+  const originalOpen = fs.open; let pdfReads = 0;
+  fs.open = async (file, ...args) => {if (file === filename) pdfReads++; return originalOpen.call(fs, file, ...args);};
+  try {
+    let state = await ready(item.api, item); await ready(item.api, item);
+    assert.equal(pdfReads, 0);
+    await item.api.importPdfReview(item.request, state.revision); assert.equal(pdfReads, 1);
+    item.api.pdfChanged(Uri.file(filename)); state = await ready(item.api, item);
+    assert.equal(pdfReads, 1, 'a delayed watcher event never reads or discards the same imported snapshot');
+    assert.equal(state.pdfReview.imported, true);
+    await setAndImportPdfDecisions(item, ['accepted', 'ignored'], false); pdfReads = 0;
+    item.api.pdfChanged(Uri.file(filename)); state = await ready(item.api, item);
+    assert.equal(pdfReads, 0); assert.equal(state.pdfReview.imported, false); assert.equal(state.pdfReview.canApply, false);
+    assert.equal(state.pdfReview.accepted, undefined);
+    await ready(item.api, item); assert.equal(pdfReads, 0);
+    state = await importReady(item.api, item); assert.equal(pdfReads, 1); assert.equal(state.pdfReview.canApply, true);
+    await item.api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+    assert.ok(pdfReads >= 3, 'Apply rereads imported bytes and the final replacement guard');
+  } finally {fs.open = originalOpen;}
+});
+
+
+test('real compiler, portable PDF, reopen import and host Apply round-trip a grouped math example', {skip: process.env.RR_TEST_LATEX !== '1'}, async () => {
+  const {PDFDocument} = require('pdf-lib'), {readPortableReviewPdf} = require('../src/portableReviewPdf.ts');
+  const {resolveRequest} = require('../src/request.ts');
+  const source = (await fs.readFile(path.join(root, 'examples', 'multiline-demo.tex'), 'utf8'))
+    .replace('amsmath,amssymb}', 'amsmath,amssymb,host-smoke-style}');
+  const request = JSON.parse(await fs.readFile(path.join(root, 'examples', 'multiline-demo.tex.rr'), 'utf8'));
+  const item = await fixture(source, request.request, true, 'tex'), created = service();
+  const dependency = path.join(path.dirname(item.target.fsPath), 'host-smoke-style.sty');
+  const dependencyBytes = Buffer.from('\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesPackage{host-smoke-style}[2026/11/15 Host smoke]\n\\newcommand{\\hostsmokemarker}{Unchanged dependency}\n');
+  await fs.writeFile(dependency, dependencyBytes);
+  let state = await ready(created.api, item); const raw = await read(item.request), writeCount = sourceWrites.length;
+  await created.api.generateReviewPdf(item.request, state.revision);
+  const filename = item.request.fsPath + '.pdf', unreviewed = await fs.readFile(filename);
+  assert.equal(await read(item.target), source); assert.equal(await read(item.request), raw); assert.equal(sourceWrites.length, writeCount);
+  assert.deepEqual(await fs.readFile(dependency), dependencyBytes);
+  const parsed = await readPortableReviewPdf(unreviewed); assert.equal(parsed.manifest.entries.length, request.request.length);
+  assert.ok(Object.values(parsed.decisions).every(value => value === 'pending'));
+  const doc = await PDFDocument.load(unreviewed), reviewedRequest = structuredClone(parsed.manifest.request);
+  for (const entry of parsed.manifest.entries) {
+    const choice = entry.index % 3 === 1 ? 'ignored' : 'accepted';
+    doc.getForm().getRadioGroup('RRDecision_' + parsed.manifest.exportId + '_' + entry.id).select(choice);
+    reviewedRequest.request[entry.index].status = choice;
+  }
+  await fs.writeFile(filename, await doc.save());
+  const restarted = service(created.state).api; state = await importReady(restarted, item);
+  assert.equal(state.pdfReview.canApply, true, state.pdfReview.error); assert.equal(state.pdfReview.pending, 0); assert.equal(state.pdfReview.applied, false);
+  assert.equal(await read(item.target), source); assert.equal(await read(item.request), raw); assert.equal(sourceWrites.length, writeCount);
+  const expected = resolveRequest(reviewedRequest, source, source).expectedTarget;
+  const result = await restarted.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash); assert.ok(result.completionPrompt);
+  assert.deepEqual(await fs.readFile(item.target.fsPath), Buffer.from(expected, 'utf8')); assert.deepEqual(await fs.readFile(dependency), dependencyBytes);
+  assert.deepEqual(await statuses(item), reviewedRequest.request.map(entry => entry.status)); assert.equal(sourceWrites.length, writeCount + 1);
+  state = await importReady(service(created.state).api, item); assert.equal(state.pdfReview.applied, true);
+  await restarted.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash); assert.equal(sourceWrites.length, writeCount + 1);
+  await fs.writeFile(path.join(root, '.codex-test', 'last-host-pdf-smoke.json'), JSON.stringify({pdf: filename, source: item.target.fsPath,
+    request: item.request.fsPath, dependency, entries: parsed.manifest.entries.length, pages: doc.getPageCount(), warnings: state.pdfReview.warnings}, null, 2));
+  console.log('Combined host PDF smoke: ' + filename);
+});
+
+
+test('regeneration preserves a PDF replaced after the final check instead of installing over it', async () => {
+  const item = await pdfFixture(), state = await ready(item.api, item), filename = item.request.fsPath + '.pdf';
+  const originalRename = fs.rename, warning = vscode.window.showWarningMessage;
+  vscode.window.showWarningMessage = async () => 'Build PDF'; let displaced = false;
+  fs.rename = async (from, to) => {
+    if (from === filename && !displaced) {displaced = true; await fs.writeFile(filename, 'returned review at final rename');}
+    return originalRename.call(fs, from, to);
+  };
+  try {
+    await assert.rejects(item.api.generateReviewPdf(item.request, state.revision, true), /replaced during export/);
+    assert.equal(await fs.readFile(filename, 'utf8'), 'returned review at final rename');
+    assert.equal((await fs.readdir(path.dirname(filename))).some(name => name.startsWith('.codex-pdf-review-')), false, 'restored displaced PDF needs no retained backup');
+  } finally {fs.rename = originalRename; vscode.window.showWarningMessage = warning;}
+});
+
+test('regeneration keeps both PDFs if another returned file arrives after old-file displacement', async () => {
+  const item = await pdfFixture(), state = await ready(item.api, item), filename = item.request.fsPath + '.pdf';
+  const previous = await fs.readFile(filename), originalLink = fs.link, warning = vscode.window.showWarningMessage;
+  vscode.window.showWarningMessage = async () => 'Build PDF'; let raced = false;
+  fs.link = async (from, to) => {
+    if (to === filename && path.basename(from) === 'review.pdf' && !raced) {raced = true; await fs.writeFile(filename, 'new returned review after displacement');}
+    return originalLink.call(fs, from, to);
+  };
+  try {
+    await assert.rejects(item.api.generateReviewPdf(item.request, state.revision, true), /displaced PDF was kept at/);
+    assert.equal(await fs.readFile(filename, 'utf8'), 'new returned review after displacement');
+    const directories = (await fs.readdir(path.dirname(filename))).filter(name => name.startsWith('.codex-pdf-review-'));
+    assert.equal(directories.length, 1);
+    assert.deepEqual(await fs.readFile(path.join(path.dirname(filename), directories[0], 'previous.pdf')), previous, 'recognized old review remains recoverable without overwriting the new one');
+    assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  } finally {fs.link = originalLink; vscode.window.showWarningMessage = warning;}
+});
+
+
+test('desktop vscode-userdata storage compiles locally while remote storage is refused', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), saved = context();
+  saved.globalStorageUri.scheme = 'vscode-userdata'; const {api} = service(saved, undefined, fake.tools), state = await ready(api, item);
+  await api.generateReviewPdf(item.request, state.revision); assert.equal((await ready(api, item)).pdfReview.available, true);
+  const remote = await fixture(undefined, undefined, true, 'tex'), remoteContext = context(); remoteContext.globalStorageUri.scheme = 'vscode-remote';
+  const other = service(remoteContext, undefined, fake.tools).api;
+  await assert.rejects(other.generateReviewPdf(remote.request, (await ready(other, remote)).revision), /Local extension storage/);
+});
+
+
+test('hard-linked originals cannot write outside the workspace during review', async () => {
+  const item = await fixture(), {api} = service(), state = await ready(api, item);
+  const sentinel = path.join(path.dirname(scratch), 'outside-source-' + path.basename(scratch) + '.txt');
+  await fs.writeFile(sentinel, item.before);
+  await fs.unlink(item.target.fsPath); await fs.link(sentinel, item.target.fsPath);
+  const requestBefore = await read(item.request), writes = sourceWrites.length;
+  await assert.rejects(api.decide(item.request, item.relative, state.files[0].hunks[0].id, 'accepted', state.revision), /hard.link|unlinked/i);
+  assert.equal(await fs.readFile(sentinel, 'utf8'), item.before);
+  assert.equal(await read(item.request), requestBefore); assert.equal(sourceWrites.length, writes);
+});
+
+test('hard-linked requests cannot write creation metadata or decisions outside the workspace', async () => {
+  const item = await fixture(undefined, undefined, false), {api} = service();
+  const raw = await read(item.request), sentinel = path.join(path.dirname(scratch), 'outside-request-' + path.basename(scratch) + '.rr');
+  await fs.writeFile(sentinel, raw);
+  await fs.unlink(item.request.fsPath); await fs.link(sentinel, item.request.fsPath);
+  const state = await api.getState(item.request);
+  assert.match(state.error, /hard.link|unlinked/i);
+  assert.equal(await fs.readFile(sentinel, 'utf8'), raw);
+  assert.equal(await read(item.target), item.before);
+});
+
+
+test('PDF import bounds a file that grows after its size check without parsing changed bytes', async () => {
+  const item = await pdfFixture(), filename = item.request.fsPath + '.pdf', state = await ready(item.api, item);
+  const initial = await fs.readFile(filename), originalOpen = fs.open, parserCalls = item.calls.read;
+  let maxRead = 0, changed = false, closed = false;
+  fs.open = async (file, ...args) => {
+    const handle = await originalOpen.call(fs, file, ...args);
+    if (file === filename) {
+      const originalRead = handle.read.bind(handle), originalClose = handle.close.bind(handle);
+      handle.read = async (...readArgs) => {
+        maxRead = Math.max(maxRead, readArgs[2]);
+        if (!changed) {changed = true; await fs.appendFile(filename, Buffer.alloc(1024 * 1024, 32));}
+        return originalRead(...readArgs);
+      };
+      handle.close = async () => {closed = true; return originalClose();};
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(item.api.importPdfReview(item.request, state.revision), /changed while reading/);
+    assert.equal(changed, true); assert.ok(maxRead <= initial.length + 1); assert.equal(closed, true);
+    assert.equal(item.calls.read, parserCalls, 'changed bytes never reach the PDF parser');
+    assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  } finally {fs.open = originalOpen;}
+});
+
+test('PDF import rejects a path replaced after opening even if the open file remains readable', async () => {
+  const item = await pdfFixture(), filename = item.request.fsPath + '.pdf', state = await ready(item.api, item);
+  const originalOpen = fs.open, originalBytes = await fs.readFile(filename), parserCalls = item.calls.read;
+  let replaced = false;
+  fs.open = async (file, ...args) => {
+    const handle = await originalOpen.call(fs, file, ...args);
+    if (file === filename && !replaced) {
+      replaced = true;
+      await fs.rename(filename, filename + '.saved');
+      await fs.writeFile(filename, originalBytes);
+    }
+    return handle;
+  };
+  try {
+    await assert.rejects(item.api.importPdfReview(item.request, state.revision), /changed while (reading|opening)/);
+    assert.equal(replaced, true); assert.equal(item.calls.read, parserCalls);
+    assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  } finally {fs.open = originalOpen;}
+});
+
+
+test('every PDF export requires explicit local compiler consent and cancellation starts no tools', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), created = service(undefined, undefined, fake.tools);
+  const state = await ready(created.api, item), raw = await read(item.request), warning = vscode.window.showWarningMessage;
+  const prompts = []; vscode.window.showWarningMessage = async (...args) => {prompts.push(args); return undefined;};
+  try {
+    await created.api.generateReviewPdf(item.request, state.revision);
+    assert.equal(prompts.length, 1); assert.equal(prompts[0][0], 'Build this review PDF?');
+    assert.equal(prompts[0][1].modal, true); assert.equal(prompts[0][2], 'Build PDF');
+    assert.ok(prompts[0][1].detail.includes(path.basename(item.request.fsPath)));
+    assert.ok(prompts[0][1].detail.includes(item.relative));
+    assert.match(prompts[0][1].detail, /runs the proposed LaTeX using local tools/);
+    assert.equal(fake.calls.compile.length, 0); assert.equal(await read(item.target), item.before); assert.equal(await read(item.request), raw);
+    assert.equal(created.state.workspaceState.keys().some(key => key.endsWith('pdf-export')), false);
+    await assert.rejects(fs.access(item.request.fsPath + '.pdf'), {code: 'ENOENT'});
+    vscode.window.showWarningMessage = async (...args) => {prompts.push(args); return 'Build PDF';};
+    await created.api.generateReviewPdf(item.request, state.revision);
+    await created.api.generateReviewPdf(item.request, state.revision, true);
+    assert.equal(prompts.length, 3, 'confirmation is never remembered'); assert.equal(fake.calls.compile.length, 2);
+    assert.match(prompts[2][1].detail, /decisions discarded/);
+  } finally {vscode.window.showWarningMessage = warning;}
+});
+
+test('source, request, trust, and returned-PDF changes while confirmation is open never reach the compiler', async () => {
+  for (const mutation of ['source', 'request', 'trust', 'pdf']) {
+    const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), {api} = service(undefined, undefined, fake.tools);
+    const state = await ready(api, item), warning = vscode.window.showWarningMessage;
+    vscode.window.showWarningMessage = async () => {
+      if (mutation === 'source') await fs.writeFile(item.target.fsPath, 'new external source');
+      if (mutation === 'request') {const request = JSON.parse(await read(item.request)); request.request[0].after = 'changed after consent'; await fs.writeFile(item.request.fsPath, JSON.stringify(request));}
+      if (mutation === 'trust') vscode.workspace.isTrusted = false;
+      if (mutation === 'pdf') await fs.writeFile(item.request.fsPath + '.pdf', 'new returned review');
+      return 'Build PDF';
+    };
+    try {
+      await assert.rejects(api.generateReviewPdf(item.request, state.revision), /changed|no longer matches/i, mutation);
+      assert.equal(fake.calls.compile.length, 0, mutation);
+      if (mutation === 'source') assert.equal(await read(item.target), 'new external source');
+      else assert.equal(await read(item.target), item.before);
+      if (mutation === 'pdf') assert.equal(await fs.readFile(item.request.fsPath + '.pdf', 'utf8'), 'new returned review');
+    } finally {vscode.window.showWarningMessage = warning; vscode.workspace.isTrusted = true;}
+  }
+});
+
+
+test('a known PDF hash never authorizes Apply until an explicit Import in this service session', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex'), fake = fakePdfTools(), created = service(undefined, undefined, fake.tools);
+  let state = await ready(created.api, item);
+  await created.api.generateReviewPdf(item.request, state.revision);
+  const filename = item.request.fsPath + '.pdf';
+  const value = JSON.parse(await fs.readFile(filename, 'utf8'));
+  for (const entry of value.manifest.entries) value.decisions[entry.id] = 'accepted';
+  await fs.writeFile(filename, JSON.stringify(value));
+  const hash = require('node:crypto').createHash('sha256').update(await fs.readFile(filename)).digest('hex');
+  created.api.pdfChanged(Uri.file(filename));
+  state = await ready(created.api, item); await ready(created.api, item);
+  assert.equal(fake.calls.read, 0); assert.equal(state.pdfReview.available, true); assert.equal(state.pdfReview.imported, false);
+  assert.equal(state.pdfReview.accepted, undefined); assert.equal(state.pdfReview.pdfHash, undefined); assert.equal(state.pdfReview.canApply, false);
+  await assert.rejects(created.api.applyPdfReview(item.request, state.revision, hash), /not been imported/);
+  assert.equal(fake.calls.read, 0, 'an unsolicited Apply must not parse or import the PDF');
+  assert.equal(await read(item.target), item.before); assert.deepEqual(await statuses(item), ['pending', 'pending']);
+  state = await importReady(created.api, item); assert.equal(state.pdfReview.canApply, true); assert.equal(state.pdfReview.pdfHash, hash);
+  const restarted = service(created.state, undefined, fake.tools).api;
+  state = await ready(restarted, item); assert.equal(state.pdfReview.imported, false);
+  await assert.rejects(restarted.applyPdfReview(item.request, state.revision, hash), /not been imported/);
+  state = await importReady(restarted, item);
+  await restarted.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash);
+  assert.deepEqual(await statuses(item), ['accepted', 'accepted']);
+});
+
+test('a newer RR can generate a replacement PDF without importing stale PDF choices', async () => {
+  const item = await pdfFixture(); await setAndImportPdfDecisions(item, ['accepted', 'ignored']);
+  let state = await ready(item.api, item);
+  await item.api.editPending(item.request, item.relative, state.files[0].hunks[0].id, 'NEW PROPOSAL', state.revision);
+  state = await ready(item.api, item); assert.equal(state.pdfReview.imported, false); assert.equal(state.pdfReview.canApply, false);
+  const raw = await read(item.request), reads = item.calls.read;
+  await item.api.generateReviewPdf(item.request, state.revision, true);
+  state = await ready(item.api, item);
+  assert.equal(state.pdfReview.available, true); assert.equal(state.pdfReview.imported, false); assert.equal(state.pdfReview.accepted, undefined);
+  assert.equal(item.calls.read, reads, 'generation never imports the previous or newly generated form');
+  const exported = JSON.parse(await fs.readFile(item.request.fsPath + '.pdf', 'utf8'));
+  assert.equal(exported.manifest.request.request[0].after, 'NEW PROPOSAL');
+  assert.deepEqual(Object.values(exported.decisions), ['pending', 'pending']);
+  assert.equal(await read(item.request), raw); assert.equal(await read(item.target), item.before);
+});
+
+
+test('Pending all restores mixed replacements additions and deletions in one write while preserving unrelated edits', async () => {
+  const before = 'header\nold first\nold second\nkeep\ndelete me\nignore me\npending me\nfooter\n';
+  const entries = [
+    {line:2,before:'old first\nold second',after:'new first\nnew second\nnew third',status:'pending'},
+    {line:4,before:null,after:'inserted a\ninserted b',status:'pending'},
+    {line:5,before:'delete me',after:null,status:'pending'},
+    {line:6,before:'ignore me',after:'ignored proposal',status:'pending'},
+    {line:7,before:'pending me',after:'pending proposal',status:'pending'},
+  ];
+  const item = await fixture(before,entries), created = service();
+  let state = await ready(created.api,item); const ids = state.files[0].hunks.map(hunk => hunk.id);
+  for (const [index,decision] of [[0,'accepted'],[1,'accepted'],[2,'accepted'],[3,'ignored']]) {
+    await created.api.decide(item.request,item.relative,ids[index],decision,state.revision); state = await ready(created.api,item);
+  }
+  await fs.writeFile(item.target.fsPath,(await read(item.target)).replace('header\n','user header\n'));
+  state = await ready(created.api,item);
+  const writes = sourceWrites.length, revision = state.revision;
+  assert.equal(await created.api.undoFile(item.request,item.relative,revision),undefined);
+  assert.equal(sourceWrites.length,writes+1,'All approved source changes are restored by one transaction');
+  assert.equal(await read(item.target),before.replace('header\n','user header\n'));
+  assert.deepEqual(await statuses(item),entries.map(()=>'pending'));
+  assert.deepEqual(JSON.parse(await read(item.request)).request.map(entry=>entry.line),entries.map(entry=>entry.line));
+  state = await ready(service(created.state).api,item);
+  assert.equal(state.closed,false); assert.notEqual(state.revision,revision);
+  assert.deepEqual(state.files[0].hunks.map(hunk=>hunk.id),ids);
+  assert.equal(journals(created.state).length,0);
+});
+
+test('Pending all reopens ignored requests without a source write or a completion prompt and invalidates the old prompt', async () => {
+  const item=await fixture(),{api}=service(); let state=await ready(api,item); let completions=0;
+  api.setCompletionRecorder(async()=>{completions++;});
+  const completed=await api.decide(item.request,item.relative,undefined,'ignored',state.revision);
+  assert.ok(completed.completionPrompt); assert.equal(completions,1);
+  state=await ready(api,item); const writes=sourceWrites.length;
+  assert.equal(await api.undoFile(item.request,item.relative,state.revision),undefined);
+  assert.equal(sourceWrites.length,writes); assert.equal(completions,1);
+  assert.deepEqual(await statuses(item),['pending','pending']); assert.equal(await read(item.target),item.before);
+  const prompt=completed.completionPrompt;
+  await assert.rejects(api.resolveCompletion(item.request,prompt.completionId,prompt.revision,true,false),/no longer current/);
+  assert.equal((await ready(api,item)).closed,false);
+});
+
+test('Pending all rejects stale dirty untrusted and empty actions without changing either file', async () => {
+  for (const kind of ['stale','dirty-source','dirty-request','untrusted','no-reviewed','unknown-file']) {
+    const item=await fixture(),{api}=service(); let state=await ready(api,item);
+    if(kind!=='no-reviewed') {await api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision);state=await ready(api,item);}
+    let dirty;
+    if(kind.startsWith('dirty-')) {dirty=await vscode.workspace.openTextDocument(kind==='dirty-source'?item.target:item.request);dirty.isDirty=true;}
+    if(kind==='untrusted')vscode.workspace.isTrusted=false;
+    const raw=await read(item.request),source=await read(item.target),writes=sourceWrites.length;
+    try {
+      await assert.rejects(api.undoFile(item.request,kind==='unknown-file'?'outside.txt':item.relative,kind==='stale'?'obsolete':state.revision),
+        /request changed|unsaved|Save the .rr|Trust this workspace|no accepted or ignored|not part of the request/i);
+      assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);assert.equal(sourceWrites.length,writes);
+    } finally {if(dirty)dirty.isDirty=false;vscode.workspace.isTrusted=true;}
+  }
+});
+
+test('Pending all cannot partially reset a review when an accepted or ignored block has manual changes', async () => {
+  for (const blockedDecision of ['accepted','ignored']) {
+    const item=await fixture(),created=service();let state=await ready(created.api,item);
+    const ids=state.files[0].hunks.map(h=>h.id);
+    await created.api.decide(item.request,item.relative,ids[0],'accepted',state.revision);state=await ready(created.api,item);
+    await created.api.decide(item.request,item.relative,ids[1],blockedDecision,state.revision);
+    await fs.writeFile(item.target.fsPath,'ONE\ncontext\nmanual changed review\n');
+    state=await ready(created.api,item); assert.ok(state.files[0].hunks[1].undoBlocked);
+    const source=await read(item.target),raw=await read(item.request),writes=sourceWrites.length;
+    await assert.rejects(created.api.undoFile(item.request,item.relative,state.revision),/Undo is unavailable/i);
+    assert.equal(await read(item.target),source);assert.equal(await read(item.request),raw);assert.equal(sourceWrites.length,writes);
+    assert.equal(journals(created.state).length,0);
+  }
+});
+
+test('Pending all preserves an unrelated pending conflict and its manual source', async () => {
+  const item=await fixture(),{api}=service();let state=await ready(api,item);
+  await api.decide(item.request,item.relative,state.files[0].hunks[0].id,'accepted',state.revision);
+  await fs.writeFile(item.target.fsPath,'ONE\ncontext\nmanual pending replacement\n');state=await ready(api,item);
+  assert.ok(state.files[0].hunks[1].conflict);
+  await api.undoFile(item.request,item.relative,state.revision);
+  assert.equal(await read(item.target),'one\ncontext\nmanual pending replacement\n');
+  assert.deepEqual(await statuses(item),['pending','pending']);
+  assert.ok((await ready(api,item)).files[0].hunks[1].conflict);
+});
+
+test('Pending all source-write failure leaves every decision intact', async () => {
+  const item=await fixture(),created=service();let state=await ready(created.api,item);
+  await created.api.decide(item.request,item.relative,undefined,'accepted',state.revision);state=await ready(created.api,item);
+  const raw=await read(item.request),source=await read(item.target);
+  sourceFault={path:item.target.fsPath,when:'before'};
+  await assert.rejects(created.api.undoFile(item.request,item.relative,state.revision),/Injected source failure/);
+  assert.equal(await read(item.request),raw);assert.equal(await read(item.target),source);
+  assert.deepEqual(await statuses(item),['accepted','accepted']);assert.equal(journals(created.state).length,0);
+});
+
+
+test('PDF navigation finishes on the actual output PDF in the same group, a split group, or an already visible viewer', async () => {
+  for (const mode of ['current','right','left','existing','moved']) {
+    const item=await fixture(undefined,undefined,true,'tex'),{api}=service(),state=await ready(api,item);
+    const original=await read(item.target),request=await read(item.request),start=pdfCommands.length;
+    const output=Uri.file(path.join(path.dirname(item.target.fsPath),'output','master-output.pdf'));
+    const destination=mode==='left'?1:mode==='current'?2:3;
+    const target={input:new vscode.TabInputCustom(output,'latex-workshop-pdf-hook'),isActive:mode==='existing'};
+    const other={input:new vscode.TabInputCustom(Uri.file(path.join(scratch,'unrelated.rr.pdf')),'latex-workshop-pdf-hook'),isActive:true};
+    const group={viewColumn:destination,tabs:[target],activeTab:target};
+    vscode.window.tabGroups.all=[{viewColumn:4,tabs:[other],activeTab:other},...(mode==='existing'?[group]:[])];
+    settings.set('view.pdf.tab.editorGroup',mode==='left'?'left':mode==='current'?'current':'right');
+    let sawSourceAfterView=false;
+    pdfCommandHook=async command=>{
+      if(command==='latex-workshop.view'){
+        target.isActive=true;
+        if(mode!=='existing')vscode.window.tabGroups.all.push(group);
+        return 'handled';
+      }
+      if(command==='latex-workshop.synctex'){
+        assert.equal(vscode.window.activeTextEditor.document.uri.toString(),item.target.toString());
+        sawSourceAfterView=true;
+        if(mode==='current')assert.notEqual(group.activeTab,target,'Returning to TeX really hides same-group PDF');
+        if(mode==='moved')group.viewColumn=5;
+      }
+    };
+    try {
+      await api.openTargetPdf(item.request,item.relative,state.files[0].hunks[0].id,state.revision);
+      assert.ok(sawSourceAfterView);
+      const last=pdfCommands.at(-1);
+      assert.equal(last.command,'vscode.openWith');assert.equal(last.args[0].toString(),output.toString());
+      assert.deepEqual(last.args.slice(1),['latex-workshop-pdf-hook',{viewColumn:group.viewColumn,preserveFocus:false,preview:false}]);
+      assert.equal(vscode.window.tabGroups.activeTabGroup.activeTab,target);
+      assert.equal(vscode.window.activeTextEditor,undefined);
+      assert.equal(pdfCommands.slice(start).some(item=>item.command.includes('build')),false);
+      assert.equal(await read(item.target),original);assert.equal(await read(item.request),request);
+    } finally {
+      pdfCommandHook=undefined;settings.delete('view.pdf.tab.editorGroup');vscode.window.tabGroups.all=[];
+    }
+  }
+});
+
+test('PDF navigation does not guess among unrelated PDFs or reopen a viewer closed during forwarding', async () => {
+  for(const kind of ['ambiguous','missing','closed']){
+    const item=await fixture(undefined,undefined,true,'tex'),{api}=service(),state=await ready(api,item),start=pdfCommands.length;
+    const tabs=[1,4].map(n=>{const tab={input:new vscode.TabInputCustom(Uri.file(path.join(scratch,'unrelated-'+n+'.pdf')),'latex-workshop-pdf-hook'),isActive:true};return {viewColumn:n,tabs:[tab],activeTab:tab};});
+    vscode.window.tabGroups.all=kind==='missing'?[]:[...tabs];settings.set('view.pdf.tab.editorGroup','right');
+    pdfCommandHook=async command=>{
+      if(command==='latex-workshop.view'){
+        if(kind==='closed'){
+          const tab={input:new vscode.TabInputCustom(Uri.file(path.join(scratch,'original-output.pdf')),'latex-workshop-pdf-hook'),isActive:true};
+          vscode.window.tabGroups.all.push({viewColumn:3,tabs:[tab],activeTab:tab});
+        }
+        return 'handled';
+      }
+      if(command==='latex-workshop.synctex'&&kind==='closed')vscode.window.tabGroups.all=tabs;
+    };
+    try{
+      await assert.rejects(api.openTargetPdf(item.request,item.relative,state.files[0].hunks[0].id,state.revision),/Could not identify|tab changed or closed/);
+      assert.equal(pdfCommands.slice(start).some(item=>item.command==='vscode.openWith'),false);
+    }finally{pdfCommandHook=undefined;settings.delete('view.pdf.tab.editorGroup');vscode.window.tabGroups.all=[];}
+  }
+});
+
+test('PDF navigation preserves browser and external viewer preferences without switching an unrelated VS Code PDF', async () => {
+  for(const mode of ['browser','external']){
+    const item=await fixture(undefined,undefined,true,'tex'),{api}=service(),state=await ready(api,item),start=pdfCommands.length;
+    settings.set('view.pdf.viewer',mode);pdfCommandHook=async()=> 'handled';
+    try{
+      await api.openTargetPdf(item.request,item.relative,state.files[0].hunks[0].id,state.revision);
+      assert.deepEqual(pdfCommands.slice(start).map(item=>item.command),['latex-workshop.view','latex-workshop.synctex']);
+    }finally{settings.delete('view.pdf.viewer');pdfCommandHook=undefined;vscode.window.tabGroups.all=[];}
+  }
+});
+
+function pdfProgressGate() {
+  let resolve; const promise = new Promise(done => {resolve = done;}); return {promise, resolve};
+}
+
+test('PDF progress spans confirmation and deferred compiler passes with one stable start time', async () => {
+  const item = await fixture(undefined, undefined, true, 'tex');
+  const prompted = pdfProgressGate(), consent = pdfProgressGate(), compiling = pdfProgressGate(), finishCompile = pdfProgressGate();
+  let compilerReport;
+  const fake = fakePdfTools({compile: async (_input, report) => {
+    compilerReport = report;
+    report({stage: 'diffing', message: 'Generating comparison…'});
+    report({stage: 'compiling', message: 'Compiling PDF — pass 1 of 3…'});
+    compiling.resolve();
+    await finishCompile.promise;
+  }});
+  const {api} = service(undefined, undefined, fake.tools), state = await ready(api, item), events = [];
+  api.onDidChangePdfGeneration(event => events.push({kind: 'progress', ...event}));
+  api.onDidFinishPdfGeneration(event => events.push({kind: 'result', ...event}));
+  let refreshes = 0; api.onDidChange(() => {refreshes++;});
+  const warning = vscode.window.showWarningMessage;
+  vscode.window.showWarningMessage = async () => {prompted.resolve(); return consent.promise;};
+  try {
+    const pending = api.generateReviewPdf(item.request, state.revision);
+    await prompted.promise;
+    const first = api.getPdfGenerationProgress(item.request);
+    assert.equal(first.stage, 'confirming'); assert.equal(api.busy, true);
+    assert.ok(Number.isFinite(first.startedAt)); assert.ok(first.startedAt <= Date.now());
+    assert.equal(api.getPdfGenerationProgress(Uri.file(item.request.fsPath + '.other')), undefined);
+    first.message = 'mutated copy';
+    assert.notEqual(api.getPdfGenerationProgress(item.request).message, first.message);
+    consent.resolve('Build PDF'); await compiling.promise;
+    const compilingState = api.getPdfGenerationProgress(item.request), previousRefreshes = refreshes;
+    assert.match(compilingState.message, /pass 1/); assert.equal(compilingState.startedAt, first.startedAt);
+    compilerReport({stage: 'compiling', message: 'Compiling PDF — pass 2 of 3…'});
+    assert.match(api.getPdfGenerationProgress(item.request).message, /pass 2/);
+    assert.equal(refreshes, previousRefreshes, 'compiler stages do not trigger full review refreshes');
+    finishCompile.resolve(); await pending;
+    assert.equal(api.busy, false); assert.equal(api.getPdfGenerationProgress(item.request), undefined);
+    assert.ok(events.filter(event => event.progress).every(event => event.uri.toString() === item.request.toString() && event.progress.startedAt === first.startedAt));
+    assert.deepEqual(events.filter(event => event.progress).slice(-2).map(event => event.progress.stage), ['annotating', 'saving']);
+    assert.equal(events.at(-2).progress, null); assert.equal(events.at(-1).outcome, 'created');
+    assert.equal(await read(item.target), item.before);
+  } finally {consent.resolve('Build PDF'); finishCompile.resolve(); vscode.window.showWarningMessage = warning;}
+});
+
+for (const outcome of ['cancelled', 'compile failure', 'stale request']) test('PDF progress clears after ' + outcome, async () => {
+  const item = await fixture(undefined, undefined, true, 'tex');
+  const fake = fakePdfTools({compile: async () => {if (outcome === 'compile failure') throw Error('Progress compile failure');}});
+  const {api} = service(undefined, undefined, fake.tools), state = await ready(api, item), events = [];
+  api.onDidChangePdfGeneration(event => events.push({kind: 'progress', ...event}));
+  api.onDidFinishPdfGeneration(event => events.push({kind: 'result', ...event}));
+  const warning = vscode.window.showWarningMessage;
+  if (outcome === 'cancelled') vscode.window.showWarningMessage = async () => undefined;
+  try {
+    const action = api.generateReviewPdf(item.request, outcome === 'stale request' ? 'outdated' : state.revision);
+    if (outcome === 'cancelled') await action;
+    else await assert.rejects(action, outcome === 'compile failure' ? /Progress compile failure/ : /request changed/);
+    assert.equal(api.getPdfGenerationProgress(item.request), undefined); assert.equal(api.busy, false);
+    assert.equal(events.at(-2).progress, null);
+    assert.equal(events.at(-1).outcome, outcome === 'cancelled' ? 'cancelled' : 'failed');
+    if (outcome !== 'cancelled') assert.match(events.at(-1).error, outcome === 'compile failure' ? /Progress compile failure/ : /request changed/);
+    if (outcome !== 'compile failure') assert.equal(fake.calls.compile.length, 0);
+    await assert.rejects(fs.access(item.request.fsPath + '.pdf'), {code: 'ENOENT'});
+  } finally {vscode.window.showWarningMessage = warning;}
 });

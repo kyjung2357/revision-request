@@ -271,3 +271,116 @@ test('Git baseline recording failure preserves a request edited after creation',
   assert.equal(await fs.readFile(item.output.fsPath,'utf8'),'USER EDITED REQUEST\n');
   assert.equal(await fs.readFile(item.original.fsPath,'utf8'),item.after);
 });
+
+
+test('PDF option starts off and only native workspace LaTeX selections enable it',async t=>{
+  const item=await fixture(),{panel}=await open(t);
+  assert.match(panel.webview.html,/<input id="generate-pdf" type="checkbox" disabled aria-describedby="pdf-hint">/);
+  assert.equal(state(panel).pdfSupported,false);assert.equal(state(panel).generatePdf,false);
+  await send(panel,{command:'setGeneratePdf',value:true});
+  assert.equal(state(panel).generatePdf,false);
+  for(const extension of ['TEX','ltx','latex','py','md','tex.rr']){
+    const original=Uri.file(path.join(current.workspace,'original.'+extension));
+    await fs.writeFile(original.fsPath,item.before);
+    current.picks.push([original]);await send(panel,'selectOriginal');
+    const supported=['TEX','ltx','latex'].includes(extension);
+    assert.equal(state(panel).pdfSupported,supported,extension);
+    assert.equal(state(panel).generatePdf,false);
+    await send(panel,{command:'setGeneratePdf',value:true});
+    assert.equal(state(panel).generatePdf,supported,extension);
+  }
+  await absent(item);await unchanged(item);
+});
+
+test('PDF option uses only boolean native state and is passed once into creation',async t=>{
+  const item=await fixture(),{panel,result}=await open(t);await choose(panel,item);
+  for(const value of ['true',1,null,{},undefined]){
+    await send(panel,{command:'setGeneratePdf',value});assert.equal(state(panel).generatePdf,false);
+  }
+  await send(panel,{command:'setGeneratePdf',value:true,original:item.original.fsPath});
+  assert.equal(state(panel).generatePdf,false);
+  await send(panel,{command:'setGeneratePdf',value:true});assert.equal(state(panel).generatePdf,true);
+  await send(panel,{command:'setGeneratePdf',value:false});assert.equal(state(panel).generatePdf,false);
+  await send(panel,{command:'setGeneratePdf',value:true});
+  await send(panel,{command:'create',generatePdf:false});
+  assert.equal((await result).toString(),item.output.toString());
+  assert.equal(current.createCalls.length,1);assert.equal(current.createCalls[0][4],true);
+  await assert.rejects(fs.lstat(item.output.fsPath+'.pdf'),{code:'ENOENT'});
+  await unchanged(item);
+});
+
+test('PDF selection survives picker cancellation and modified-copy selection but resets with a new original',async t=>{
+  const item=await fixture(),{panel}=await open(t);await choose(panel,item);
+  await send(panel,{command:'setGeneratePdf',value:true});
+  current.picks.push(undefined);await send(panel,'selectOriginal');assert.equal(state(panel).generatePdf,true);
+  current.quickPicks.push(undefined);await send(panel,'selectOriginal');assert.equal(state(panel).generatePdf,true);
+  current.picks.push([item.proposed]);await send(panel,'selectProposed');assert.equal(state(panel).generatePdf,true);
+  const other=Uri.file(path.join(current.workspace,'second.tex'));await fs.writeFile(other.fsPath,item.before);
+  current.picks.push([other]);await send(panel,'selectOriginal');
+  assert.equal(state(panel).pdfSupported,true);assert.equal(state(panel).generatePdf,false);
+});
+
+test('Git baseline cannot enable PDF even if its filename is LaTeX or messages spoof support',async t=>{
+  const item=await gitFixture(),{panel}=await open(t);
+  current.picks.push([item.original]);await send(panel,'selectOriginal');
+  await send(panel,{command:'setGeneratePdf',value:true});assert.equal(state(panel).generatePdf,true);
+  await chooseGit(panel,item);
+  assert.equal(state(panel).pdfSupported,false);assert.equal(state(panel).generatePdf,false);
+  await send(panel,{command:'setGeneratePdf',value:true,pdfSupported:true});
+  await send(panel,{command:'setGeneratePdf',value:true});
+  assert.equal(state(panel).generatePdf,false);
+  await send(panel,{command:'create',generatePdf:true});assert.equal(current.createCalls[0][4],false);
+});
+
+test('PDF option cannot change while selecting or creating',async t=>{
+  const item=await fixture(),gate=deferred();
+  const {panel,result}=await open(t,async()=>{await gate.promise;return item.output;});await choose(panel,item);
+  await send(panel,{command:'setGeneratePdf',value:true});
+  const picker=deferred();current.picks.push(picker.promise);
+  const selecting=send(panel,'selectProposed');await tick();assert.equal(state(panel).selecting,true);
+  await send(panel,{command:'setGeneratePdf',value:false});picker.resolve(undefined);await selecting;
+  assert.equal(state(panel).generatePdf,true);
+  const creating=send(panel,'create');await tick();assert.equal(state(panel).busy,true);
+  await send(panel,{command:'setGeneratePdf',value:false});
+  assert.equal(current.createCalls[0][4],true);assert.equal(state(panel).generatePdf,true);
+  gate.resolve();await creating;await result;
+});
+
+test('create form client renders PDF disabled state and sends only explicit checkbox choices',async()=>{
+  const vm=require('node:vm'),elements=new Map(),messages=[],windowListeners=new Map();
+  const element=id=>{if(!elements.has(id))elements.set(id,{textContent:'',disabled:false,checked:false,hidden:false,listeners:new Map(),
+    classList:{toggle(name,value){this[name]=value;}},addEventListener(type,callback){this.listeners.set(type,callback);}});return elements.get(id);};
+  vm.runInNewContext(await fs.readFile(path.join(root,'media/create-request.js'),'utf8'),{
+    acquireVsCodeApi:()=>({postMessage:value=>messages.push(JSON.parse(JSON.stringify(value)))}),
+    document:{getElementById:element,addEventListener(){}},window:{addEventListener:(name,callback)=>windowListeners.set(name,callback)},
+  });
+  const render=data=>windowListeners.get('message')({data:{type:'state',...data}});
+  assert.deepEqual(messages,[{command:'ready'}]);
+  render({pdfSupported:false,generatePdf:false});
+  assert.equal(element('generate-pdf').disabled,true);assert.equal(element('pdf-option').classList.disabled,true);
+  render({original:'paper.tex',pdfSupported:true,generatePdf:false});
+  assert.equal(element('generate-pdf').disabled,false);assert.equal(element('pdf-option').classList.disabled,false);
+  element('generate-pdf').checked=true;element('generate-pdf').listeners.get('change')();
+  assert.deepEqual(messages.at(-1),{command:'setGeneratePdf',value:true});
+  render({original:'paper.tex',pdfSupported:true,generatePdf:true,busy:true});
+  const sent=messages.length;element('generate-pdf').listeners.get('change')();assert.equal(messages.length,sent);
+  render({original:'paper.tex',originalMode:'git',pdfSupported:false,generatePdf:true});
+  assert.equal(element('generate-pdf').disabled,true);assert.equal(element('generate-pdf').checked,false);
+  assert.match(element('pdf-hint').textContent,/saved workspace original/);
+});
+
+
+for(const requested of [false,true])test('create command returns '+(requested?'the checked PDF option':'no PDF option by default')+' after releasing creation',async t=>{
+  const item=await fixture();let inExclusive=false,released=false;
+  const result=createRequestFromFiles(Uri.file(root),async action=>{
+    inExclusive=true;try{return await action();}finally{inExclusive=false;released=true;}
+  });await tick();
+  const panel=current.panels.at(-1);t.after(()=>panel.dispose());await send(panel,'ready');await choose(panel,item);
+  if(requested)await send(panel,{command:'setGeneratePdf',value:true});
+  await send(panel,'create');const created=await result;
+  assert.equal(created.uri.toString(),item.output.toString());assert.equal(created.fromGit,false);
+  assert.equal(released,true);assert.equal(inExclusive,false);
+  if(requested)assert.equal(created.generatePdf,true);else assert.equal(Object.hasOwn(created,'generatePdf'),false);
+  assert.ok((JSON.parse(await fs.readFile(item.output.fsPath,'utf8'))).request.every(entry=>entry.status==='pending'));
+  await assert.rejects(fs.lstat(item.output.fsPath+'.pdf'),{code:'ENOENT'});await unchanged(item);
+});

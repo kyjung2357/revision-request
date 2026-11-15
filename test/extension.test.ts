@@ -9,6 +9,10 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { BridgeMethod, McpStatus } from '../src/mcpTypes';
 import { createRequestFromSnapshots } from '../src/createRequest';
 import type { McpDiagnosticReport } from '../src/mcpDiagnostics';
+import { PDFDocument } from 'pdf-lib';
+import { readPortableReviewPdf } from '../src/portableReviewPdf';
+import { resolveRequest } from '../src/request';
+import type { PdfReviewState } from '../src/pdfReviewTypes';
 
 interface ExtensionApi {
   getReadyCount(): number;
@@ -23,6 +27,10 @@ interface ExtensionApi {
     decision: 'accepted' | 'ignored', revision: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
   resolveCompletion(uri: vscode.Uri, completionId: string, revision: string, deleteRequest: boolean, rememberChoice: boolean): Promise<{deleted: boolean}>;
   deleteRequest(uri: vscode.Uri): Promise<void>;
+  generateReviewPdf(uri: vscode.Uri, revision: string, replace?: boolean): Promise<void>;
+  testConfirmNextPdfBuild(): void;
+  importPdfReview(uri: vscode.Uri, revision: string): Promise<PdfReviewState>;
+  applyPdfReview(uri: vscode.Uri, revision: string, pdfHash: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
   undo(uri: vscode.Uri, file: string, hunk: string, revision: string): Promise<void>;
   editPending(uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string): Promise<{changed: boolean; revision: string}>;
 }
@@ -254,12 +262,17 @@ export async function run(): Promise<void> {
     const state = await ready(item);
     const intervening = Buffer.from('user edit after proposal\n');
     await vscode.workspace.fs.writeFile(item.target, intervening);
-    await assert.rejects(api.decide(item.request, item.relative, undefined, 'accepted', state.revision),
-      /original has changed/i);
+    const originalRequest = await bytes(item.request);
+    await assert.rejects(api.decide(item.request, item.relative, undefined, 'accepted', state.revision), /request changed/i);
     assert.deepEqual(await bytes(item.target), intervening);
     const blocked = await api.getState(item.request);
-    assert.match(blocked.files[0]!.issue ?? '', /original has changed/i);
+    assert.notEqual(blocked.revision, state.revision, 'Source tracking invalidates stale action revisions.');
+    assert.equal(blocked.rawRevision, state.rawRevision, 'External source edits do not rewrite the request.');
+    assert.equal(blocked.files[0]!.issue, undefined, 'The source conflict belongs to this pending block.');
+    assert.match(blocked.files[0]!.hunks[0]!.conflict ?? '', /changed inside this pending block/i);
     assert.equal(blocked.files[0]!.hunks[0]!.decision, 'pending');
+    await assert.rejects(api.decide(item.request, item.relative, undefined, 'accepted', blocked.revision), /changed inside this pending block/i);
+    assert.deepEqual(await bytes(item.target), intervening); assert.deepEqual(await bytes(item.request), originalRequest);
   });
 
   await check('A dirty unsaved target editor is refused and its disk content stays unchanged', async () => {
@@ -328,7 +341,9 @@ export async function run(): Promise<void> {
         const document = await vscode.workspace.openTextDocument(item.request);
         let state = await ready(item);
         const savedHash = createHash('sha256').update(savedText.replace(/^\uFEFF/, '')).digest('hex');
-        assert.equal(state.revision, savedHash, 'Revision must hash saved JSON, excluding only its optional BOM.');
+        assert.equal(state.rawRevision, savedHash, 'Raw revision must hash saved JSON, excluding only its optional BOM.');
+        assert.notEqual(state.revision, state.rawRevision, 'Decision revision also binds the tracked source.');
+        assert.equal((await ready(item)).revision, state.revision, 'An unchanged tracked source retains a stable action revision.');
         if (style === 'mixed') {
           assert.notEqual(createHash('sha256').update(document.getText()).digest('hex'), savedHash,
             'This fixture must reproduce the actual mixed-EOL text-model mismatch.');
@@ -479,7 +494,11 @@ export async function run(): Promise<void> {
       }
     }
     await vscode.workspace.fs.writeFile(item.target, Buffer.from('external edit\n'));
-    await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', state.revision), /original has changed/i);
+    await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', state.revision), /request changed/i);
+    const conflicting = await ready(item);
+    assert.notEqual(conflicting.revision, state.revision); assert.equal(conflicting.rawRevision, state.rawRevision);
+    assert.match(conflicting.files[0]!.hunks[0]!.conflict ?? '', /changed inside this pending block/i);
+    await assert.rejects(api.editPending(item.request, item.relative, hunk.id, 'edited\n', conflicting.revision), /changed inside this pending block/i);
     assert.deepEqual(await bytes(item.request), requestBytes);
     assert.deepEqual(await bytes(item.target), Buffer.from('external edit\n'));
     await vscode.workspace.fs.writeFile(item.target, Buffer.from(item.before));
@@ -1169,7 +1188,10 @@ export async function run(): Promise<void> {
     await api.decide(stale.request, stale.relative, staleHunk.id, 'accepted', await latestRevision(stale.request));
     const userText = Buffer.from('independent user edit\n');
     await vscode.workspace.fs.writeFile(stale.target, userText);
-    await assert.rejects(api.undo(stale.request, stale.relative, staleHunk.id, await latestRevision(stale.request)), /original has changed/i);
+    const changedSource = await ready(stale);
+    assert.equal(changedSource.files[0]!.hunks[0]!.decision, 'accepted');
+    assert.match(changedSource.files[0]!.hunks[0]!.undoBlocked ?? '', /edited directly.*Undo is unavailable/i);
+    await assert.rejects(api.undo(stale.request, stale.relative, staleHunk.id, changedSource.revision), {message: changedSource.files[0]!.hunks[0]!.undoBlocked});
     assert.deepEqual(await bytes(stale.target), userText);
     assert.equal((await api.getState(stale.request)).files[0]!.hunks[0]!.decision, 'accepted');
 
@@ -1480,7 +1502,12 @@ export async function run(): Promise<void> {
         const afterAccepted = Buffer.from('FIRST\ncontext\nlast\n'); assert.deepEqual(await bytes(item.target), afterAccepted);
         const partial = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
         assert.equal(partial.accepted, 1); assert.equal(partial.pending, 1);
-        await api.decide(made.request, item.relative, made.status.hunks[1]!.id, 'ignored', await latestRevision(made.request));
+        const completion = (await api.decide(made.request, item.relative, made.status.hunks[1]!.id, 'ignored', await latestRevision(made.request)))?.completionPrompt;
+        assert.ok(completion, 'The final individual decision waits for the user to confirm request deletion.');
+        const beforeCleanup = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
+        assert.equal(beforeCleanup.status, 'completed'); assert.equal(beforeCleanup.cleanup, 'retained');
+        await vscode.workspace.fs.stat(made.request); assert.deepEqual(await bytes(item.target), afterAccepted);
+        await api.resolveCompletion(made.request, completion.completionId, completion.revision, true, false);
         const complete = await tool<McpStatus>(client, 'rr_get_request_status', {requestId: made.status.requestId});
         assert.equal(complete.status, 'completed'); assert.equal(complete.cleanup, 'deleted');
         assert.equal(complete.accepted, 1); assert.equal(complete.ignored, 1); assert.equal(complete.pending, 0);
@@ -1554,6 +1581,58 @@ export async function run(): Promise<void> {
         assert.ok((await api.getState(made.request)).files[0]!.hunks.every(hunk => hunk.decision === 'pending'));
       });
     } finally { release?.(); await agentConfig.update('mcp.allowAgentDecisions', previous, vscode.ConfigurationTarget.Global); }
+  });
+  if (process.env.RR_TEST_LATEX === '1') await check('Bundled PDF compiler, portable form, explicit import and Apply preserve source until approval', async () => {
+    assert.equal(typeof api.generateReviewPdf, 'function');
+    assert.equal(typeof api.importPdfReview, 'function');
+    assert.equal(typeof api.applyPdfReview, 'function');
+    const source = (await fs.readFile(path.join(extension.extensionPath, 'examples', 'multiline-demo.tex'), 'utf8'))
+      .replace('amsmath,amssymb}', 'amsmath,amssymb,pdf-host-smoke}');
+    const sample = JSON.parse(await fs.readFile(path.join(extension.extensionPath, 'examples', 'multiline-demo.tex.rr'), 'utf8'));
+    const item = await fixture('portable-pdf-smoke', source, source);
+    await vscode.workspace.fs.writeFile(item.request, Buffer.from(JSON.stringify({...sample, path: item.relative}, null, 2)));
+    const dependency = vscode.Uri.joinPath(workspace, 'pdf-host-smoke.sty');
+    const dependencyBytes = Buffer.from('\\NeedsTeXFormat{LaTeX2e}\n\\ProvidesPackage{pdf-host-smoke}[2026/11/15 Bundled smoke]\n\\newcommand{\\pdfhostsmoke}{Unchanged dependency}\n');
+    await vscode.workspace.fs.writeFile(dependency, dependencyBytes);
+    let state = await ready(item); const sourceBytes = await bytes(item.target), requestBytes = await bytes(item.request);
+    api.testConfirmNextPdfBuild();
+    await api.generateReviewPdf(item.request, state.revision);
+    assert.deepEqual(await bytes(item.target), sourceBytes); assert.deepEqual(await bytes(item.request), requestBytes);
+    assert.deepEqual(await bytes(dependency), dependencyBytes);
+    const companion = vscode.Uri.file(item.request.fsPath + '.pdf'), exported = await readPortableReviewPdf(await bytes(companion));
+    assert.equal(exported.manifest.entries.length, sample.request.length); assert.equal(exported.manifest.entries.length, 12);
+    assert.ok(Object.values(exported.decisions).every(value => value === 'pending'));
+    state = await ready(item); assert.equal(state.pdfReview?.available, true); assert.equal(state.pdfReview.imported, false);
+    assert.equal(state.pdfReview.pending, undefined); assert.equal(state.pdfReview.canApply, false);
+    await assert.rejects(api.applyPdfReview(item.request, state.revision, exported.pdfHash), /[Ii]mport/);
+    await api.importPdfReview(item.request, state.revision);
+    state = await ready(item); assert.equal(state.pdfReview?.pending, 12); assert.equal(state.pdfReview.imported, true); assert.equal(state.pdfReview.error, undefined);
+    const doc = await PDFDocument.load(await bytes(companion)), reviewed = structuredClone(exported.manifest.request);
+    for (const entry of exported.manifest.entries) {
+      const decision = entry.index % 3 === 1 ? 'ignored' : 'accepted';
+      doc.getForm().getRadioGroup('RRDecision_' + exported.manifest.exportId + '_' + entry.id).select(decision);
+      reviewed.request[entry.index]!.status = decision;
+    }
+    await vscode.workspace.fs.writeFile(companion, await doc.save());
+    await vscode.commands.executeCommand('revisionRequest.openPreview', item.request);
+    state = await ready(item); assert.equal(state.pdfReview?.imported, false); assert.equal(state.pdfReview.pending, undefined);
+    assert.equal(state.pdfReview.canApply, false);
+    await api.importPdfReview(item.request, state.revision);
+    state = await ready(item); assert.equal(state.pdfReview?.imported, true); assert.equal(state.pdfReview.canApply, true, state.pdfReview.error); assert.equal(state.pdfReview.pending, 0);
+    assert.equal(state.pdfReview.accepted, 8); assert.equal(state.pdfReview.ignored, 4); assert.equal(state.pdfReview.applied, false);
+    assert.deepEqual(await bytes(item.target), sourceBytes); assert.deepEqual(await bytes(item.request), requestBytes);
+    const expected = resolveRequest(reviewed, source, source).expectedTarget;
+    const applied = await api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash!); assert.ok(applied?.completionPrompt);
+    assert.deepEqual(await bytes(item.target), Buffer.from(expected, 'utf8')); assert.deepEqual(await bytes(dependency), dependencyBytes);
+    const stored = JSON.parse((await bytes(item.request)).toString('utf8'));
+    assert.deepEqual(stored.request.map((entry: {status: string}) => entry.status), reviewed.request.map(entry => entry.status));
+    state = await ready(item); assert.equal(state.pdfReview?.applied, true); assert.equal(state.pdfReview.canApply, false);
+    const after = await bytes(item.target), saved = await bytes(item.request);
+    assert.equal(await api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash!), undefined);
+    assert.deepEqual(await bytes(item.target), after); assert.deepEqual(await bytes(item.request), saved);
+    await fs.writeFile(path.join(workspace.fsPath, 'pdf-smoke.json'), JSON.stringify({pdf: companion.fsPath,
+      source: item.target.fsPath, request: item.request.fsPath, dependency: dependency.fsPath, entries: 12, accepted: 8, ignored: 4,
+      pages: doc.getPageCount(), warnings: state.pdfReview.warnings}, null, 2));
   });
   const result = {
     vscodeVersion: vscode.version,

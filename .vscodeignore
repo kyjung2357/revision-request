@@ -8,6 +8,7 @@
 !language-configuration.json
 !syntaxes/**
 !dist/mcp-server.cjs
+!dist/pdf-review-worker.cjs
 !dist/review-highlight.js
 !LICENSE
 !THIRD_PARTY_NOTICES.txt

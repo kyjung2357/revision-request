@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
+import {constants as fsConstants, type BigIntStats} from 'node:fs';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import { computeHunks, computeFileInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
 import { getReviewHtml, getReviewRestoreErrorHtml } from './webview';
+import { captureLatexPdfView, resolveLatexPdfView, focusLatexPdfView } from './latexNavigation';
 import { createTrackedReview, rebaseTrackedReview, reconfigureTrackedReview, transitionTrackedReview, projectTrackedReview, validateTrackedReview, type TrackedReview } from './reviewRebase';
 import { parseRequestDocument, proposalIdentity, resolveRequest, patchRequestStatuses, editPendingRequest, ensureRequestTime, type RevisionRequest } from './request';
 import { McpHost } from './mcpHost';
@@ -14,6 +16,28 @@ import { createRequestFromFiles } from './createRequestCommand';
 import { readGitOriginal, validateGitOriginalTarget, type GitOriginal } from './gitOriginal';
 import { collectMcpDiagnostics, formatMcpDiagnostics } from './mcpDiagnostics';
 import { applyReviewAction, getReviewActions, type ReviewAction, type ReviewActionInput } from './reviewActions';
+import type {CompiledReviewPdf, ImportedPdfReview, LatexReviewPdfInput, PdfReviewAnchor, PdfReviewManifest, PdfReviewState, PdfGenerationProgress, PdfGenerationResult, PdfCompilationProgressReporter} from './pdfReviewTypes';
+
+export interface PdfReviewTools {
+  compile(input: LatexReviewPdfInput, onProgress?: PdfCompilationProgressReporter): Promise<CompiledReviewPdf>;
+  create(pdf: Uint8Array, manifest: PdfReviewManifest, anchors: PdfReviewAnchor[]): Promise<Uint8Array>;
+  read(bytes: Uint8Array): Promise<ImportedPdfReview>;
+}
+const pdfReviewTools: PdfReviewTools = {
+  compile: async (input, onProgress) => (require('./latexReviewPdf') as typeof import('./latexReviewPdf')).generateLatexReviewPdf(input, onProgress),
+  create: async (pdf, manifest, anchors) => (require('./portableReviewPdf') as typeof import('./portableReviewPdf')).createPortableReviewPdf(pdf, manifest, anchors),
+  read: async bytes => (require('./portableReviewPdf') as typeof import('./portableReviewPdf')).readPortableReviewPdf(bytes),
+};
+async function confirmPdfBuild(requestName: string, targetPath: string, replacing: boolean): Promise<boolean> {
+  const detail = 'Request: ' + requestName + '\nSource: ' + targetPath + '\n\n' +
+    'This runs the proposed LaTeX using local tools. Only continue if you trust the source and proposed changes.' +
+    (replacing ? '\n\nThe existing review PDF will be replaced and its saved review decisions discarded.' : '');
+  return await vscode.window.showWarningMessage('Build this review PDF?', {modal: true, detail}, 'Build PDF') === 'Build PDF';
+}
+interface PdfExportRecord {
+  manifest: PdfReviewManifest; generation: string; warnings: string[];
+  application?: {decisions: Record<string, Decision>; sourceHash: string; requestHash: string};
+}
 
 const VIEW = 'revisionRequest.review';
 type Decisions = Record<string, Decision>;
@@ -49,7 +73,7 @@ export interface ReviewState {
   highlightChangedLines: boolean; showOnlyChangedText: boolean; defaultLayout: 'unified' | 'sideBySide'; error?: string;
   acceptShortcut: 'ctrlEnter' | 'altEnter' | 'tab' | 'shiftTab' | 'none';
   requestIdentity?: string; verified: boolean;
-  verificationIssue?: string; verifiedTargetHash?: string; closed?: boolean;
+  verificationIssue?: string; verifiedTargetHash?: string; closed?: boolean; pdfReview?: PdfReviewState;
 }
 const failure = (error: unknown) => error instanceof Error ? error.message : String(error);
 const keyFor = (file: string, hunk: string) => file + ':' + hunk;
@@ -68,15 +92,58 @@ function decode(bytes: Uint8Array): string {
   } catch { throw new Error('Only UTF-8 text files are supported.'); }
 }
 
+const MAX_REVIEW_PDF_BYTES = 50 * 1024 * 1024;
+const pdfStamp = (stat: BigIntStats) => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].join(':');
+function checkPdfFile(stat: BigIntStats) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) throw new Error('The companion PDF must be a regular, unlinked file.');
+  if (stat.size > BigInt(MAX_REVIEW_PDF_BYTES)) throw new Error('The review PDF exceeds the 50 MiB size limit.');
+}
+async function readBoundedPdf(filename: string, expected?: BigIntStats): Promise<Buffer> {
+  const before = expected ?? await fs.lstat(filename, {bigint: true});
+  checkPdfFile(before);
+  // Never follow a substituted symlink, allocate from a growing file, or trust
+  // metadata from a different inode than the one whose bytes were imported.
+  const handle = await fs.open(filename, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat({bigint: true}); checkPdfFile(opened);
+    if (pdfStamp(opened) !== pdfStamp(before)) throw new Error('The companion PDF changed while opening. Import it again.');
+    const buffer = Buffer.alloc(Number(opened.size) + 1); let used = 0;
+    while (used < buffer.length) {
+      const {bytesRead} = await handle.read(buffer, used, buffer.length - used, used);
+      if (!bytesRead) break;
+      used += bytesRead;
+    }
+    const after = await handle.stat({bigint: true}), current = await fs.lstat(filename, {bigint: true});
+    checkPdfFile(after); checkPdfFile(current);
+    if (used !== Number(opened.size) || pdfStamp(after) !== pdfStamp(opened) || pdfStamp(current) !== pdfStamp(opened)) {
+      throw new Error('The companion PDF changed while reading. Import it again.');
+    }
+    return buffer.subarray(0, used);
+  } finally {await handle.close();}
+}
+
 export class ReviewService implements vscode.Disposable {
   private readonly emitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.emitter.event;
   private readonly completed = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidDeleteRequest = this.completed.event;
+  private readonly pdfProgress = new vscode.EventEmitter<{uri: vscode.Uri; progress: PdfGenerationProgress | null}>();
+  readonly onDidChangePdfGeneration = this.pdfProgress.event;
+  private readonly pdfFinished = new vscode.EventEmitter<{uri: vscode.Uri} & PdfGenerationResult>();
+  readonly onDidFinishPdfGeneration = this.pdfFinished.event;
+  private readonly pdfGenerations = new Map<string, PdfGenerationProgress>();
+  getPdfGenerationProgress(uri: vscode.Uri): PdfGenerationProgress | undefined {
+    const progress = this.pdfGenerations.get(uri.toString());
+    return progress ? {...progress} : undefined;
+  }
   private queue: Promise<unknown> = Promise.resolve();
   private readonly trackingQueues = new Map<string, Promise<unknown>>();
   private readonly completionPrompts = new Map<string, CompletionPrompt>();
   private readonly attemptedPreparation = new Map<string, string>();
+  // Cache pure parsing/resolution only. Every action still rereads and checks both files.
+  private readonly parsedRequests: {text: string; request: RevisionRequest}[] = [];
+  private readonly resolvedRequests: {request: RevisionRequest; baseline: string; review: ReturnType<typeof resolveRequest>}[] = [];
+  private readonly pdfImports = new Map<string, {stamp: string; review: ImportedPdfReview}>();
   busy = false;
   private completionRecorder?: (uri: vscode.Uri, cleanup: 'retained' | 'deleted' | 'failed') => Promise<void>;
   setCompletionRecorder(recorder: (uri: vscode.Uri, cleanup: 'retained' | 'deleted' | 'failed') => Promise<void>) {
@@ -86,12 +153,33 @@ export class ReviewService implements vscode.Disposable {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly writeRequest: (uri: vscode.Uri, bytes: Uint8Array) => Thenable<void> = (uri, bytes) => vscode.workspace.fs.writeFile(uri, bytes),
+    private readonly pdfTools: PdfReviewTools = pdfReviewTools,
+    private readonly confirmBuild: typeof confirmPdfBuild = confirmPdfBuild,
   ) {}
-  dispose() { this.emitter.dispose(); this.completed.dispose(); }
+  dispose() { this.pdfImports.clear(); this.pdfGenerations.clear(); this.parsedRequests.length = 0; this.resolvedRequests.length = 0; this.emitter.dispose(); this.completed.dispose(); this.pdfProgress.dispose(); this.pdfFinished.dispose(); }
   changed(retryPreparation = false) { if (retryPreparation || !this.busy) this.attemptedPreparation.clear(); this.emitter.fire(); }
   isTarget(uri: vscode.Uri) { return this.watchedTargets.has(uri.toString()); }
   private storageKey(uri: vscode.Uri) {
     return 'review.' + createHash('sha256').update(uri.toString()).digest('hex');
+  }
+  private parseReviewRequest(text: string): RevisionRequest {
+    const cached = this.parsedRequests.find(item => item.text === text);
+    if (cached) return cached.request;
+    const request = parseRequestDocument(text);
+    this.parsedRequests.unshift({text, request});
+    this.parsedRequests.length = Math.min(2, this.parsedRequests.length);
+    return request;
+  }
+  private resolveReview(request: RevisionRequest, current: string, baseline?: string) {
+    // Current text was decoded strictly from disk, but its size must still be
+    // checked on cache hits just as resolveRequest checks it on cache misses.
+    if (Buffer.byteLength(current, 'utf8') > 5 * 1024 * 1024) throw new Error('Current original exceeds the text size limit.');
+    const cached = baseline === undefined ? undefined : this.resolvedRequests.find(item => item.request === request && item.baseline === baseline);
+    if (cached) return cached.review;
+    const review = resolveRequest(request, current, baseline);
+    this.resolvedRequests.unshift({request, baseline: review.baseline, review});
+    this.resolvedRequests.length = Math.min(2, this.resolvedRequests.length);
+    return review;
   }
   private async readRequest(uri: vscode.Uri) {
     if (uri.scheme !== 'file' || path.extname(uri.fsPath).toLowerCase() !== '.rr') {
@@ -104,6 +192,7 @@ export class ReviewService implements vscode.Disposable {
       throw new Error('The request must resolve inside its workspace and outside Git metadata.');
     }
     const requestStat = await fs.stat(realRequest);
+    if (requestStat.nlink !== 1) throw new Error('The request must not have hard links; review an independent .rr file.');
     if (!requestStat.isFile() || requestStat.size > 20 * 1024 * 1024) throw new Error('The request must be a regular .rr file within the 20 MiB limit.');
     const document = await vscode.workspace.openTextDocument(uri);
     if (document.isDirty) throw new Error('Save the .rr request before reviewing its proposals.');
@@ -115,7 +204,7 @@ export class ReviewService implements vscode.Disposable {
       throw new Error('The request changed while loading. Review its refreshed contents before deciding.');
     }
     let request: RevisionRequest;
-    try { request = parseRequestDocument(text); }
+    try { request = this.parseReviewRequest(text); }
     catch (error) {
       if (error instanceof SyntaxError || failure(error).startsWith('Invalid .rr JSON:')) {
         throw new Error('JSON syntax error in "' + path.basename(uri.fsPath) + '".');
@@ -184,13 +273,14 @@ export class ReviewService implements vscode.Disposable {
       if (gitOriginal && cached !== undefined && requestFingerprint(requestModelText(cached)) !== gitOriginal.hash) cached = undefined;
       const target = await this.targetUri(uri, {path: request.path, before: '', after: ''});
       const current = decode(await vscode.workspace.fs.readFile(target));
-      const review = resolveRequest(request, current, cached);
+      const review = this.resolveReview(request, current, cached);
       if (gitOriginal && (gitOriginal.path !== request.path || requestFingerprint(requestModelText(review.baseline)) !== gitOriginal.hash)) {
         throw new Error('This request uses Git commit ' + gitOriginal.commit.slice(0, 8) +
           ' as its original. Review it in a workspace whose target matches that version.');
       }
       const savedTracking = this.context.workspaceState.get<TrackedReview>(sourceKey);
       let tracking: TrackedReview | undefined;
+      let trackingChanged = false;
       const dirty = vscode.workspace.textDocuments.some(document => document.uri.toString() === target.toString() && document.isDirty);
       if (savedTracking !== undefined) {
         tracking = validateTrackedReview(savedTracking);
@@ -202,15 +292,19 @@ export class ReviewService implements vscode.Disposable {
             hunk.oldStart !== entry.hunk.oldStart || hunk.oldLines !== entry.hunk.oldLines || hunk.newLines !== entry.hunk.newLines ||
             review.decisions[hunk.id] !== entry.decision;
         })) throw new Error('The stored request statuses or proposals do not match this review. Create a fresh request.');
-        if (!dirty) tracking = rebaseTrackedReview(tracking, current);
+        if (!dirty && tracking.text !== current) {
+          tracking = rebaseTrackedReview(tracking, current);
+          trackingChanged = true;
+        }
       } else if (!dirty && current === review.expectedTarget) {
         // First establish an exact local baseline. Unknown/imported mismatches are never relocated.
         tracking = createTrackedReview(review.file, review.decisions);
+        trackingChanged = true;
       }
       await this.assertRawRequest(uri, raw);
       if (decode(await vscode.workspace.fs.readFile(target)) !== current) throw new Error('The original changed while refreshing this review. Try again.');
       if (cached === undefined) await this.context.workspaceState.update(key, review.baseline);
-      if (tracking && JSON.stringify(tracking) !== JSON.stringify(savedTracking)) await this.context.workspaceState.update(sourceKey, tracking);
+      if (tracking && trackingChanged) await this.context.workspaceState.update(sourceKey, tracking);
       const decisions: Decisions = {};
       for (const [hunk, decision] of Object.entries(review.decisions)) decisions[keyFor(request.path, hunk)] = decision;
       return {...raw, revision: this.trackedRevision(raw.fingerprint, tracking), tracking,
@@ -246,8 +340,8 @@ export class ReviewService implements vscode.Disposable {
     if (decode(await vscode.workspace.fs.readFile(uri)) !== text) throw new Error('The request changed while saving. Review it again.');
   }
   private projection(text: string, baseline: string) {
-    const request = parseRequestDocument(text);
-    return {request, review: resolveRequest(request, '', baseline)};
+    const request = this.parseReviewRequest(text);
+    return {request, review: this.resolveReview(request, '', baseline)};
   }
   private recoverReview(uri: vscode.Uri): Promise<'old' | 'new' | undefined> {
     return this.withTracking(uri, () => this.recoverReviewUnlocked(uri));
@@ -331,7 +425,10 @@ export class ReviewService implements vscode.Disposable {
         }
         await this.writeRawRequest(uri, loaded, text);
         if (open?.isDirty || decode(await vscode.workspace.fs.readFile(target.uri)) !== newTracking.text) throw new Error('The original changed while saving the review status.');
-        await this.context.workspaceState.update(this.baselineKey(uri, loaded.generation, next.review.identity), journal.baseline);
+        const baselineKey = this.baselineKey(uri, loaded.generation, next.review.identity);
+        if (this.context.workspaceState.get<string>(baselineKey) !== journal.baseline) {
+          await this.context.workspaceState.update(baselineKey, journal.baseline);
+        }
         await this.context.workspaceState.update(this.trackingKey(uri, loaded.generation, next.review.identity), newTracking);
         await this.context.workspaceState.update(this.journalKey(uri), undefined);
       } catch (error) {
@@ -339,6 +436,297 @@ export class ReviewService implements vscode.Disposable {
         if (outcome !== 'new') throw error;
       }
       return this.loadReview(uri);
+    });
+  }
+
+  private pdfExportKey(uri: vscode.Uri) { return this.reviewPrefix(uri) + 'pdf-export'; }
+  private pdfFileKey(filename: string) { return process.platform === 'win32' ? path.resolve(filename).toLowerCase() : path.resolve(filename); }
+  // A delayed watcher event must not discard a newer explicit import.
+  // getState and Apply compare metadata before using the cached snapshot.
+  pdfChanged(_uri: vscode.Uri) { this.changed(); }
+  private async companionPdfInfo(uri: vscode.Uri): Promise<{filename: string; parent: string; stat?: BigIntStats; stamp?: string}> {
+    const filename = uri.fsPath + '.pdf';
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (uri.scheme !== 'file' || !folder || folder.uri.scheme !== 'file') throw new Error('PDF review requires a local workspace.');
+    const root = await fs.realpath(folder.uri.fsPath), parent = await fs.realpath(path.dirname(filename));
+    if (!inside(root, parent) || path.relative(root, parent).split(path.sep).some(part => part.toLowerCase() === '.git')) {
+      throw new Error('The companion PDF must stay inside this workspace.');
+    }
+    let stat;
+    try { stat = await fs.lstat(filename, {bigint: true}); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') {this.pdfImports.delete(this.pdfFileKey(filename)); return {filename, parent};} throw error; }
+    checkPdfFile(stat);
+    return {filename, parent, stat, stamp: pdfStamp(stat)};
+  }
+  private async companionPdf(uri: vscode.Uri): Promise<{filename: string; bytes?: Buffer; hash?: string; stamp?: string}> {
+    const {filename, parent, stat, stamp} = await this.companionPdfInfo(uri);
+    if (!stat) return {filename};
+    const bytes = await readBoundedPdf(filename, stat);
+    if (await fs.realpath(path.dirname(filename)) !== parent) throw new Error('The companion PDF location changed while reading. Import it again.');
+    return {filename, bytes, stamp, hash: createHash('sha256').update(bytes).digest('hex')};
+  }
+  private async pdfReview(uri: vscode.Uri, loaded?: Awaited<ReturnType<ReviewService['load']>>, force = false) {
+    const state: PdfReviewState = {supported: /\.(?:tex|ltx|latex)\.rr$/i.test(uri.fsPath),
+      available: false, filename: path.basename(uri.fsPath) + '.pdf'};
+    let imported: ImportedPdfReview | undefined, record: PdfExportRecord | undefined, stamp: string | undefined;
+    const key = this.pdfFileKey(uri.fsPath + '.pdf');
+    state.imported = false; state.canApply = false;
+    try {
+      const info = await this.companionPdfInfo(uri);
+      state.available = info.stat !== undefined;
+      if (!info.stat) return {state};
+      stamp = info.stamp;
+      if (force) {
+        const companion = await this.companionPdf(uri);
+        if (!companion.bytes || !companion.hash || companion.stamp !== stamp) throw new Error('The PDF changed while opening. Import it again.');
+        imported = await this.pdfTools.read(companion.bytes);
+        if (imported.pdfHash !== companion.hash || (await this.companionPdfInfo(uri)).stamp !== stamp) {
+          throw new Error('The PDF changed while its review data was read. Import it again.');
+        }
+      } else {
+        const snapshot = this.pdfImports.get(key);
+        if (!snapshot || snapshot.stamp !== stamp) {
+          this.pdfImports.delete(key);
+          return {state};
+        }
+        imported = snapshot.review;
+      }
+      state.imported = true;
+      state.pdfHash = imported.pdfHash;
+      state.pending = Object.values(imported.decisions).filter(value => value === 'pending').length;
+      state.accepted = Object.values(imported.decisions).filter(value => value === 'accepted').length;
+      state.ignored = Object.values(imported.decisions).filter(value => value === 'ignored').length;
+      record = this.context.workspaceState.get<PdfExportRecord>(this.pdfExportKey(uri));
+      if (!record || JSON.stringify(record.manifest) !== JSON.stringify(imported.manifest)) {
+        throw new Error('This PDF does not match a review exported from this request. Keep the original .rr and generate a new review PDF.');
+      }
+      state.warnings = record.warnings;
+      if (!loaded) throw new Error('The request and original must be verified before importing PDF decisions.');
+      if (loaded.generation !== record.generation || loaded.resolved.identity !== record.manifest.proposalIdentity) {
+        throw new Error('The request changed since this PDF was generated. Generate a new review PDF.');
+      }
+      const target = await this.inspectTarget(uri, loaded.request.files[0]!, loaded.decisions, loaded.tracking);
+      const sourceHash = requestFingerprint(target.current);
+      const application = record.application;
+      const sameDecisions = (a: Record<string, Decision>, b: Record<string, Decision>) =>
+        Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(id => a[id] === b[id]);
+      if (application && application.requestHash === loaded.fingerprint && application.sourceHash === sourceHash) {
+        if (!sameDecisions(application.decisions, imported.decisions)) throw new Error('This PDF has different decisions from the review already applied. The original was kept unchanged.');
+        state.applied = true; state.canApply = false;
+        return {state, imported, record, stamp};
+      }
+      if (sourceHash !== record.manifest.sourceHash || loaded.resolved.request.request.some((entry, index) =>
+          entry.status !== record!.manifest.request.request[index]?.status)) {
+        throw new Error('The original or local review decisions changed since this PDF was generated. Generate a new review PDF.');
+      }
+      if (loaded.tracking?.entries.some(entry => entry.decision === 'pending' && entry.conflict)) {
+        throw new Error('Resolve pending source conflicts before using PDF review.');
+      }
+      const ids = record.manifest.entries.map(entry => entry.id);
+      if (!ids.length || Object.keys(imported.decisions).length !== ids.length || ids.some(id =>
+          !['pending', 'accepted', 'ignored'].includes(imported!.decisions[id]!))) {
+        throw new Error('The PDF review decisions are incomplete or invalid.');
+      }
+      state.applied = false;
+      state.canApply = state.pending === 0 && vscode.workspace.isTrusted;
+    } catch (error) { this.pdfImports.delete(key); state.imported = false; state.error = failure(error); state.canApply = false; }
+    return {state, imported, record, stamp};
+  }
+  async generateReviewPdf(uri: vscode.Uri, revision: string, replace = false) {
+    return this.runExclusive(async () => {
+      const startedAt = Date.now(), key = uri.toString();
+      const report: PdfCompilationProgressReporter = progress => {
+        const current = {...progress, startedAt};
+        this.pdfGenerations.set(key, current);
+        this.pdfProgress.fire({uri, progress: {...current}});
+      };
+      let result: PdfGenerationResult = {outcome: 'failed'};
+      report({stage: 'preparing', message: 'Checking request and source…'});
+      try {
+        result = {outcome: await this.generateReviewPdfNow(uri, revision, replace, report)};
+      } catch (error) {
+        result = {outcome: 'failed', error: failure(error)};
+        throw error;
+      } finally {
+        this.pdfGenerations.delete(key);
+        this.pdfProgress.fire({uri, progress: null});
+        this.pdfFinished.fire({uri, ...result});
+      }
+    });
+  }
+  private async generateReviewPdfNow(uri: vscode.Uri, revision: string, replace: boolean,
+    report: PdfCompilationProgressReporter): Promise<'created' | 'cancelled'> {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before generating a review PDF.');
+    await this.prepareReview(uri);
+    const loaded = await this.load(uri);
+    if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before generating a PDF.');
+    if (!/\.(?:tex|ltx|latex)$/i.test(loaded.resolved.request.path)) throw new Error('Review PDF generation currently supports LaTeX files.');
+    const file = loaded.request.files[0]!;
+    const tracking = loaded.tracking ?? createTrackedReview(file, loaded.resolved.review.decisions);
+    const entries = tracking.entries.filter(entry => entry.decision === 'pending')
+      .sort((a, b) => a.start - b.start || loaded.resolved.review.entryIndexByHunkId[a.hunk.id]! - loaded.resolved.review.entryIndexByHunkId[b.hunk.id]!);
+    if (!entries.length) throw new Error('There are no pending changes to export.');
+    if (entries.some(entry => entry.conflict)) throw new Error('Resolve pending source conflicts before generating a review PDF.');
+    const target = await this.inspectTarget(uri, file, loaded.decisions, tracking);
+    const prior = await this.companionPdf(uri);
+    if (prior.bytes && !replace) throw new Error('A review PDF already exists. Use Generate PDF from RR to confirm replacing it.');
+    report({stage: 'confirming', message: 'Waiting for PDF build confirmation…'});
+    if (!await this.confirmBuild(path.basename(uri.fsPath), loaded.resolved.request.path, prior.bytes !== undefined)) return 'cancelled';
+    report({stage: 'preparing', message: 'Preparing the LaTeX review…'});
+    // Consent applies only to the exact request/source the user was shown.
+    // The prompt can stay open while files or workspace trust change.
+    await this.assertRawRequest(uri, loaded);
+    const confirmedTarget = await this.inspectTarget(uri, file, loaded.decisions, tracking);
+    if (confirmedTarget.current !== target.current || !vscode.workspace.isTrusted) {
+      throw new Error('The source or workspace trust changed before PDF generation. Nothing was compiled.');
+    }
+    if ((await this.companionPdf(uri)).hash !== prior.hash) {
+      throw new Error('The companion PDF changed before generation. Its saved review was kept.');
+    }
+    const folder = vscode.workspace.getWorkspaceFolder(uri)!;
+    if (!this.context.globalStorageUri || !['file', 'vscode-userdata'].includes(this.context.globalStorageUri.scheme) ||
+        !path.isAbsolute(this.context.globalStorageUri.fsPath)) throw new Error('Local extension storage is required to compile a review PDF.');
+    const storage = path.resolve(this.context.globalStorageUri.fsPath, '.codex-pdf-review');
+    const outputDirectory = path.join(storage, randomUUID());
+    const manifest: PdfReviewManifest = {format: 'revision-request-pdf', formatVersion: 1, exportId: randomUUID(),
+      createdAt: new Date().toISOString(), path: loaded.resolved.request.path, proposalIdentity: loaded.resolved.identity,
+      sourceHash: requestFingerprint(target.current), request: loaded.resolved.request,
+      entries: entries.map(entry => { const index = loaded.resolved.review.entryIndexByHunkId[entry.hunk.id]!;
+        return {id: entry.hunk.id, index, originalDecision: entry.decision, reason: loaded.resolved.request.request[index]!.reason}; })};
+    await fs.mkdir(outputDirectory, {recursive: true});
+    try {
+      const compiled = await this.pdfTools.compile({workspaceRoot: folder.uri.fsPath, targetPath: target.uri.fsPath,
+        source: target.current, outputDirectory,
+        entries: entries.map(entry => { const index = loaded.resolved.review.entryIndexByHunkId[entry.hunk.id]!;
+          return {id: entry.hunk.id, index, start: entry.start, end: entry.end,
+            before: target.current.slice(entry.start, entry.end), after: entry.hunk.after,
+            reason: loaded.resolved.request.request[index]!.reason}; })}, report);
+      report({stage: 'annotating', message: 'Adding review buttons to the PDF…'});
+      const bytes = await this.pdfTools.create(compiled.pdf, manifest, compiled.anchors);
+      if (bytes.length > 50 * 1024 * 1024) throw new Error('The generated PDF exceeds the 50 MiB size limit.');
+      await this.assertRawRequest(uri, loaded);
+      const current = await this.inspectTarget(uri, file, loaded.decisions, tracking);
+      if (current.current !== target.current || !vscode.workspace.isTrusted) throw new Error('The source or workspace trust changed during PDF generation. Nothing was exported.');
+      const latest = await this.companionPdf(uri);
+      if (latest.hash !== prior.hash) throw new Error('The companion PDF changed during generation. Its saved review was kept.');
+      const key = this.pdfExportKey(uri), previous = this.context.workspaceState.get<PdfExportRecord>(key);
+      const record: PdfExportRecord = {manifest, generation: loaded.generation, warnings: compiled.warnings};
+      // Sibling staging keeps displacement and exclusive installation on one
+      // filesystem even when extension storage is on another disk. No source
+      // or persistent project configuration is changed by this transaction.
+      report({stage: 'saving', message: 'Saving the review PDF…'});
+      const stageParent = path.dirname(latest.filename);
+      const stageDirectory = path.join(stageParent, '.codex-pdf-review-' + randomUUID());
+      await fs.mkdir(stageDirectory);
+      let retainStage = false;
+      try {
+        const staged = path.join(stageDirectory, 'review.pdf');
+        await fs.writeFile(staged, bytes, {flag: 'wx'});
+        await this.assertRawRequest(uri, loaded);
+        await this.inspectTarget(uri, file, loaded.decisions, tracking);
+        if ((await this.companionPdf(uri)).hash !== prior.hash || !vscode.workspace.isTrusted) {
+          throw new Error('The companion PDF or workspace trust changed before export. Its saved review was kept.');
+        }
+        await this.context.workspaceState.update(key, record);
+        const displaced = path.join(stageDirectory, 'previous.pdf');
+        let hasDisplaced = false;
+        try {
+          await this.assertRawRequest(uri, loaded);
+          await this.inspectTarget(uri, file, loaded.decisions, tracking);
+          if ((await this.companionPdf(uri)).hash !== prior.hash || !vscode.workspace.isTrusted) {
+            throw new Error('The companion PDF or workspace trust changed before export. Its saved review was kept.');
+          }
+          if (prior.bytes) {
+            // Verify the exact file displaced, closing the final check/rename
+            // race. A returned review arriving at the live path is never replaced.
+            await fs.rename(latest.filename, displaced);
+            hasDisplaced = true;
+            const moved = await fs.lstat(displaced, {bigint: true});
+            if (!moved.isFile() || moved.isSymbolicLink() || moved.nlink !== 1n || moved.size > BigInt(MAX_REVIEW_PDF_BYTES) ||
+                createHash('sha256').update(await readBoundedPdf(displaced, moved)).digest('hex') !== prior.hash) {
+              throw new Error('The companion PDF was replaced during export. Its returned review was preserved.');
+            }
+          }
+          // Atomic exclusive installation also refuses a PDF copied into the
+          // gap after displacement. Rename-overwrite would silently lose it.
+          await fs.link(staged, latest.filename);
+        } catch (error) {
+          let detail = failure(error);
+          if (hasDisplaced) {
+            try {
+              const moved = await fs.lstat(displaced);
+              if (!moved.isFile() || moved.isSymbolicLink()) throw new Error('The displaced companion is not a regular file.');
+              await fs.link(displaced, latest.filename); // never overwrite an arriving review
+            } catch {
+              retainStage = true;
+              detail += ' The displaced PDF was kept at "' + displaced + '" because its original path is occupied or cannot be restored.';
+            }
+          }
+          try { await this.context.workspaceState.update(key, previous); }
+          catch (restoreError) { detail += ' Export metadata could not be restored: ' + failure(restoreError); }
+          throw new Error(detail);
+        }
+      } finally {
+        if (!retainStage && path.dirname(path.resolve(stageDirectory)) === stageParent) await fs.rm(stageDirectory, {recursive: true, force: true}).catch(() => undefined);
+      }
+      this.pdfImports.delete(this.pdfFileKey(uri.fsPath + '.pdf'));
+      return 'created';
+    } finally {
+      // This UUID directory is owned by this operation, outside the source project.
+      if (path.dirname(path.resolve(outputDirectory)) === storage) await fs.rm(outputDirectory, {recursive: true, force: true}).catch(() => undefined);
+    }
+  }
+
+  async importPdfReview(uri: vscode.Uri, revision: string) {
+    return this.runExclusive(async () => {
+      const key = this.pdfFileKey(uri.fsPath + '.pdf');
+      this.pdfImports.delete(key);
+      const loaded = await this.load(uri);
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before importing.');
+      const result = await this.pdfReview(uri, loaded, true);
+      if (result.state.error) throw new Error(result.state.error);
+      if (!result.state.available || !result.imported || !result.stamp) throw new Error('No companion review PDF was found.');
+      this.pdfImports.set(key, {stamp: result.stamp, review: result.imported});
+      while (this.pdfImports.size > 2) this.pdfImports.delete(this.pdfImports.keys().next().value!);
+      return result.state;
+    });
+  }
+  async applyPdfReview(uri: vscode.Uri, revision: string, pdfHash: string) {
+    return this.runExclusive(async () => {
+      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before applying PDF decisions.');
+      await this.prepareReview(uri);
+      const loaded = await this.load(uri);
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before applying PDF decisions.');
+      const key = this.pdfFileKey(uri.fsPath + '.pdf'), snapshot = this.pdfImports.get(key);
+      if (!snapshot || snapshot.review.pdfHash !== pdfHash || (await this.companionPdfInfo(uri)).stamp !== snapshot.stamp) {
+        this.pdfImports.delete(key);
+        throw new Error('The review PDF changed or has not been imported. Import its latest decisions before applying.');
+      }
+      const result = await this.pdfReview(uri, loaded, true);
+      if (result.state.error) throw new Error(result.state.error);
+      if (!result.state.available || !result.imported || !result.record || result.state.pdfHash !== pdfHash) {
+        throw new Error('The review PDF changed. Import its latest decisions before applying.');
+      }
+      if (result.state.applied) return;
+      if (!result.state.canApply) throw new Error('Complete every PDF decision before applying the reviewed changes.');
+      const {imported, record} = result;
+      const updates: Record<number, Decision> = {}, changes: Record<string, Decision> = {};
+      for (const entry of record.manifest.entries) {
+        updates[entry.index] = imported.decisions[entry.id]!;
+        changes[entry.id] = imported.decisions[entry.id]!;
+      }
+      const text = patchRequestStatuses(loaded.savedText, updates);
+      const tracking = loaded.tracking ?? createTrackedReview(loaded.resolved.review.file, loaded.resolved.review.decisions);
+      const next = transitionTrackedReview(tracking, changes);
+      // Persist an exact receipt before the transaction: recovery can recognize a
+      // committed result after a crash without applying the source a second time.
+      await this.context.workspaceState.update(this.pdfExportKey(uri), {...record, application: {
+        decisions: imported.decisions, sourceHash: requestFingerprint(next.text), requestHash: requestFingerprint(text)}} satisfies PdfExportRecord);
+      if ((await this.companionPdf(uri)).hash !== pdfHash) throw new Error('The review PDF changed before applying. Import its latest decisions first.');
+      this.completionPrompts.delete(uri.toString());
+      const committed = await this.commitReview(uri, loaded, text, 'user');
+      const completionPrompt = await this.finishCompletedReview(uri, committed, 'user');
+      if (completionPrompt) return {completionPrompt};
     });
   }
 
@@ -370,6 +758,7 @@ export class ReviewService implements vscode.Disposable {
     }
     const stat = await fs.stat(real);
     if (!stat.isFile()) throw new Error('The target is not a regular file.');
+    if (stat.nlink !== 1) throw new Error('The target must not have hard links; review an independent source file.');
     if (stat.size > 20 * 1024 * 1024) throw new Error('The target is too large for this review.');
     const uri = vscode.Uri.file(candidate);
     this.watchedTargets.add(uri.toString());
@@ -421,6 +810,7 @@ export class ReviewService implements vscode.Disposable {
       base.requestIdentity = loaded.resolved.identity;
       base.closed = loaded.resolved.request.request.length > 0 && loaded.resolved.request.request.every(entry => entry.status !== 'pending');
       base.verified = true;
+      base.pdfReview = (await this.pdfReview(uri, loaded)).state;
       for (const file of request.files) {
         const display = loaded.tracking ? projectTrackedReview(loaded.tracking).file : file;
         let issue: string | undefined;
@@ -463,6 +853,7 @@ export class ReviewService implements vscode.Disposable {
         base.requestIdentity = proposalIdentity(error.request);
         base.closed = error.request.request.length > 0 && error.request.request.every(entry => entry.status !== 'pending');
       }
+      base.pdfReview = (await this.pdfReview(uri)).state;
       base.verified = false; base.verificationIssue = failure(error);
       if (!base.closed) base.error = failure(error);
     }
@@ -509,6 +900,52 @@ export class ReviewService implements vscode.Disposable {
       const committed = await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, updates), origin);
       const completionPrompt = await this.finishCompletedReview(uri, committed, origin);
       if (completionPrompt) return {completionPrompt};
+    });
+  }
+  async acceptThrough(uri: vscode.Uri, filePath: string, hunkId: string, revision: string, draft?: string) {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before accepting proposals.');
+    if (typeof filePath !== 'string' || typeof hunkId !== 'string' || !hunkId || typeof revision !== 'string' ||
+        (draft !== undefined && typeof draft !== 'string')) throw new Error('Choose a pending change to accept up to.');
+    return this.runExclusive(async () => {
+      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before accepting proposals.');
+      await this.prepareReview(uri);
+      const loaded = await this.load(uri);
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before accepting.');
+      const file = loaded.request.files.find(candidate => candidate.path === filePath);
+      if (!file) throw new Error('This file is not part of the request.');
+      // Use the same current source order as the preview, not JSON array order.
+      const hunks = (loaded.tracking ? projectTrackedReview(loaded.tracking).hunks : computeHunks(file))
+        .slice().sort((a, b) => a.start - b.start || a.index - b.index);
+      const through = hunks.findIndex(hunk => hunk.id === hunkId);
+      if (through < 0 || loaded.decisions[keyFor(file.path, hunkId)] !== 'pending') {
+        throw new Error('Choose a pending change to accept up to.');
+      }
+      const selected = hunks.slice(0, through + 1).filter(hunk => loaded.decisions[keyFor(file.path, hunk.id)] === 'pending');
+      const selectedIds = new Set(selected.map(hunk => hunk.id));
+      const conflict = loaded.tracking?.entries.find(entry => selectedIds.has(entry.hunk.id) && entry.conflict)?.conflict;
+      if (conflict) throw new Error(conflict);
+      await this.inspectTarget(uri, file, loaded.decisions, loaded.tracking);
+      let text = loaded.savedText;
+      const anchorIndex = loaded.resolved.review.entryIndexByHunkId[hunkId]!;
+      let removed = false;
+      if (draft !== undefined) {
+        const edited = editPendingRequest(text, loaded.resolved.review.baseline, hunkId, draft);
+        if (edited.review.expectedTarget !== loaded.resolved.review.expectedTarget) throw new Error('Editing a proposal must preserve accepted source content.');
+        text = edited.text;
+        removed = edited.request.request.length < loaded.resolved.request.request.length;
+      }
+      const updates: Record<number, Decision> = {};
+      for (const hunk of selected) {
+        const index = loaded.resolved.review.entryIndexByHunkId[hunk.id]!;
+        if (removed && index === anchorIndex) continue;
+        updates[removed && index > anchorIndex ? index - 1 : index] = 'accepted';
+      }
+      text = patchRequestStatuses(text, updates);
+      this.completionPrompts.delete(uri.toString());
+      // One guarded source/RR transaction preserves partial decisions and external edits.
+      const committed = await this.commitReview(uri, loaded, text, 'user', draft === undefined ? undefined : hunkId);
+      const completionPrompt = await this.finishCompletedReview(uri, committed, 'user');
+      return {changed: true, revision: committed.revision, completionPrompt};
     });
   }
   private completedReview(loaded: Awaited<ReturnType<ReviewService['load']>>) {
@@ -609,6 +1046,34 @@ export class ReviewService implements vscode.Disposable {
       }
       const index = loaded.resolved.review.entryIndexByHunkId[hunk.id]!;
       await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, {[index]: 'pending'}), origin);
+    });
+  }
+  async undoFile(uri: vscode.Uri, filePath: string, revision: string, origin: DecisionOrigin = 'user') {
+    assertDecisionOrigin(origin);
+    if (typeof filePath !== 'string' || !filePath || typeof revision !== 'string' || !revision) {
+      throw new Error('Choose a request file to return to pending.');
+    }
+    return this.runExclusive(async () => {
+      assertDecisionOrigin(origin);
+      await this.prepareReview(uri);
+      const loaded = await this.load(uri);
+      if (loaded.revision !== revision) throw new Error('The request changed. Review its refreshed contents before undoing.');
+      const file = loaded.request.files.find(candidate => candidate.path === filePath);
+      if (!file) throw new Error('This file is not part of the request.');
+      const selected = computeHunks(file).filter(hunk => {
+        const previous = loaded.decisions[keyFor(file.path, hunk.id)];
+        return previous === 'accepted' || previous === 'ignored';
+      });
+      if (!selected.length) throw new Error('There are no accepted or ignored changes to return to pending.');
+      const selectedIds = new Set(selected.map(hunk => hunk.id));
+      const blocked = loaded.tracking?.entries.find(entry => selectedIds.has(entry.hunk.id) && entry.undoBlocked)?.undoBlocked;
+      if (blocked) throw new Error(blocked);
+      const updates: Record<number, Decision> = {};
+      for (const hunk of selected) updates[loaded.resolved.review.entryIndexByHunkId[hunk.id]!] = 'pending';
+      // Restore every decision with one guarded source/RR transaction. A conflict
+      // must not leave a partly reset request, and reopening is not completion.
+      await this.commitReview(uri, loaded, patchRequestStatuses(loaded.savedText, updates), origin);
+      this.completionPrompts.delete(uri.toString());
     });
   }
   private assertEditable(loaded: Awaited<ReturnType<ReviewService['load']>>, hunkId: string) {
@@ -766,7 +1231,7 @@ export class ReviewService implements vscode.Disposable {
     if (!file) throw new Error('Unknown request file.');
     return vscode.window.showTextDocument(await this.targetUri(requestUri, file), {viewColumn: vscode.ViewColumn.Active, preserveFocus: true, preview: false, ...options});
   }
-  async openTargetLine(requestUri: vscode.Uri, filePath: string, hunkId: string, revision: string) {
+  async openTargetLine(requestUri: vscode.Uri, filePath: string, hunkId: string, revision: string, viewColumn: vscode.ViewColumn = vscode.ViewColumn.Active) {
     const loaded = await this.load(requestUri);
     if (loaded.revision !== revision) throw new Error('The request changed. Refresh the preview before navigating to the original.');
     const file = loaded.request.files.find(item => item.path === filePath);
@@ -790,10 +1255,38 @@ export class ReviewService implements vscode.Disposable {
     if (line < 0 || line >= document.lineCount) throw new Error('The original line is no longer available. Refresh the preview.');
     const position = new vscode.Position(line, 0), selection = new vscode.Range(position, position);
     const editor = await vscode.window.showTextDocument(document, {
-      viewColumn: vscode.ViewColumn.Active, preserveFocus: false, preview: false, selection
+      viewColumn, preserveFocus: false, preview: false, selection
     });
     editor.revealRange(selection, vscode.TextEditorRevealType.InCenter);
     return editor;
+  }
+  async openTargetPdf(requestUri: vscode.Uri, filePath: string, hunkId: string, revision: string) {
+    if (!/\.(?:tex|ltx|latex)$/i.test(filePath)) throw new Error('PDF navigation is available for LaTeX source files only.');
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before using LaTeX Workshop PDF navigation.');
+    const workshop = vscode.extensions.getExtension('James-Yu.latex-workshop');
+    if (!workshop) throw new Error('Install or enable LaTeX Workshop to navigate from this change to its PDF.');
+    try { await workshop.activate(); }
+    catch (error) { throw new Error('Could not activate LaTeX Workshop: ' + failure(error)); }
+    const editor = await this.openTargetLine(requestUri, filePath, hunkId, revision);
+    if (!['latex', 'latex-expl3', 'context', 'doctex', 'pweave', 'jlweave', 'rsweave'].includes(editor.document.languageId)) {
+      throw new Error('Select a LaTeX language mode for the original file before navigating to its PDF.');
+    }
+    // SyncTeX requires the active native source editor. The View command also
+    // awaits LaTeX Workshop's root discovery, avoiding a stale project root on
+    // the first click from a webview. It opens an existing PDF without building.
+    const pdfView = captureLatexPdfView(editor.viewColumn);
+    try { await vscode.commands.executeCommand('latex-workshop.view'); }
+    catch (error) { throw new Error('Could not open the PDF with LaTeX Workshop: ' + failure(error)); }
+    const pdfTab = resolveLatexPdfView(pdfView);
+    // Viewing can move focus or take time; revalidate and restore the exact
+    // source location before invoking the same command as SyncTeX from cursor.
+    await this.openTargetLine(requestUri, filePath, hunkId, revision, editor.viewColumn);
+    if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before using LaTeX Workshop PDF navigation.');
+    try { await vscode.commands.executeCommand('latex-workshop.synctex'); }
+    catch (error) { throw new Error('Could not run LaTeX Workshop SyncTeX: ' + failure(error)); }
+    // Workshop's forward search does not focus its viewer, and cannot reveal a
+    // PDF hidden behind TeX in the same group. Finish on the actual output PDF.
+    if (pdfTab) await focusLatexPdfView(pdfTab);
   }
   async snapshots(requestUri: vscode.Uri, filePath: string, revision: string) {
     const loaded = await this.load(requestUri);
@@ -1047,13 +1540,18 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
     this.syncQuickReviewContext();
     let generation = 0;
     let disposed = false;
+    let panelWasActive = panel.active;
     let actionError: string | undefined;
+    let pdfActionError: string | undefined;
     let refreshRequested = false;
     let refreshTask: Promise<void> | undefined;
     let notifiedBusy = false;
-    const update = (invalidate = true): Promise<void> => {
+    let lastPostedFingerprint: string | undefined;
+    let deliveries = 0, forcedDelivery = 0, fulfilledDelivery = 0;
+    const update = (invalidate = true, force = false): Promise<void> => {
       if (disposed) return Promise.resolve();
       if (invalidate) ++generation;
+      if (force) ++forcedDelivery;
       if (this.service.busy) {
         refreshRequested = true;
         // Writes can emit several document and filesystem events. Keep the
@@ -1078,7 +1576,14 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
             if (disposed || this.service.busy || requested !== generation) continue;
             this.rememberSourceDocument(uri);
             if (actionError) state.error = actionError;
+            if (pdfActionError) state.pdfReview = {supported: false, available: false, filename: path.basename(uri.fsPath) + '.pdf',
+              ...state.pdfReview, error: pdfActionError, canApply: false};
+            // Disk/document notifications can arrive again after a write has
+            // finished. Verify them, but do not redraw identical review rows.
+            const fingerprint = requestFingerprint(JSON.stringify(state));
+            if (fingerprint === lastPostedFingerprint && !notifiedBusy && forcedDelivery === fulfilledDelivery) continue;
             notifiedBusy = false;
+            lastPostedFingerprint = fingerprint; fulfilledDelivery = forcedDelivery; deliveries++;
             await panel.webview.postMessage(state);
           }
         } finally { refreshTask = undefined; }
@@ -1086,7 +1591,17 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
       return refreshTask;
     };
     const disposables = [
-      this.service.onDidChange(() => { void update(); }),
+      this.service.onDidChangePdfGeneration(event => {
+        if (!disposed && event.uri.toString() === uri.toString()) {
+          void panel.webview.postMessage({type: 'pdfGenerationProgress', progress: event.progress});
+        }
+      }),
+      this.service.onDidFinishPdfGeneration(event => {
+        if (!disposed && event.uri.toString() === uri.toString()) {
+          void panel.webview.postMessage({type: 'pdfGenerationResult', outcome: event.outcome, error: event.error});
+        }
+      }),
+      this.service.onDidChange(() => { pdfActionError = undefined; void update(); }),
       this.service.onDidDeleteRequest(deleted => {
         if (deleted.toString() === uri.toString()) {
           if (this.sourceOnlyUri === uri.toString()) this.sourceOnlyUri = undefined;
@@ -1094,7 +1609,8 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
         }
       }),
       panel.onDidChangeViewState(event => {
-        if (event.webviewPanel.active) { this.activeUri = uri; this.syncQuickReviewContext(); }
+        panelWasActive = event.webviewPanel.active;
+        if (panelWasActive) { this.activeUri = uri; this.syncQuickReviewContext(); }
       }),
       panel.webview.onDidReceiveMessage(async message => {
         if (!message || typeof message.type !== 'string') return;
@@ -1128,16 +1644,37 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
           }
           return; // A local draft must not trigger a preview refresh or any file write.
         }
+        const deliveriesBeforeAction = deliveries;
         let editResult: Awaited<ReturnType<ReviewService['editPending']>> | undefined;
         let decisionResult: Awaited<ReturnType<ReviewService['decide']>>;
         let completionSucceeded = false;
         let quickDecisionSucceeded = false;
+        let pdfGenerationStarted = false;
         try {
-          actionError = undefined;
+          actionError = undefined; pdfActionError = undefined;
           switch (message.type) {
             case 'ready':
               this.readyCount++;
               this.quickReview.get(panel)!.ready = true;
+              {
+                const progress = this.service.getPdfGenerationProgress(uri);
+                if (progress) {
+                  // PDF generation never modifies the source/request. A new or
+                  // reloaded panel can read one initial state while it runs.
+                  // Stage messages themselves never request full review state.
+                  const state = await this.service.getState(uri);
+                  if (disposed) return;
+                  // Do not replay an old busy snapshot after completion.
+                  // The normal settled refresh below owns that state.
+                  if (this.service.getPdfGenerationProgress(uri)) {
+                    await panel.webview.postMessage(state);
+                    lastPostedFingerprint = requestFingerprint(JSON.stringify(state));
+                    deliveries++;
+                    const currentProgress = this.service.getPdfGenerationProgress(uri);
+                    if (currentProgress) await panel.webview.postMessage({type: 'pdfGenerationProgress', progress: currentProgress});
+                  }
+                }
+              }
               break;
             case 'decide':
             case 'decideFile':
@@ -1149,14 +1686,50 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               decisionResult = await this.service.decide(uri, message.filePath, message.type === 'decide' ? message.hunkId : undefined, message.decision, message.revision);
               quickDecisionSucceeded = true;
               break;
+            case 'acceptThrough':
+              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' || !message.hunkId ||
+                  typeof message.revision !== 'string' ||
+                  (('draft' in message || 'editId' in message) &&
+                    (typeof message.draft !== 'string' || typeof message.editId !== 'string' || !message.editId)) ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'revision', 'draft', 'editId'].includes(key))) {
+                throw new Error('Invalid acceptance range.');
+              }
+              {
+                const accepted = await this.service.acceptThrough(uri, message.filePath, message.hunkId, message.revision, message.draft);
+                if (message.editId !== undefined) editResult = {changed: accepted.changed, revision: accepted.revision};
+                if (accepted.completionPrompt) decisionResult = {completionPrompt: accepted.completionPrompt};
+              }
+              break;
+            case 'generateReviewPdf':
+            case 'regenerateReviewPdf':
+            case 'importPdfReview':
+            case 'applyPdfReview':
+              if (typeof message.revision !== 'string' || !message.revision ||
+                  Object.keys(message).some(key => !['type', 'revision', ...(message.type === 'applyPdfReview' ? ['pdfHash'] : [])].includes(key)) ||
+                  (message.type === 'applyPdfReview' && (typeof message.pdfHash !== 'string' || !/^[a-f0-9]{64}$/.test(message.pdfHash)))) {
+                throw new Error('Invalid PDF review action.');
+              }
+              if (message.type === 'applyPdfReview') decisionResult = await this.service.applyPdfReview(uri, message.revision, message.pdfHash);
+              else if (message.type === 'importPdfReview') await this.service.importPdfReview(uri, message.revision);
+              else {
+                pdfGenerationStarted = true;
+                await this.service.generateReviewPdf(uri, message.revision, message.type === 'regenerateReviewPdf');
+              }
+              break;
             case 'undo':
               if (typeof message.filePath !== 'string' || typeof message.revision !== 'string' ||
                   typeof message.hunkId !== 'string') throw new Error('Invalid undo action.');
               await this.service.undo(uri, message.filePath, message.hunkId, message.revision);
               break;
+            case 'undoFile':
+              if (typeof message.filePath !== 'string' || !message.filePath || typeof message.revision !== 'string' || !message.revision ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'revision'].includes(key))) throw new Error('Invalid pending-all action.');
+              await this.service.undoFile(uri, message.filePath, message.revision);
+              break;
             case 'editPending':
-              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' ||
-                  typeof message.draft !== 'string' || typeof message.revision !== 'string' || typeof message.editId !== 'string') {
+              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' || !message.hunkId ||
+                  typeof message.draft !== 'string' || typeof message.revision !== 'string' || typeof message.editId !== 'string' ||
+                  Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'draft', 'revision', 'editId'].includes(key))) {
                 throw new Error('Invalid proposal edit.');
               }
               editResult = await this.service.editPending(uri, message.filePath, message.hunkId, message.draft, message.revision);
@@ -1191,25 +1764,35 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               break;
             case 'deleteRequest': await this.service.deleteRequest(uri); break;
             case 'openTargetLine':
-              if (typeof message.filePath !== 'string' || typeof message.hunkId !== 'string' ||
-                  typeof message.revision !== 'string' ||
+            case 'openTargetPdf':
+              if (typeof message.filePath !== 'string' || !message.filePath || typeof message.hunkId !== 'string' || !message.hunkId ||
+                  typeof message.revision !== 'string' || !message.revision ||
                   Object.keys(message).some(key => !['type', 'filePath', 'hunkId', 'revision'].includes(key))) {
                 throw new Error('Invalid original-line navigation.');
               }
-              await this.service.openTargetLine(uri, message.filePath, message.hunkId, message.revision);
+              if (message.type === 'openTargetPdf') await this.service.openTargetPdf(uri, message.filePath, message.hunkId, message.revision);
+              else await this.service.openTargetLine(uri, message.filePath, message.hunkId, message.revision);
               break;
             case 'openTarget': await this.service.openTarget(uri, message.filePath, {preserveFocus: false}); break;
             case 'openSource': await this.openSource(uri); break;
             case 'openDiff': await this.openDiff(uri, message.filePath, message.revision); break;
             default: return;
           }
-        } catch (error) { actionError = failure(error); }
+        } catch (error) {
+          if (!pdfGenerationStarted && ['generateReviewPdf', 'regenerateReviewPdf'].includes(message.type) && !disposed) {
+            await panel.webview.postMessage({type: 'pdfGenerationProgress', progress: null});
+            await panel.webview.postMessage({type: 'pdfGenerationResult', outcome: 'failed', error: failure(error)});
+          }
+          if (['generateReviewPdf', 'regenerateReviewPdf', 'importPdfReview', 'applyPdfReview'].includes(message.type)) pdfActionError = failure(error);
+          else actionError = failure(error);
+        }
         if (message.type === 'decide' && typeof message.quickDecisionId === 'string' && !disposed) {
           await panel.webview.postMessage({type: 'quickDecisionResult', quickDecisionId: message.quickDecisionId,
             filePath: message.filePath, hunkId: message.hunkId, decision: message.decision,
             success: quickDecisionSucceeded, error: actionError});
         }
-        if (['editPending', 'editAndAccept', 'ignoreEdited'].includes(message.type) && !disposed) {
+        if ((['editPending', 'editAndAccept', 'ignoreEdited'].includes(message.type) ||
+            (message.type === 'acceptThrough' && typeof message.editId === 'string')) && !disposed) {
           await panel.webview.postMessage({type: 'editResult', editId: message.editId, filePath: message.filePath,
             hunkId: message.hunkId, success: editResult !== undefined, error: actionError, ...editResult});
           actionError = undefined; // The draft editor owns edit errors and keeps the draft.
@@ -1220,7 +1803,8 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
           actionError = undefined;
         }
         // Actions join their final refresh; readiness and errors need a new delivery.
-        await update(message.type === 'ready' || actionError !== undefined);
+        await update(message.type === 'ready' || actionError !== undefined || pdfActionError !== undefined,
+          message.type === 'ready' || actionError !== undefined || pdfActionError !== undefined || deliveries === deliveriesBeforeAction);
         if (message.type === 'ready' && !disposed) {
           await this.deliverFirstChange(panel);
           await this.deliverQuickReview(panel);
@@ -1235,13 +1819,16 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
       disposed = true;
       ++generation;
       if (this.panels.get(uri.toString()) === panel) {
+        // VS Code may invalidate all panel getters before this callback. Remove
+        // the binding first and use the last live focus state during cleanup.
+        this.panels.delete(uri.toString());
+        this.quickReview.delete(panel);
         // Closing a preview may expose its source tab. Keep that viewing session
         // as JSON; a subsequent activation after switching away can open again.
         const hasSource = vscode.workspace.textDocuments.some(document => document.uri.toString() === uri.toString());
-        if (hasSource && (panel.active || this.activeSourceDocument?.uri.toString() === uri.toString() ||
+        if (hasSource && (panelWasActive || this.activeSourceDocument?.uri.toString() === uri.toString() ||
             (!this.activeSourceDocument && this.activeUri?.toString() === uri.toString()))) this.suppressSource(uri);
         if (this.activeUri?.toString() === uri.toString()) this.activeUri = undefined;
-        this.panels.delete(uri.toString());
       }
       this.quickReview.delete(panel);
       this.syncQuickReviewContext();
@@ -1278,12 +1865,16 @@ class RequestTree implements vscode.TreeDataProvider<vscode.Uri>, vscode.Disposa
 
 export async function activate(context: vscode.ExtensionContext) {
   let failNextRequestWriteAfterSave = false;
+  let confirmNextPdfBuildForTest = false;
   const service = new ReviewService(context, context.extensionMode === vscode.ExtensionMode.Test ? async (uri, bytes) => {
     await vscode.workspace.fs.writeFile(uri, bytes);
     if (failNextRequestWriteAfterSave) {
       failNextRequestWriteAfterSave = false;
       throw new Error('Injected request-write failure after saving bytes.');
     }
+  } : undefined, undefined, context.extensionMode === vscode.ExtensionMode.Test ? async (...args) => {
+    if (confirmNextPdfBuildForTest) {confirmNextPdfBuildForTest = false; return true;}
+    return confirmPdfBuild(...args);
   } : undefined);
   const snapshots = new SnapshotProvider();
   const editor = new ReviewEditor(context, service, snapshots);
@@ -1334,12 +1925,13 @@ export async function activate(context: vscode.ExtensionContext) {
   };
   const requests = vscode.workspace.createFileSystemWatcher('**/*.rr');
   const targets = vscode.workspace.createFileSystemWatcher('**/*');
+  const reviewPdfs = vscode.workspace.createFileSystemWatcher('**/*.rr.pdf');
   const changed = (uri: vscode.Uri) => {
     if (uri.path.endsWith('.rr')) { tree.refresh(); service.changed(); }
     else if (service.isTarget(uri)) service.changed();
   };
   context.subscriptions.push(
-    service, tree, requests, targets, editor,
+    service, tree, requests, targets, reviewPdfs, editor,
     {dispose: () => {disposed = true; bridge?.dispose(); diagnosticOutput?.dispose();}},
     vscode.window.registerWebviewPanelSerializer(VIEW, editor),
     vscode.window.onDidChangeActiveTextEditor(active => editor.autoPreview(active)),
@@ -1352,6 +1944,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.createTreeView('revisionRequest.requests', {treeDataProvider: tree}),
     requests.onDidCreate(changed), requests.onDidDelete(changed), requests.onDidChange(changed),
     targets.onDidChange(changed), targets.onDidDelete(changed),
+    reviewPdfs.onDidCreate(uri => service.pdfChanged(uri)), reviewPdfs.onDidChange(uri => service.pdfChanged(uri)), reviewPdfs.onDidDelete(uri => service.pdfChanged(uri)),
     vscode.workspace.onDidChangeTextDocument(event => changed(event.document.uri)),
     vscode.workspace.onDidSaveTextDocument(document => changed(document.uri)),
     vscode.workspace.onDidGrantWorkspaceTrust(() => {service.changed(); publishWorkspaces();}),
@@ -1404,7 +1997,21 @@ export async function activate(context: vscode.ExtensionContext) {
             'Created ' + path.basename(created.uri.fsPath) + ' from a Git commit. Review it against a file matching that commit.',
             'Open RR as JSON');
           if (choice === 'Open RR as JSON') await editor.openSource(created.uri);
-        } else await editor.openPreview(created.uri);
+        } else {
+          await editor.openPreview(created.uri);
+          if (created.generatePdf) {
+            // Creation has released the review queue; PDF generation owns its
+            // own transaction and keeps the same compiler-consent checks.
+            try {
+              const state = await service.getState(created.uri);
+              await vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
+                title: 'Generating review PDF…'}, () => service.generateReviewPdf(created.uri, state.revision));
+            } catch (error) {
+              void vscode.window.showWarningMessage('Created ' + path.basename(created.uri.fsPath) +
+                ', but the review PDF could not be generated. ' + failure(error));
+            } finally { service.changed(); }
+          }
+        }
       } catch (error) { void vscode.window.showErrorMessage(failure(error)); }
     }),
     ...['revisionRequest.toggleQuickReview', 'revisionRequest.enableQuickReview', 'revisionRequest.disableQuickReview'].map(command =>
@@ -1443,10 +2050,14 @@ export async function activate(context: vscode.ExtensionContext) {
     ...(context.extensionMode === vscode.ExtensionMode.Test ? {
       testRunExclusive: <T>(action: () => Promise<T>) => service.runExclusive(action),
       testFailNextRequestWriteAfterSave: () => {failNextRequestWriteAfterSave = true;},
+      testConfirmNextPdfBuild: () => {confirmNextPdfBuildForTest = true;},
       testRestorePreview: (panel: vscode.WebviewPanel, state: unknown) => editor.deserializeWebviewPanel(panel, state),
       resolveCompletion: (uri: vscode.Uri, completionId: string, revision: string, deleteRequest: boolean, rememberChoice: boolean) =>
         service.resolveCompletion(uri, completionId, revision, deleteRequest, rememberChoice),
       deleteRequest: (uri: vscode.Uri) => service.deleteRequest(uri),
+      generateReviewPdf: (uri: vscode.Uri, revision: string, replace = false) => service.generateReviewPdf(uri, revision, replace),
+      importPdfReview: (uri: vscode.Uri, revision: string) => service.importPdfReview(uri, revision),
+      applyPdfReview: (uri: vscode.Uri, revision: string, pdfHash: string) => service.applyPdfReview(uri, revision, pdfHash),
       editPending: (uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string) =>
         service.editPending(uri, file, hunk, draft, revision),
       editAndAccept: (uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string) =>
@@ -1456,7 +2067,9 @@ export async function activate(context: vscode.ExtensionContext) {
     decide: (uri: vscode.Uri, file: string, hunk: string | undefined, decision: 'accepted' | 'ignored', revision: string) =>
       service.decide(uri, file, hunk, decision, revision),
     undo: (uri: vscode.Uri, file: string, hunk: string, revision: string) =>
-      service.undo(uri, file, hunk, revision)
+      service.undo(uri, file, hunk, revision),
+    undoFile: (uri: vscode.Uri, file: string, revision: string) =>
+      service.undoFile(uri, file, revision)
   };
 }
 export function deactivate() {}

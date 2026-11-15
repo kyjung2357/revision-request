@@ -6,7 +6,7 @@ import { listGitFileHistory, type GitOriginal } from './gitOriginal';
 export interface CreateRequestViewOptions {
   extensionUri: vscode.Uri;
   defaultUri: vscode.Uri;
-  create: (original: vscode.Uri, proposed: vscode.Uri, isCancelled: () => boolean, gitOriginal?: GitOriginal) => Promise<vscode.Uri>;
+  create: (original: vscode.Uri, proposed: vscode.Uri, isCancelled: () => boolean, gitOriginal: GitOriginal | undefined, generatePdf: boolean) => Promise<vscode.Uri>;
 }
 let active: {panel: vscode.WebviewPanel; result: Promise<vscode.Uri | undefined>} | undefined;
 const escape = (value: string) => value.replace(/[&<>"']/g, character => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[character]!));
@@ -31,7 +31,9 @@ export function createRequestViewHtml(webview: vscode.Webview, extensionUri: vsc
 <p class="hint">The saved file containing the changes you want to propose. With a Git original, this defaults to the current file.</p>
 <div class="path-display" id="proposed-path" aria-live="polite">No file selected</div></section>
 <section class="result" aria-labelledby="result-label"><h2 id="result-label">Request file</h2><div id="output-path" class="path-display" aria-live="polite">Choose an original to see where the request will be saved.</div>
-<p class="hint">The request is saved beside the original as <code>original.ext.rr</code>. Existing requests are never overwritten.</p></section>
+<p class="hint">The request is saved beside the original as <code>original.ext.rr</code>. Existing requests are never overwritten.</p>
+<label class="pdf-option disabled" id="pdf-option"><input id="generate-pdf" type="checkbox" disabled aria-describedby="pdf-hint"><span>Generate a review PDF</span></label>
+<p class="hint" id="pdf-hint">Available for LaTeX originals (.tex, .ltx, .latex).</p></section>
 <p class="note">Both input files stay unchanged. Only <strong>Accept</strong> in the review applies a change to the original.</p>
 <p id="git-notice" class="note" hidden>This request uses the selected commit as its baseline. Share it with someone reviewing that version; your current file may already contain the changes.</p>
 <p id="error-message" class="error" role="alert" hidden></p>
@@ -48,6 +50,8 @@ export function showCreateRequestView(options: CreateRequestViewOptions): Promis
     {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(options.extensionUri, 'media')]});
   let original: vscode.Uri | undefined, proposed: vscode.Uri | undefined;
   let gitOriginal: GitOriginal | undefined;
+  let generatePdf = false;
+  const pdfSupported = () => !gitOriginal && /\.(?:tex|ltx|latex)$/i.test(original?.fsPath ?? '');
   let busy = false, selecting = false, disposed = false, error: string | undefined;
   let resolve!: (uri: vscode.Uri | undefined) => void;
   const result = new Promise<vscode.Uri | undefined>(done => {resolve = done;});
@@ -57,14 +61,23 @@ export function showCreateRequestView(options: CreateRequestViewOptions): Promis
       output:original ? original.fsPath + '.rr' : undefined,
       originalMode: gitOriginal ? 'git' : 'workspace',
       originalRevision: gitOriginal ? [gitOriginal.commit.slice(0, 8), gitOriginal.date, gitOriginal.subject].filter(Boolean).join(' · ') : undefined,
-      busy, selecting, error});
+      pdfSupported: pdfSupported(), generatePdf, busy, selecting, error});
   };
   const messages = panel.webview.onDidReceiveMessage(async (message: unknown) => {
-    if (disposed || !message || typeof message !== 'object') return;
+    if (disposed || !message || typeof message !== 'object' || Array.isArray(message)) return;
     const command = (message as {command?: unknown}).command;
     if (command === 'ready') { state(); return; }
     if (busy || selecting) return;
     if (command === 'cancel') { panel.dispose(); return; }
+    if (command === 'setGeneratePdf') {
+      const value = (message as {value?: unknown}).value;
+      if (typeof value === 'boolean' && Object.keys(message).length === 2 &&
+          Object.keys(message).every(key => key === 'command' || key === 'value')) {
+        generatePdf = value && pdfSupported();
+      }
+      state();
+      return;
+    }
     if (command === 'selectOriginal' || command === 'selectProposed') {
       selecting = true; error = undefined; state();
       try {
@@ -110,7 +123,7 @@ export function showCreateRequestView(options: CreateRequestViewOptions): Promis
         // Replace all baseline fields only after every native selection succeeds.
         if (selectedCommit) proposed = picked;
         else if (gitOriginal && proposed?.toString() === original?.toString()) proposed = undefined;
-        original = picked; gitOriginal = selectedCommit;
+        original = picked; gitOriginal = selectedCommit; generatePdf = false;
       } catch (failure) { if (!disposed) error = failure instanceof Error ? failure.message : 'The file could not be selected.'; }
       finally { selecting = false; state(); }
       return;
@@ -118,7 +131,7 @@ export function showCreateRequestView(options: CreateRequestViewOptions): Promis
     if (command === 'create' && original && proposed) {
       busy = true; error = undefined; state();
       try {
-        const created = await options.create(original, proposed, () => disposed, gitOriginal);
+        const created = await options.create(original, proposed, () => disposed, gitOriginal, generatePdf && pdfSupported());
         if (!disposed) { resolve(created); panel.dispose(); }
       } catch (failure) { if (!disposed) error = failure instanceof Error ? failure.message : 'The request could not be created.'; }
       finally { busy = false; state(); }

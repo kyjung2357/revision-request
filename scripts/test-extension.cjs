@@ -34,6 +34,8 @@ async function main() {
     'editor.formatOnSave': false,
   }, null, 2));
   await buildAll();
+  // The test bundle also imports the PDF reader and needs its adjacent worker.
+  await fs.copyFile(path.join(root, '.codex-build', 'pdf-review-worker.cjs'), path.join(scratch, 'pdf-review-worker.cjs'));
   await build({
     entryPoints: [path.join(root, 'test', 'extension.test.ts')],
     outfile: testBundle,

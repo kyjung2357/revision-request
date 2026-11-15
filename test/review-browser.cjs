@@ -80,20 +80,38 @@ function mockScript() {
     `window.acquireVsCodeApi = () => ({ getState: () => window.__savedState, setState: value => { window.__savedState = value; sessionStorage.setItem('rr-view-state', JSON.stringify(value)); }, postMessage: message => {\n` +
     `window.__messages.push(structuredClone(message));\n` +
     `if (message.type === 'reviewActions' && !window.__deferReviewActions) { queueMicrotask(()=>window.dispatchEvent(new MessageEvent('message',{data:{type:'reviewActionsResult',editId:message.editId,reviewActions:window.__review.files.find(f=>f.path===message.filePath)?.hunks.find(h=>h.id===message.hunkId)?.reviewActions||[{id:'comment',label:'Keep original as comments',enabled:true}]}}))); }\n` +
-    `if (message.type === 'decide' || message.type === 'decideFile' || message.type === 'undo') {\n` +
+    `if (message.type === 'decide' || message.type === 'decideFile' || message.type === 'undo' || message.type === 'undoFile') {\n` +
     `if (window.__deferDecisions) return;\n` +
     `const next = structuredClone(window.__review); const file = next.files.find(item => item.path === message.filePath);\n` +
     `if (!file || message.revision !== next.revision) throw new Error('Invalid decision transport');\n` +
-    `if (message.type === 'undo') { const hunk = file.hunks.find(item => item.id === message.hunkId); if (!hunk || hunk.decision === 'pending') throw new Error('Invalid undo transport'); hunk.decision = 'pending'; }\n` +
+    `if (message.type === 'undoFile') { for (const hunk of file.hunks) hunk.decision = 'pending'; }\n` +
+    `else if (message.type === 'undo') { const hunk = file.hunks.find(item => item.id === message.hunkId); if (!hunk || hunk.decision === 'pending') throw new Error('Invalid undo transport'); hunk.decision = 'pending'; }\n` +
     `else for (const hunk of file.hunks) if (hunk.decision === 'pending' && (message.type === 'decideFile' || hunk.id === message.hunkId)) hunk.decision = message.decision;\n` +
     `if (next.closed && file.hunks.some(hunk => hunk.decision === 'pending')) next.closed = false;\n` +
     `window.__setReview(next); if(message.quickDecisionId && !window.__deferQuickAck) queueMicrotask(()=>window.dispatchEvent(new MessageEvent("message",{data:{type:"quickDecisionResult",quickDecisionId:message.quickDecisionId,filePath:message.filePath,hunkId:message.hunkId,decision:message.decision,success:true}}))); }\n` +
     `} });\n`;
 }
 
+function profileReviewScript(script) {
+  if (!process.env.RR_UI_PROFILE) return script;
+  let source=script.toString();const start=source.indexOf('  function render() {'),end=source.indexOf("  window.addEventListener('message'",start);
+  let render=source.slice(start,end);
+  render=render.replace('    if (!state) return;','    if (!state) return; const phases = {}; let phaseStart = performance.now(); const mark = name => {phases[name] = performance.now() - phaseStart; phaseStart = performance.now();};');
+  for(const [statement,name] of [
+    ['    captureViewport();','capture'],
+    ['      const documentView = renderDocument(file, busy);','document'],
+    ['    reconcileChildren(app, appChildren);','reconcile'],
+    ['    viewRows = Array.from(root.querySelectorAll(\'[data-row-key]\'));','overview'],
+    ['    updateLayout(); restoreViewport();','layout'],
+    ['    saveViewState();','finish']
+  ]) render=render.replace(statement,statement+' mark('+JSON.stringify(name)+');');
+  render=render.replace('    saveViewState(); mark("finish");','    saveViewState(); mark("finish"); window.__renderPhases = phases;');
+  return Buffer.from(source.slice(0,start)+render+source.slice(end));
+}
+
 async function startServer() {
   const [css,js,createCss,createJs,highlightJs] = await Promise.all([
-    ...['review.css','review.js','create-request.css','create-request.js'].map(name=>fs.readFile(path.join(root,'media',name))),
+    ...['review.css','review.js','create-request.css','create-request.js'].map(name=>fs.readFile(name==='review.js' && process.env.RR_UI_BASELINE_SCRIPT ? process.env.RR_UI_BASELINE_SCRIPT : path.join(root,'media',name))),
     fs.readFile(path.join(runDir,'review-highlight.js'))
   ]);
   const createTheme = ':root{--vscode-foreground:#d4d4d4;--vscode-editor-background:#1e1e1e;--vscode-descriptionForeground:#aaa;--vscode-input-background:#252526;--vscode-input-foreground:#d4d4d4;--vscode-panel-border:#555;--vscode-button-secondaryForeground:#fff;--vscode-button-secondaryBackground:#3a3d41;--vscode-button-secondaryHoverBackground:#45494e;--vscode-button-foreground:#fff;--vscode-button-background:#0e639c;--vscode-button-hoverBackground:#1177bb;--vscode-focusBorder:#007fd4;--vscode-errorForeground:#f48771;}';
@@ -105,7 +123,7 @@ async function startServer() {
   const routes = new Map([
     ['/', ['text/html; charset=utf-8', html]],
     ['/review.css', ['text/css; charset=utf-8', css]],
-    ['/review.js', ['text/javascript; charset=utf-8', js]],
+    ['/review.js', ['text/javascript; charset=utf-8', profileReviewScript(js)]],
     ['/review-highlight.js', ['text/javascript; charset=utf-8', highlightJs]],
     ['/mock.js', ['text/javascript; charset=utf-8', Buffer.from(mockScript())]],
     ['/create', ['text/html; charset=utf-8', Buffer.from(createHtml)]],
@@ -1010,6 +1028,98 @@ async function runEditorTests(width) {
   });
 }
 
+async function clickReviewSurface(selector) {
+  const point = await cdp.evaluate('(() => {const node=document.querySelector('+JSON.stringify(selector)+');if(!node)throw Error("Missing click target: "+'+JSON.stringify(selector)+');node.scrollIntoView({block:"nearest"});const r=node.getBoundingClientRect();return{x:r.x+Math.min(6,r.width/2),y:r.y+Math.min(7,r.height/2)};})()');
+  await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+  await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
+  await settle();
+}
+async function runEditorExitTests(width) {
+  const saves = () => cdp.evaluate('window.__messages.filter(message=>message.type==="editPending")');
+  const begin = async (mode, direct = false) => {
+    await resetFixture(width);
+    if ((await unifiedSnapshot()).unified !== (mode === 'unified')) await toggleLayout();
+    if (direct) {await cdp.evaluate('window.__setReview('+JSON.stringify(singleLineFixture())+')');await settle();}
+    await openEdit(direct ? 'direct' : 'grow');
+  };
+  const applySavedState = async (message, revision) => {
+    await cdp.evaluate('(() => {const next=structuredClone(window.__review),hunk=next.files[0].hunks.find(h=>h.id==='+JSON.stringify(message.hunkId)+');next.revision='+JSON.stringify(revision)+';hunk.after='+JSON.stringify(message.draft+'\n')+';hunk.newLines='+message.draft.split('\n').length+';hunk.id+="-saved";delete hunk.inlineChanges;window.__setReview(next);})()');
+    await settle();
+  };
+  for (const mode of ['sideBySide','unified']) {
+    await runTest(width+'px '+mode+': code clicks and Alt-click cursors keep the active draft without saving',async()=>{
+      await begin(mode);await writeDraft('alpha one\nbeta one');
+      await clickEditorOffset(2,false);assert.equal((await editSnapshot()).selection[0],2);
+      await clickEditorOffset(12,true);assert.equal((await editorCursors()).count,2);
+      assert.equal((await saves()).length,0);assert.equal((await editSnapshot()).draft,'alpha one\nbeta one');
+      await clickMore('grow');assert.ok(await cdp.evaluate('Boolean(document.querySelector(".review-action-menu"))'));
+      assert.equal((await saves()).length,0,'Opening the action menu keeps the proposal editor active');
+      await cdp.evaluate('document.querySelector(".review-action-why").click()');await settle();
+      assert.ok(await editSnapshot());assert.equal((await saves()).length,0,'Explanation clicks do not auto-save');
+      await cdp.evaluate('document.querySelector(".why-popover .why-close").click()');await settle();
+      await editorKey('Escape');if(await editSnapshot())await editorKey('Escape');
+    });
+    for (const [name,selector] of [
+      ['line-number gutter','.pending-editor .line-number'],
+      ['original code','.editing-original .code-text'],
+      ['another pending row','.hunk:not(.hunk-editing) [data-edit-hunk]'],
+      ['unchanged context','.code-side.left.context .code-text'],
+      ['header text','.pane-banner.left .eyebrow']
+    ]) await runTest(width+'px '+mode+': clicking '+name+' saves only the proposal and leaves it pending',async()=>{
+      await begin(mode);const original=await originalProjection();const draft='Saved local proposal.\nSecond line.';
+      await writeDraft(draft);await clickReviewSurface(selector);
+      const messages=await saves(),message=messages.at(-1);
+      assert.equal(messages.length,1);assert.deepEqual({...message,editId:undefined},{type:'editPending',filePath:fixture.files[0].path,hunkId:'grow',revision:fixture.revision,draft,editId:undefined});
+      assert.ok(message.editId);assert.equal((await editSnapshot()).readOnly,true);
+      await clickReviewSurface('.pane-banner.left .eyebrow');assert.equal((await saves()).length,1,'Pending save cannot be submitted twice');
+      assert.equal(await cdp.evaluate('window.__messages.some(m=>["editAndAccept","ignoreEdited","decide","decideFile","undo"].includes(m.type))'),false);
+      await editAck(message,{success:true,changed:true,revision:'saved-'+mode+'-'+name});
+      assert.equal(await editSnapshot(),null,'Matching successful acknowledgement exits editing');
+      await applySavedState(message,'saved-'+mode+'-'+name);
+      assert.equal(await editSnapshot(),null,'The saved state must not reopen its native input');
+      assert.equal(await originalProjection(),original,'Saving a proposal cannot change the original projection');
+      const current=await cdp.evaluate('window.__review.files[0].hunks[0]');
+      assert.equal(current.after,draft+'\n');assert.equal(current.decision,'pending');
+      assert.equal(await cdp.evaluate('window.__savedState.editing'),null);
+    });
+    await runTest(width+'px '+mode+': unchanged single-line draft exits after its no-op save acknowledgement',async()=>{
+      await begin(mode,true);const initial=await editSnapshot();
+      await clickReviewSurface('.pending-editor .line-number');
+      const message=(await saves()).at(-1);assert.ok(message);assert.equal(message.draft,initial.draft);
+      await editAck(message,{success:true,changed:false,revision:fixture.revision});
+      await cdp.evaluate('window.__setReview(structuredClone(window.__review))');await settle();
+      assert.equal(await editSnapshot(),null,'An unchanged save still exits the direct input');
+      assert.equal(await cdp.evaluate('window.__review.files[0].hunks[0].decision'),'pending');
+    });
+    await runTest(width+'px '+mode+': failed outside save retains the draft and retries with a new correlation ID',async()=>{
+      await begin(mode,true);const draft='Keep my unsaved edit.';
+      await writeDraft(draft);await clickReviewSurface('.pending-editor .line-number');
+      const first=(await saves()).at(-1);assert.ok(first);
+      await editAck(first,{success:true,editId:'unrelated-save',revision:'unrelated'});
+      assert.equal((await editSnapshot()).draft,draft);assert.equal((await editSnapshot()).readOnly,true);
+      await editAck(first,{success:false,error:'The request changed. Your draft is kept.'});
+      assert.equal((await editSnapshot()).draft,draft);assert.equal((await editSnapshot()).readOnly,false);
+      assert.match((await editSnapshot()).error,/request changed/);
+      await clickReviewSurface('.pane-banner.left .eyebrow');
+      const retry=(await saves()).at(-1);assert.notEqual(retry.editId,first.editId);assert.equal(retry.draft,draft);
+      await editAck(first,{success:true,revision:'late-old-save'});assert.equal((await editSnapshot()).readOnly,true);
+      await editAck(retry,{success:true,revision:'saved-direct'});await applySavedState(retry,'saved-direct');
+      assert.equal(await editSnapshot(),null,'Single-line direct input remains closed after saved state');
+    });
+    await runTest(width+'px '+mode+': stale or conflicted outside clicks never discard or silently save a draft',async()=>{
+      for(const conflict of [false,true]) {
+        await begin(mode);await writeDraft('Retain this draft for manual recovery.');
+        await cdp.evaluate('(() => {const next=structuredClone(window.__review);'+(conflict?'next.files[0].hunks[0].conflict="Source overlap.";':'next.revision="new-raw-revision";')+'window.__setReview(next);})()');await settle();
+        await clickReviewSurface('.pane-banner.left .eyebrow');
+        assert.equal((await saves()).length,0);assert.equal((await editSnapshot()).draft,'Retain this draft for manual recovery.');
+        await cdp.evaluate('document.querySelector(".pending-editor textarea").focus({preventScroll:true})');await editorKey('Escape');
+      }
+    });
+  }
+  if ((await unifiedSnapshot()).unified) await toggleLayout();
+  await resetFixture(width);
+}
+
 async function runEditorDecisionTests(width) {
   await runTest(width+'px: configured editor shortcuts approve once and retain drafts across settings, IME and failed decisions',async()=>{
     await resetFixture(width);await openEdit('grow');await writeDraft('Editable draft');
@@ -1050,6 +1160,99 @@ async function runEditorDecisionTests(width) {
   });
 }
 
+async function runAcceptThroughTests(width) {
+  const sent = () => cdp.evaluate('window.__messages.filter(message=>message.type==="acceptThrough")');
+  const makeState = () => {
+    const next=structuredClone(fixture),lines=Array.from({length:30},(_,index)=>'Original line '+(index+1)+'.\n');
+    const file=next.files[0];file.before=lines.join('');
+    file.hunks=[2,6,10,14,18].map((line,index)=>({id:'through-'+index,index,start:lines.slice(0,line-1).join('').length,
+      end:lines.slice(0,line).join('').length,before:lines[line-1],after:'Proposed line '+line+'.\n',oldStart:line,newStart:line,
+      oldLines:1,newLines:1,contextBefore:[],contextAfter:[],decision:index===1?'accepted':index===2?'ignored':'pending',explanation:'Reason '+index}));
+    // JSON array order does not define the visual prefix.
+    file.hunks=[file.hunks[4],file.hunks[2],file.hunks[0],file.hunks[3],file.hunks[1]];
+    next.rawRevision=next.revision;return next;
+  };
+  const begin = async mode => {
+    await resetFixture(width);
+    if((await unifiedSnapshot()).unified!==(mode==='unified'))await toggleLayout();
+    await cdp.evaluate('window.__messages=[];window.__setReview('+JSON.stringify(makeState())+')');await settle();
+  };
+  const control = () => cdp.evaluate('(() => {const node=document.querySelector(".review-action-accept-through");return node?{text:node.textContent,disabled:node.disabled,role:node.getAttribute("role"),key:node.dataset.focusKey}:null;})()');
+  const click = async () => {await cdp.evaluate('document.querySelector(".review-action-accept-through")?.click()');await settle();};
+  const settleDecision = async (message, revision) => {
+    await cdp.evaluate('(() => {const next=structuredClone(window.__review),file=next.files[0];next.revision='+JSON.stringify(revision)+';next.busy=false;for(const hunk of file.hunks){if(["through-0","through-3"].includes(hunk.id)){hunk.decision="accepted";if(hunk.id==="through-3"&&'+JSON.stringify(message.draft!==undefined)+'){hunk.after='+JSON.stringify((message.draft||'')+'\n')+';hunk.newLines='+JSON.stringify((message.draft||'').split('\n').length)+';delete hunk.inlineChanges;}}}window.__setReview(next);})()');await settle();
+  };
+  for(const mode of ['sideBySide','unified']) {
+    await runTest(width+'px '+mode+': Accept all up to here is the first accessible menu item and sends one guarded prefix action',async()=>{
+      await begin(mode);const before=await cdp.evaluate('JSON.stringify(window.__review)');await clickMore('through-3');
+      const labels=await cdp.evaluate('[...document.querySelectorAll(".review-action-menu [role=menuitem]")].map(node=>node.textContent)');
+      assert.equal(labels[0],'Accept all up to here');assert.equal(labels[1],'Show change explanation');
+      assert.deepEqual(await control(),{text:'Accept all up to here',disabled:false,role:'menuitem',key:'menu:acceptThrough'});
+      assert.equal(await cdp.evaluate('document.activeElement.dataset.focusKey'),'menu:acceptThrough');
+      await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"End",bubbles:true,cancelable:true}))');
+      await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Home",bubbles:true,cancelable:true}))');
+      assert.equal(await cdp.evaluate('document.activeElement.dataset.focusKey'),'menu:acceptThrough');
+      await click();const messages=await sent();assert.equal(messages.length,1);
+      assert.deepEqual(messages[0],{type:'acceptThrough',filePath:fixture.files[0].path,hunkId:'through-3',revision:fixture.revision});
+      assert.equal(await cdp.evaluate('JSON.stringify(window.__review)'),before,'Bulk approval must wait for the host before changing any status');
+      assert.equal(await cdp.evaluate('Boolean(document.querySelector(".review-action-menu"))'),false);
+      assert.equal(await cdp.evaluate('window.__messages.filter(message=>["decide","decideFile","editPending","editAndAccept"].includes(message.type)).length'),0,'A prefix action is not a loop of single-row decisions');
+      await settleDecision(messages[0],'through-accepted');
+      const statuses=await cdp.evaluate('Object.fromEntries(window.__review.files[0].hunks.map(hunk=>[hunk.id,hunk.decision]))');
+      assert.deepEqual(statuses,{'through-4':'pending','through-2':'ignored','through-0':'accepted','through-3':'accepted','through-1':'accepted'});
+      const active=await cdp.evaluate('[...document.querySelectorAll(".hunk-pending")].map(node=>node.dataset.overviewHunk)');assert.deepEqual(active,['through-4']);
+    });
+    await runTest(width+'px '+mode+': delayed action capabilities preserve keyboard focus away from bulk approval',async()=>{
+      await begin(mode);await cdp.evaluate('window.__deferReviewActions=true');await clickMore('through-3');
+      const request=await cdp.evaluate('window.__messages.filter(message=>message.type==="reviewActions").at(-1)');
+      await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}))');
+      assert.equal(await cdp.evaluate('document.activeElement.classList.contains("review-action-why")'),true);
+      await cdp.evaluate('window.dispatchEvent(new MessageEvent("message",{data:'+JSON.stringify({type:'reviewActionsResult',editId:request.editId,reviewActions:[]})+'}))');await settle();
+      assert.equal(await cdp.evaluate('document.activeElement.classList.contains("review-action-why")'),true,'Async menu refresh cannot redirect Enter to Accept all up to here');
+      await cdp.evaluate('document.activeElement.click()');await settle();assert.equal((await sent()).length,0);
+      assert.ok(await cdp.evaluate('Boolean(document.querySelector(".why-popover"))'));
+      await cdp.evaluate('document.querySelector(".why-close").click();window.__deferReviewActions=false');await settle();
+    });
+    await runTest(width+'px '+mode+': prefix approval blocks earlier pending conflicts but permits later and resolved conflicts',async()=>{
+      for(const [id,blocked] of [['through-0',true],['through-3',true],['through-4',false],['through-1',false],['through-2',false]]) {
+        await begin(mode);await cdp.evaluate('(() => {const next=structuredClone(window.__review);next.files[0].hunks.find(hunk=>hunk.id==='+JSON.stringify(id)+').conflict="Manual source overlap.";window.__setReview(next);})()');await settle();await clickMore('through-3');
+        assert.equal((await control()).disabled,blocked,'Only pending conflicts within the visual prefix prevent bulk approval: '+id);
+        if(blocked){await click();assert.equal((await sent()).length,0);}else{await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await settle();}
+      }
+    });
+    await runTest(width+'px '+mode+': trust, busy and current source guards prevent unavailable prefix actions',async()=>{
+      for(const guard of ['untrusted','issue','busy']) {
+        await begin(mode);await clickMore('through-3');
+        await cdp.evaluate('(() => {const next=structuredClone(window.__review);'+(guard==='untrusted'?'next.trusted=false;':guard==='issue'?'next.files[0].issue="Save the original before reviewing.";':'next.busy=true;')+'window.__setReview(next);})()');await settle();
+        const item=await control();assert.ok(!item||item.disabled,guard+' cannot approve');await click();assert.equal((await sent()).length,0);
+      }
+      await begin(mode);await clickMore('through-3');
+      await cdp.evaluate('window.__setReview({...structuredClone(window.__review),revision:"new-source-revision"})');await settle();
+      assert.equal(await control(),null,'A menu from an old revision closes instead of approving a different source');assert.equal((await sent()).length,0);
+    });
+    await runTest(width+'px '+mode+': prefix approval submits the current edited draft atomically and preserves it after failure',async()=>{
+      await begin(mode);await openEdit('through-3');const draft='Edited line fourteen.\nA second proposed line.';await writeDraft(draft);await clickMore('through-3');
+      assert.equal((await control()).disabled,false);await click();const first=(await sent()).at(-1);assert.ok(first?.editId);
+      assert.deepEqual({...first,editId:undefined},{type:'acceptThrough',filePath:fixture.files[0].path,hunkId:'through-3',revision:fixture.revision,draft,editId:undefined});
+      assert.equal((await editSnapshot()).draft,draft);assert.equal((await editSnapshot()).readOnly,true);
+      await editAck(first,{success:true,editId:'obsolete-prefix',revision:'obsolete'});assert.equal((await editSnapshot()).readOnly,true);
+      await editAck(first,{success:false,error:'A preceding pending change conflicts. Your draft is kept.'});assert.equal((await editSnapshot()).draft,draft);assert.equal((await editSnapshot()).readOnly,false);
+      await clickMore('through-3');await click();const retry=(await sent()).at(-1);assert.notEqual(retry.editId,first.editId);assert.equal(retry.draft,draft);
+      await editAck(retry,{success:true,changed:true,revision:'edited-prefix'});await settleDecision(retry,'edited-prefix');
+      assert.equal(await editSnapshot(),null);assert.equal(await cdp.evaluate('window.__review.files[0].hunks.find(h=>h.id==="through-4").decision'),'pending');
+      assert.equal(await cdp.evaluate('window.__messages.some(message=>message.type==="editPending"||message.type==="editAndAccept")'),false,'The current draft is never saved in a separate transaction');
+    });
+    await runTest(width+'px '+mode+': stale edited prefix actions keep the draft and cannot approve refreshed proposals',async()=>{
+      await begin(mode);await openEdit('through-3');await writeDraft('Retain this draft.');await clickMore('through-3');
+      await cdp.evaluate('window.__setReview({...structuredClone(window.__review),revision:"different-proposal",rawRevision:"different-json"})');await settle();
+      const staleControl=await control();assert.ok(!staleControl||staleControl.disabled);await click();assert.equal((await sent()).length,0);assert.equal((await editSnapshot()).draft,'Retain this draft.');
+      await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await settle();
+      await cdp.evaluate('document.querySelector(".pending-editor textarea").focus({preventScroll:true})');await editorKey('Escape');
+    });
+  }
+  await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
+}
+
 async function runReviewActionTests(width) {
   await runTest(width+'px: More actions floats without starting an editor and supports keyboard navigation',async()=>{
     await resetFixture(width);if((await unifiedSnapshot()).unified)await toggleLayout();
@@ -1075,8 +1278,10 @@ async function runReviewActionTests(width) {
     const labels=await cdp.evaluate(`(() => {const why=document.querySelector('.review-action-why');return {why:why.textContent,aria:why.getAttribute('aria-label'),reasons:[...document.querySelectorAll('.review-menu-reason')].map(node=>node.textContent)};})()`);
     assert.equal(labels.why,'Show change explanation');assert.equal(labels.aria,'Show change explanation');
     assert.deepEqual(labels.reasons,[]);
-    assert.deepEqual(await cdp.evaluate('[...document.querySelectorAll(".review-action-menu [role=menuitem]")].map(node=>node.textContent)'),['Show change explanation','Keep original as comments'],'Only explanation and original-preservation actions remain');
+    assert.deepEqual(await cdp.evaluate('[...document.querySelectorAll(".review-action-menu [role=menuitem]")].map(node=>node.textContent)'),['Accept all up to here','Show change explanation','Keep original as comments'],'Prefix approval is first, followed by explanation and preservation');
     await screenshot('review-actions-'+width);
+    await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}))');
+    assert.equal(await cdp.evaluate('document.activeElement.classList.contains("review-action-why")'),true);
     await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}))');
     assert.equal(await cdp.evaluate('document.activeElement.dataset.reviewAction'),'comment');
     await cdp.evaluate('document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}))');await settle();
@@ -1353,7 +1558,7 @@ async function runQuickReviewTests(width) {
     const label=width+'px '+(unified?'unified':'side-by-side');
     await runTest(label+': Quick Review sits left of bulk actions without an empty row and defaults off',async()=>{
       await resetQuick(width,unified);const view=await quickSnapshot();
-      assert.equal(view.enabled,false);assert.equal(view.disabled,false);assert.equal(view.selected.length,0);assert.equal(view.bulk.length,2);
+      assert.equal(view.enabled,false);assert.equal(view.disabled,false);assert.equal(view.selected.length,0);assert.equal(view.bulk.length,3);
       assertHeaderRows(view,true,!unified);
       assert.equal(view.colors.border,'rgba(0, 0, 0, 0)','The disabled Quick Review mode has no visible border');
       if(!unified) {assert.ok(Math.abs(view.left.y-view.right.y)<.6);assert.ok(Math.abs(view.left.height-view.right.height)<.6,'Banner heights remain equal');}
@@ -1372,11 +1577,14 @@ async function runQuickReviewTests(width) {
         assert.equal(view.focused.decision,wanted);assert.equal(view.selected[0].id,ids[0]);
       }
       await cdp.evaluate('window.__deferDecisions=true');await quickKey('Tab');view=await quickSnapshot();assert.equal(view.decisions.length,1);
+      assert.deepEqual(view.selected,[],'Submitting removes the old Quick Review outline while waiting');
+      assert.notEqual(view.focused.id,ids[0],'The old approval button is not left focused');
       const sent=view.decisions[0];assert.equal(sent.hunkId,ids[0]);assert.equal(sent.decision,'accepted');assert.equal(typeof sent.quickDecisionId,'string');
       await quickKey('Tab');await quickKey('ArrowRight');
       await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",repeat:true,bubbles:true,cancelable:true}))');
       assert.equal((await quickSnapshot()).decisions.length,1,'Waiting and held Tab cannot submit twice');
-      await quickResolve(sent);await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,1,'State alone cannot authorize advancement');
+      await quickResolve(sent);view=await quickSnapshot();assert.deepEqual(view.selected,[],'State before acknowledgement has no intermediate selection box');assert.notEqual(view.focused.id,ids[0],'Resolved Undo is never briefly focused');
+      await quickKey('Tab');assert.equal((await quickSnapshot()).decisions.length,1,'State alone cannot authorize advancement');
       await cdp.evaluate('(()=>{const control=[...document.querySelectorAll("button[data-quick-decision=accepted]")].find(node=>node.dataset.hunk==='+JSON.stringify(ids[1])+');control.click();})()');
       assert.equal((await quickSnapshot()).decisions.length,1,'A mouse decision also waits for the first acknowledgement');
       await quickAck(sent);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[1]);assert.equal(view.selected[0].decision,'accepted');assert.equal(view.focused.id,ids[1]);
@@ -1386,7 +1594,10 @@ async function runQuickReviewTests(width) {
       await cdp.evaluate('window.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",repeat:true,bubbles:true,cancelable:true}))');
       assert.equal((await quickSnapshot()).decisions.length,1,'Held Tab cannot approve the newly focused item');
       await quickKey('ArrowRight');await quickKey('Tab');const ignored=(await quickSnapshot()).decisions.at(-1);assert.equal(ignored.decision,'ignored');
+      await cdp.evaluate('window.__beforeQuickAck=document.querySelector(".hunk-pending")');
       await quickAck(ignored);assert.notEqual((await quickSnapshot()).selected[0]?.id,ids[2],'Ack alone waits for the state');
+      assert.equal(await cdp.evaluate('window.__beforeQuickAck===document.querySelector(".hunk-pending")'),true,'An early acknowledgement does not redraw the old item');
+      assert.deepEqual((await quickSnapshot()).selected,[],'Early acknowledgement keeps the intermediate outline hidden');
       await quickResolve(ignored);view=await quickSnapshot();assert.equal(view.selected[0].id,ids[2]);assert.equal(view.selected[0].decision,'accepted','Next item resets to Accept');
       assert.ok(Math.abs((view.selected[0].rect.y+view.selected[0].rect.bottom)/2-(view.scroll.rect.y+view.scroll.rect.bottom)/2)<20,'Ignore also centers the next change');
       const centeredTop=view.scroll.top;await quickKey('ArrowRight');await quickKey('ArrowLeft');
@@ -1434,13 +1645,14 @@ async function runQuickReviewTests(width) {
       const next=await resetQuick(width,unified),ids=next.files[0].hunks.map(h=>h.id);
       await quickToggle(true);await quickKey('ArrowLeft');await cdp.evaluate('window.__deferDecisions=true');await quickKey('Tab');
       const failed=(await quickSnapshot()).decisions.at(-1);assert.equal(failed.decision,'ignored','Ignore was selected before the failed request');await quickAck({...failed,quickDecisionId:'obsolete'},true);
-      assert.equal((await quickSnapshot()).selected[0]?.id,ids[0]);
+      assert.deepEqual((await quickSnapshot()).selected,[],'An unrelated acknowledgement cannot restore the waiting outline');
       await quickAck(failed,false,'The source changed. Review again.');
       await cdp.evaluate('window.__setReview({...structuredClone(window.__review),error:"The source changed. Review again."})');await settle();
       let view=await quickSnapshot();assert.equal(view.selected[0].id,ids[0]);assert.equal(view.selected[0].decision,'ignored');assert.equal(view.decisions.length,1);
       await cdp.evaluate('(()=>{const next=structuredClone(window.__review);delete next.error;window.__setReview(next);window.__deferDecisions=false;})()');await settle();
       for(let i=0;i<ids.length;i++){await quickKey('Tab');await settle();}
       view=await quickSnapshot();assert.equal(view.enabled,false);assert.equal(view.selected.length,0);assert.equal(view.modeMessages.at(-1).enabled,false);
+      assert.equal(view.focused.id,undefined,'Completing Quick Review does not flash focus on the final Undo button');
       assert.deepEqual(await cdp.evaluate('window.__review.files[0].hunks.map(h=>h.decision)'),['ignored','accepted','accepted','accepted']);assert.equal(view.decisions.length,5);
     });
     await runTest(label+': menus, explanations and direct editing suspend quick shortcuts',async()=>{
@@ -1482,18 +1694,18 @@ async function runQuickReviewTests(width) {
 async function originalLineSnapshot(id) {
   return cdp.evaluate(`(() => {
     const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)});
-    const go=block?.querySelector('.original-line-button'),buttons=[...block.querySelectorAll('.inline-actions button')];
+    const go=block?.querySelector('.original-line-button'),pdf=block?.querySelector('.original-pdf-button'),buttons=[...block.querySelectorAll('.inline-actions button')];
     const accept=buttons.find(node=>node.textContent==='Accept'),ignore=buttons.find(node=>node.textContent==='Ignore'),more=buttons.find(node=>node.classList.contains('review-menu-toggle'));
     const rect=node=>{if(!node)return null;const r=node.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:r.width,height:r.height};};
-    return {count:block.querySelectorAll('.original-line-button').length,go:rect(go),accept:rect(accept),ignore:rect(ignore),more:rect(more),
+    return {count:block.querySelectorAll('.original-line-button').length,pdfCount:block.querySelectorAll('.original-pdf-button').length,go:rect(go),pdf:rect(pdf),accept:rect(accept),ignore:rect(ignore),more:rect(more),
       original:rect(go?.closest('.code-side')),proposed:rect(accept?.closest('.code-side')),
-      text:go?.textContent,title:go?.title,disabled:go?.disabled,
+      text:go?.textContent,title:go?.title,disabled:go?.disabled,pdfText:pdf?.textContent,pdfTitle:pdf?.title,pdfDisabled:pdf?.disabled,
       firstRemoved:Boolean(go&&block.querySelector('.code-side.removed')===go.closest('.code-side')),
-      quickDecision:go?.dataset.quickDecision};
+      quickDecision:go?.dataset.quickDecision,pdfQuickDecision:pdf?.dataset.quickDecision};
   })()`);
 }
-async function clickOriginalLine(id) {
-  const point=await cdp.evaluate(`(() => {const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)}),button=block.querySelector('.original-line-button');button.scrollIntoView({block:'nearest'});const r=button.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+async function clickOriginalLine(id, pdf = false) {
+  const point=await cdp.evaluate(`(() => {const block=[...document.querySelectorAll('[data-overview-hunk]')].find(node=>node.dataset.overviewHunk===${JSON.stringify(id)}),button=block.querySelector(${JSON.stringify(pdf?'.original-pdf-button':'.original-line-button')});button.scrollIntoView({block:'nearest'});const r=button.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
   await cdp.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
   await cdp.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await settle();
 }
@@ -1613,52 +1825,95 @@ async function runExternalEditTests(width) {
 async function runOriginalLineTests(width) {
   const reset=async unified=>{
     if(await editSnapshot()){await cdp.evaluate('document.querySelector(".pending-editor textarea").focus()');await editorKey('Escape');}
+    await cdp.evaluate('window.__deferDecisions=false');
     await quickToggle(false);await resetFixture(width);if((await unifiedSnapshot()).unified!==unified)await toggleLayout();
   };
+  const navigationMessages=()=>cdp.evaluate('window.__messages.filter(message=>["openTargetLine","openTargetPdf"].includes(message.type))');
   const assertSize=(view,unified)=>{
-    assert.equal(view.count,1,'Each pending block has one original navigation control');
-    assert.equal(view.text,'Go to original');assert.equal(view.title,'Go to original line');assert.equal(view.firstRemoved,true);
-    assert.equal(view.go.height,view.accept.height);assert.equal(view.go.height,18);
-    assert.ok(Math.abs(view.go.width-(view.ignore.right-view.accept.x))<.7,'Navigation spans Accept and Ignore, including their gap');
-    if(unified){assert.ok(Math.abs(view.go.x-view.accept.x)<.7,'Navigation starts directly above Accept');assert.ok(view.go.right<view.more.x,'The ellipsis slot stays empty above');}
-    assert.ok(view.go.x>=view.original.x-.7&&view.go.right<=view.original.right+.7,'Navigation stays inside the original pane');
-    assert.equal(view.quickDecision,undefined,'Navigation is excluded from Quick Review decisions');
+    assert.equal(view.count,1,'Each pending block has one source navigation control');
+    assert.equal(view.pdfCount,1,'Each pending block has one PDF navigation control');
+    assert.equal(view.text,'TeX');assert.equal(view.pdfText,'PDF');assert.equal(view.firstRemoved,true);
+    assert.equal(view.go.height,view.accept.height);assert.equal(view.go.height,18);assert.equal(view.pdf.height,view.ignore.height);
+    assert.ok(Math.abs(view.go.width-view.accept.width)<.7,'Source has the same width as Accept');
+    assert.ok(Math.abs(view.pdf.width-view.ignore.width)<.7,'PDF has the same width as Ignore');
+    assert.ok(Math.abs((view.pdf.x-view.go.right)-(view.ignore.x-view.accept.right))<.7,'Navigation and decision buttons use the same gap');
+    if(unified){assert.ok(Math.abs(view.go.x-view.accept.x)<.7,'Source starts directly above Accept');assert.ok(Math.abs(view.pdf.x-view.ignore.x)<.7,'PDF starts directly above Ignore');assert.ok(view.pdf.right<view.more.x,'The ellipsis slot stays empty above');}
+    assert.ok(view.go.x>=view.original.x-.7&&view.pdf.right<=view.original.right+.7,'Both controls stay inside the original pane');
+    assert.equal(view.quickDecision,undefined,'Source navigation is excluded from Quick Review decisions');
+    assert.equal(view.pdfQuickDecision,undefined,'PDF navigation is excluded from Quick Review decisions');
   };
   for(const unified of [false,true]) {
     const label=width+'px '+(unified?'unified':'side-by-side')+' original navigation';
-    await runTest(label+': the red-row button spans only Accept and Ignore and opens without a decision',async()=>{
-      await reset(unified);const view=await originalLineSnapshot('grow');assertSize(view,unified);assert.equal(view.disabled,false);
-      const before=await cdp.evaluate('structuredClone(window.__review)');await clickOriginalLine('grow');
-      const sent=await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine")');
-      assert.deepEqual(sent,[{type:'openTargetLine',filePath:fixture.files[0].path,hunkId:'grow',revision:fixture.revision}]);
+    await runTest(label+': TeX and PDF occupy the Accept and Ignore slots and navigate without deciding',async()=>{
+      await reset(unified);const view=await originalLineSnapshot('grow');assertSize(view,unified);assert.equal(view.disabled,false);assert.equal(view.pdfDisabled,false);assert.match(view.pdfTitle,/SyncTeX/i);
+      const before=await cdp.evaluate('structuredClone(window.__review)');await clickOriginalLine('grow');await clickOriginalLine('grow',true);
+      assert.deepEqual(await navigationMessages(),['openTargetLine','openTargetPdf'].map(type=>({type,filePath:fixture.files[0].path,hunkId:'grow',revision:fixture.revision})));
       assert.deepEqual(await cdp.evaluate('window.__review'),before,'Navigation does not change proposals or decisions');
       assert.equal(await cdp.evaluate('window.__messages.some(message=>["decide","decideFile","editPending","editAndAccept","ignoreEdited"].includes(message.type))'),false);
       await screenshot('original-line-'+width+'-'+(unified?'unified':'split'));
     });
-    await runTest(label+': editing keeps the original button and preserves an unsaved draft when opening it',async()=>{
+    await runTest(label+': editing preserves draft and selection when either navigation control is clicked',async()=>{
       await reset(unified);await openEdit('shrink');await writeDraft('Unsaved replacement.\nSecond proposed line.');
       const before=await editSnapshot(),view=await originalLineSnapshot('shrink');assertSize(view,unified);
-      await clickOriginalLine('shrink');const after=await editSnapshot();assert.equal(after.draft,before.draft);
-      assert.deepEqual(after.selection,before.selection);assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").at(-1).hunkId'),'shrink');
-      assert.equal(await cdp.evaluate('window.__messages.some(message=>["editPending","editAndAccept","ignoreEdited"].includes(message.type))'),false,'Opening the source never saves or accepts the draft');
+      for(const pdf of [false,true]) {
+        await clickOriginalLine('shrink',pdf);const after=await editSnapshot();assert.equal(after.draft,before.draft);
+        assert.deepEqual(after.selection,before.selection);assert.equal((await navigationMessages()).at(-1).hunkId,'shrink');
+      }
+      assert.equal(await cdp.evaluate('window.__messages.some(message=>["editPending","editAndAccept","ignoreEdited"].includes(message.type))'),false,'Navigation never saves or accepts the draft');
     });
-    await runTest(label+': additions have no original button and pure deletion keeps both navigation and review actions',async()=>{
-      await reset(unified);assert.equal((await originalLineSnapshot('insert')).count,0);
-      const view=await originalLineSnapshot('delete');assertSize(view,unified);
+    await runTest(label+': additions omit navigation while pure deletion keeps both controls',async()=>{
+      await reset(unified);let view=await originalLineSnapshot('insert');assert.equal(view.count,0);assert.equal(view.pdfCount,0);
+      view=await originalLineSnapshot('delete');assertSize(view,unified);
       if(unified)assert.ok(view.go.bottom<=view.accept.y+.7,'Deletion keeps navigation above its decision controls');
-      await clickOriginalLine('delete');await clickDecision('delete','ignore');
-      assert.equal((await originalLineSnapshot('delete')).count,0,'Resolved changes no longer show original-line navigation');
-      assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").length'),1);
+      await clickOriginalLine('delete');await clickOriginalLine('delete',true);await clickDecision('delete','ignore');
+      view=await originalLineSnapshot('delete');assert.equal(view.count,0);assert.equal(view.pdfCount,0,'Resolved changes no longer show navigation');
+      assert.equal((await navigationMessages()).length,2);
     });
-    await runTest(label+': stale source disables navigation and Quick Review still cycles only Accept and Ignore',async()=>{
-      await reset(unified);await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.files[0].issue="The original has changed.";window.__setReview(next);})()');await settle();
-      assert.equal((await originalLineSnapshot('grow')).disabled,true);await clickOriginalLine('grow');
-      assert.equal(await cdp.evaluate('window.__messages.filter(message=>message.type==="openTargetLine").length'),0);
-      await reset(unified);await quickToggle(true);
+    await runTest(label+': stale source and per-block conflicts disable both navigation controls',async()=>{
+      for(const kind of ['issue','conflict']) {
+        await reset(unified);await cdp.evaluate('(()=>{const next=structuredClone(window.__review);'+(kind==='issue'?'next.files[0].issue="The original has changed.";':'next.files[0].hunks[0].conflict="This pending block overlaps a manual edit.";')+'window.__setReview(next);})()');await settle();
+        const view=await originalLineSnapshot('grow');assert.equal(view.disabled,true);assert.equal(view.pdfDisabled,true);await clickOriginalLine('grow');await clickOriginalLine('grow',true);
+        assert.equal((await navigationMessages()).length,0);
+      }
+    });
+    await runTest(label+': busy state and an in-flight decision lock both navigation controls',async()=>{
+      await reset(unified);await cdp.evaluate('window.__setReview({...structuredClone(window.__review),busy:true})');await settle();
+      let view=await originalLineSnapshot('grow');assert.equal(view.disabled,true);assert.equal(view.pdfDisabled,true);
+      await clickOriginalLine('grow');await clickOriginalLine('grow',true);assert.equal((await navigationMessages()).length,0);
+      await reset(unified);await cdp.evaluate('window.__deferDecisions=true');await clickDecision('grow','accept');
+      view=await originalLineSnapshot('shrink');assert.equal(view.disabled,true);assert.equal(view.pdfDisabled,true);
+      await clickOriginalLine('shrink');await clickOriginalLine('shrink',true);assert.equal((await navigationMessages()).length,0);
+      await cdp.evaluate('window.__deferDecisions=false;window.__setReview(structuredClone(window.__review))');await settle();
+      view=await originalLineSnapshot('shrink');assert.equal(view.disabled,false);assert.equal(view.pdfDisabled,false,'An acknowledged refresh unlocks both cached controls');
+    });
+    await runTest(label+': non-TeX files retain source navigation with a disabled PDF slot',async()=>{
+      await reset(unified);await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.files[0].path="examples/source.py";window.__setReview(next);})()');await settle();
+      let view=await originalLineSnapshot('grow');assert.equal(view.text,'Source');assert.equal(view.disabled,false);assert.equal(view.pdfText,'PDF');assert.equal(view.pdfDisabled,true);assert.ok(view.pdfTitle);
+      assert.ok(Math.abs(view.go.width-view.accept.width)<.7);assert.ok(Math.abs(view.pdf.width-view.ignore.width)<.7);
+      await clickOriginalLine('grow',true);assert.equal((await navigationMessages()).length,0);await clickOriginalLine('grow');
+      assert.deepEqual(await navigationMessages(),[{type:'openTargetLine',filePath:'examples/source.py',hunkId:'grow',revision:fixture.revision}]);
+      for(const suffix of ['ltx','LATEX']) {
+        await cdp.evaluate('(()=>{const next=structuredClone(window.__review);next.files[0].path='+JSON.stringify('examples/source.'+suffix)+';window.__setReview(next);})()');await settle();
+        view=await originalLineSnapshot('grow');assert.equal(view.text,'TeX');assert.equal(view.pdfDisabled,false);
+      }
+    });
+    await runTest(label+': an untrusted workspace permits source navigation but disables PDF tools',async()=>{
+      await reset(unified);await cdp.evaluate('window.__setReview({...structuredClone(window.__review),trusted:false})');await settle();
+      let view=await originalLineSnapshot('grow');assert.equal(view.disabled,false);assert.equal(view.pdfDisabled,true);assert.match(view.pdfTitle,/Trust this workspace/i);
+      await clickOriginalLine('grow',true);assert.equal((await navigationMessages()).length,0);await clickOriginalLine('grow');
+      assert.deepEqual(await navigationMessages(),[{type:'openTargetLine',filePath:fixture.files[0].path,hunkId:'grow',revision:fixture.revision}]);
+      await cdp.evaluate('window.__setReview({...structuredClone(window.__review),trusted:true})');await settle();
+      view=await originalLineSnapshot('grow');assert.equal(view.pdfDisabled,false,'Granting trust rebuilds the cached navigation controls');
+      await clickOriginalLine('grow',true);assert.equal((await navigationMessages()).at(-1).type,'openTargetPdf');
+    });
+    await runTest(label+': cached navigation uses the latest revision and Quick Review cycles only Accept and Ignore',async()=>{
+      await reset(unified);await cdp.evaluate('window.__setReview({...structuredClone(window.__review),revision:"new-navigation-revision"})');await settle();
+      await clickOriginalLine('grow',true);assert.equal((await navigationMessages()).at(-1).revision,'new-navigation-revision');
+      await quickToggle(true);
       for(const [key,decision] of [['ArrowRight','ignored'],['ArrowRight','accepted'],['ArrowLeft','ignored']]){
         await quickKey(key);const view=await quickSnapshot();assert.equal(view.selected.length,1);assert.equal(view.selected[0].decision,decision);
       }
-      assert.equal(await cdp.evaluate('document.querySelectorAll(".original-line-button.quick-review-selected").length'),0);
+      assert.equal(await cdp.evaluate('document.querySelectorAll(".original-line-button.quick-review-selected,.original-pdf-button.quick-review-selected").length'),0);
     });
   }
   await reset(false);
@@ -2151,6 +2406,27 @@ async function runUnifiedTests(width) {
   });
 }
 
+async function runHeaderStabilityTests(width) {
+  const snapshot=()=>cdp.evaluate('(() => {const rect=n=>{const r=n.getBoundingClientRect();return {x:r.x,y:r.y,height:r.height,width:r.width};};return {badges:[...document.querySelectorAll(".summary .badge")].map(rect),header:rect(document.querySelector(".comparison-header")),scroll:rect(document.querySelector("[data-scroll-area]"))};})()');
+  for(const pending of [true,false]) {
+    await resetFixture(width);
+    if(!pending) {await cdp.evaluate('(() => {const next=structuredClone(window.__review);next.closed=true;next.files[0].hunks.forEach((h,i)=>h.decision=i%2?"ignored":"accepted");window.__setReview(next);})()');await settle();}
+    await runTest(width+'px: repeated layout toggles keep '+(pending?'pending':'closed')+' status badges and header height fixed',async()=>{
+      const before=await snapshot();
+      for(let count=0;count<6;count++) {
+        await toggleLayout();const after=await snapshot();
+        for(const [i,badge] of after.badges.entries()) for(const axis of ['x','y','height','width']) {
+          assert.ok(Math.abs(badge[axis]-before.badges[i][axis])<.1,'Badge '+i+' '+axis+' moved: '+before.badges[i][axis]+' -> '+badge[axis]);
+        }
+        assert.ok(Math.abs(after.header.height-before.header.height)<.1,'The comparison header height stays fixed');
+        assert.ok(Math.abs(after.scroll.y-before.scroll.y)<.1,'The code viewport starts at the same height');
+      }
+      await toggleLayout();await screenshot('header-stable-'+width+'-'+(pending?'pending':'closed')+'-unified');
+      await toggleLayout();await screenshot('header-stable-'+width+'-'+(pending?'pending':'closed')+'-split');
+    });
+  }
+}
+
 async function runDefaultLayoutTests() {
   await resetFixture(1200);
   const fresh=async state=>{await cdp.evaluate("window.addEventListener('pagehide',()=>sessionStorage.setItem('rr-view-state','{}'),{once:true})");await reloadPreview(state);};
@@ -2222,6 +2498,43 @@ async function runCreateRequestTests() {
       await set({original:'C:/workspace/manuscript.tex',proposed:'C:/workspace/manuscript.tex',output:'C:/workspace/manuscript.tex.rr',originalMode:'git',originalRevision:'a1b2c3d4 · 2026-11-12 · Clarify the estimate'});
       await cdp.evaluate('window.scrollTo(0,0)');await settle();await screenshot('create-request-'+width+'-git');
       await set(selected);view=await snapshot();assert.equal(view.revisionHidden,true);assert.equal(view.gitNoticeHidden,true);
+    });
+    const pdfSnapshot=()=>cdp.evaluate(`(() => {const input=document.getElementById('generate-pdf'),label=document.getElementById('pdf-option'),hint=document.getElementById('pdf-hint');const box=node=>{const r=node.getBoundingClientRect();return{x:r.x,right:r.right,y:r.y,bottom:r.bottom,width:r.width,height:r.height};};return{disabled:input.disabled,checked:input.checked,type:input.type,label:label.textContent.trim(),disabledStyle:label.classList.contains('disabled'),color:getComputedStyle(label).color,bodyColor:getComputedStyle(document.body).color,hint:hint.textContent,describedBy:input.getAttribute('aria-describedby'),input:box(input),option:box(label),hintBox:box(hint),scrollWidth:document.documentElement.scrollWidth,messages:window.__createMessages};})()`);
+    await runTest(width+'px: PDF checkbox starts gray and disabled, then sends explicit checked choices for a supported original',async()=>{
+      await set({pdfSupported:false,generatePdf:false});let view=await pdfSnapshot();
+      assert.equal(view.type,'checkbox');assert.equal(view.label,'Generate a review PDF');assert.equal(view.disabled,true);assert.equal(view.checked,false);assert.equal(view.disabledStyle,true);
+      assert.equal(view.color,'rgb(170, 170, 170)','Disabled option uses the theme description/disabled color');
+      assert.equal(view.describedBy,'pdf-hint');assert.ok(view.hint.includes('.tex'));
+      const initialMessages=view.messages.length;await click('generate-pdf');assert.equal((await pdfSnapshot()).messages.length,initialMessages,'Disabled option sends no request');
+      await set({original:'C:/workspace/manuscript.tex',output:'C:/workspace/manuscript.tex.rr',pdfSupported:true,generatePdf:false});view=await pdfSnapshot();
+      assert.equal(view.disabled,false);assert.equal(view.checked,false);assert.equal(view.disabledStyle,false);assert.equal(view.color,view.bodyColor);
+      await click('pdf-option');view=await pdfSnapshot();assert.equal(view.checked,true);assert.deepEqual(view.messages.at(-1),{command:'setGeneratePdf',value:true});
+      await set({...selected,pdfSupported:true,generatePdf:true});view=await pdfSnapshot();assert.equal(view.checked,true,'Host state echoes the selected option');
+      await click('generate-pdf');assert.deepEqual((await pdfSnapshot()).messages.at(-1),{command:'setGeneratePdf',value:false});
+      await set({...selected,pdfSupported:true,generatePdf:false});assert.equal((await pdfSnapshot()).checked,false);
+      await set({original:'C:/workspace/manuscript.tex',proposed:'C:/copies/revised.tex',output:'C:/workspace/manuscript.tex.rr',pdfSupported:true,generatePdf:true});
+      view=await pdfSnapshot();for(const box of [view.input,view.option,view.hintBox]){assert.ok(box.x>=0&&box.right<=width,'PDF option stays within the viewport');assert.ok(box.height>0);}
+      assert.ok(view.input.y>=view.option.y&&view.input.bottom<=view.option.bottom+1,'Checkbox is vertically aligned inside its label');
+      assert.ok(view.scrollWidth<=width,'PDF option does not introduce horizontal overflow');
+      await cdp.evaluate('window.scrollTo(0,0)');await settle();await screenshot('create-request-'+width+'-pdf-selected');
+    });
+    await runTest(width+'px: PDF selection is locked while busy and clears for unsupported or Git originals',async()=>{
+      for(const field of ['busy','selecting']) {
+        await set({...selected,pdfSupported:true,generatePdf:true,[field]:true});const view=await pdfSnapshot();
+        assert.equal(view.disabled,true);assert.equal(view.checked,true);assert.equal(view.disabledStyle,true);
+        await cdp.evaluate("document.getElementById('generate-pdf').dispatchEvent(new Event('change',{bubbles:true}))");
+        assert.equal((await pdfSnapshot()).messages.length,view.messages.length,'Busy form cannot change the PDF option');
+      }
+      for(const state of [
+        {...selected,original:'C:/workspace/notes.md',pdfSupported:false,generatePdf:true},
+        {...selected,originalMode:'git',pdfSupported:false,generatePdf:true},
+        {pdfSupported:false,generatePdf:false}
+      ]) {
+        await set(state);const view=await pdfSnapshot();assert.equal(view.disabled,true);assert.equal(view.checked,false);assert.equal(view.disabledStyle,true);
+        if(state.originalMode==='git')assert.match(view.hint,/saved workspace original/);
+        await click('pdf-option');assert.equal((await pdfSnapshot()).messages.length,view.messages.length,'Unsupported originals cannot request a PDF');
+      }
+      await set({...selected,pdfSupported:true,generatePdf:false});assert.equal((await pdfSnapshot()).checked,false,'A newly eligible original does not silently restore the old choice');
     });
     await runTest(width+'px: selecting and creating block duplicate commands while inline errors keep the form reusable',async()=>{
       for(const field of ['selecting','busy']) {
@@ -2377,9 +2690,9 @@ async function runLayoutTests() {
           inlineButtons: Array.from(document.querySelectorAll('.inline-actions button'), rect),
           inlineGroups: Array.from(document.querySelectorAll('.hunk-pending .inline-actions'), group => Array.from(group.querySelectorAll('button'), rect)) };
       })()`);
-      assert.equal(layout.badges.length, 3); assert.equal(layout.buttons.length, 2);
-      assert.ok(Math.abs(layout.bulk.x - layout.gutter.x) < 0.6, 'Bulk region begins at the code action gutter');
-      assert.ok(Math.abs(layout.bulk.width - layout.gutter.width) < 0.6, 'Bulk region has the code action gutter width');
+      assert.equal(layout.badges.length, 3); assert.equal(layout.buttons.length, 3);
+      assert.ok(layout.bulk.x < layout.gutter.x, 'Pending all extends the bulk region left of the code action gutter');
+      assert.ok(Math.abs(layout.bulk.right - layout.gutter.right) < 0.6, 'Bulk region keeps the code action gutter right edge');
       assertHeaderRows({...layout,bulk:layout.buttons},true,true);
       const first = layout.badges[0];
       assert.ok(first.height >= 23.4, 'Banner badges and buttons are enlarged to at least 24px');
@@ -2390,8 +2703,8 @@ async function runLayoutTests() {
       assert.equal(layout.inlineGroups.length, 4);
       for (const group of layout.inlineGroups) {
         assert.equal(group.length, 3);
-        assert.ok(Math.abs(layout.buttons[0].x - group[0].x) < 0.6, 'Actual Accept all left edge matches actual inline Accept left edge');
-        assert.ok(Math.abs(layout.buttons[1].right - group[2].right) < 0.6, 'Actual Ignore all right edge matches actual inline Why right edge');
+        assert.ok(Math.abs(layout.buttons[1].x - group[0].x) < 0.6, 'Actual Accept all left edge matches actual inline Accept left edge');
+        assert.ok(Math.abs(layout.buttons[2].right - group[2].right) < 0.6, 'Actual Ignore all right edge matches actual inline Why right edge');
       }
       for (const [items, container] of [[layout.badges, layout.summary], [layout.buttons, layout.bulk]]) {
         for (let index = 0; index < items.length; index++) {
@@ -2400,8 +2713,8 @@ async function runLayoutTests() {
         }
       }
       return { bannerHeight: first.height, inlineHeight: layout.inlineButtons[0].height,
-        acceptAllLeft: layout.buttons[0].x, inlineAcceptLeft: layout.inlineGroups[0][0].x,
-        ignoreAllRight: layout.buttons[1].right, inlineWhyRight: layout.inlineGroups[0][2].right };
+        acceptAllLeft: layout.buttons[1].x, inlineAcceptLeft: layout.inlineGroups[0][0].x,
+        ignoreAllRight: layout.buttons[2].right, inlineWhyRight: layout.inlineGroups[0][2].right };
     });
     await runTest(width + 'px: Accept/Ignore/Why sit inline in the first changed right row', async () => {
       const controls = await cdp.evaluate(`(() => ({
@@ -2638,6 +2951,293 @@ async function runLayoutTests() {
 
   }
 }
+async function runDecisionPerformanceTests() {
+  await resetFixture(1200);
+  const lines=Array.from({length:4374},(_,i)=>'Line '+String(i+1).padStart(4,'0')+': \\gamma_t = \\mu_t + '+(i%10)+';\n');
+  let offset=0,index=0; const hunks=[];
+  for(let i=0;i<lines.length;i++) {
+    const text=lines[i];
+    if(i>=20 && i%21===0 && hunks.length<200) hunks.push({id:'perf-'+index,index:index++,start:offset,end:offset+text.length,
+      before:text,after:text.replace('gamma','widetilde{gamma}'),oldStart:i+1,newStart:i+1,oldLines:1,newLines:1,decision:'pending'});
+    offset+=text.length;
+  }
+  const large={type:'state',revision:'perf-1',rawRevision:'perf-raw-1',requestName:'large.tex.rr',trusted:true,busy:false,defaultLayout:'unified',
+    files:[{path:'large.tex',before:lines.join(''),hunks}]};
+  const measures=[];
+  for(const mode of ['unified','sideBySide']) await runTest('4374 lines, 200 entries '+mode+': decision transport and settled render performance',async()=>{
+    await resetFixture(1200);await cdp.evaluate('window.__setReview('+JSON.stringify({...large,defaultLayout:mode})+')');await settle();
+    if((await unifiedSnapshot()).unified !== (mode==='unified')) await toggleLayout();
+    for(const decision of ['ignored','accepted']) {
+      const measure=await cdp.evaluate('('+((decision)=>{
+        window.__deferDecisions=true;
+        const file=window.__review.files[0], hunk=file.hunks.find(h=>h.decision==='pending');
+        const context=[...document.querySelectorAll('[data-row-key^="context:"]')], blocks=[...document.querySelectorAll('[data-overview-hunk]')];
+        const button=document.querySelector('button[data-hunk="'+hunk.id+'"][data-quick-decision="'+decision+'"]');
+        const start=performance.now();button.click();const posted=performance.now();
+        const next=structuredClone(window.__review), nextFile=next.files[0], changed=nextFile.hunks.find(h=>h.id===hunk.id);
+        next.revision+='x';next.rawRevision+='x';
+        if(decision==='accepted') {
+          const delta=changed.after.length-changed.before.length, oldEnd=changed.end;
+          nextFile.before=nextFile.before.slice(0,changed.start)+changed.after+nextFile.before.slice(changed.end);
+          changed.before=changed.after;changed.end+=delta;
+          for(const other of nextFile.hunks) if(other!==changed&&other.start>=oldEnd){other.start+=delta;other.end+=delta;}
+        } else changed.after=changed.before;
+        changed.decision=decision;
+        const stateStart=performance.now();window.__setReview(next);const settled=performance.now();
+        return {decision,phases:window.__renderPhases,clickToPostMs:posted-start,stateRenderMs:settled-stateStart,retainedContext:context.filter(n=>n.isConnected).length,contextRows:context.length,retainedHunks:blocks.filter(n=>n.isConnected).length,
+          source:nextFile.before,buttons:[...document.querySelectorAll('.hunk-pending .button-accept')].filter(b=>!b.disabled).length};
+      }).toString()+')('+JSON.stringify(decision)+')');
+      assert.equal(measure.buttons,199-(decision==='accepted'?1:0));
+      assert.equal(measure.source,decision==='accepted'?large.files[0].before.replace(lines[42],lines[42].replace('gamma','widetilde{gamma}')):large.files[0].before);
+      if (!process.env.RR_UI_BASELINE_SCRIPT) {
+        assert.equal(measure.retainedContext,measure.contextRows,'A changed source offset retains exact unchanged context DOM');
+        assert.equal(measure.retainedHunks,199,'Only the decided hunk is rebuilt; unchanged controls remain current');
+      }
+      measures.push({layout:mode,...measure,source:undefined});
+      await settle();
+    }
+    await cdp.evaluate('('+(()=>{
+      window.__beforeLineShift=structuredClone(window.__review);
+      window.__contextBeforeShift=[...document.querySelectorAll('[data-row-key^="context:"]')];
+      const next=structuredClone(window.__review),f=next.files[0],prefix='A new unrelated source line.\n';
+      f.before=prefix+f.before;for(const h of f.hunks){h.start+=prefix.length;h.end+=prefix.length;}
+      next.revision+='-shift';window.__setReview(next);
+    }).toString()+')()');await settle();
+    await assertTextProjection();
+    if (!process.env.RR_UI_BASELINE_SCRIPT) assert.ok(await cdp.evaluate('window.__contextBeforeShift.filter(n=>n.isConnected).length>4000'),'Line insertion preserves later context nodes while updating their labels');
+    await cdp.evaluate('window.__setReview(window.__beforeLineShift)');await settle();await assertTextProjection();
+    await cdp.evaluate('(()=>{const f=window.__review.files[0],h=f.hunks[2],block=[...document.querySelectorAll("[data-overview-hunk]")].find(n=>n.dataset.overviewHunk===h.id);block.querySelector(".original-line-button").click();})()');
+    const live=await cdp.evaluate('({message:window.__messages.at(-1),revision:window.__review.revision,expected:window.__review.files[0].hunks[2].after.replace(/\\n$/,"")})');
+    await openEdit('perf-2','click');
+    assert.equal((await editSnapshot())?.draft,live.expected,'Cached input opens the current pending proposal with a real click');
+    assert.equal(live.message.type,'openTargetLine');assert.equal(live.message.revision,live.revision,'Cached navigation sends the latest revision');
+    await editorKey('Escape');
+    return measures.filter(x=>x.layout===mode);
+  });
+  await fs.writeFile(path.join(runDir,'decision-performance.json'),JSON.stringify(measures,null,2));
+  console.log('Decision performance: '+JSON.stringify(measures));
+}
+
+
+async function runPdfReviewTests(width) {
+  const pdf = {supported:true,available:false,imported:false,filename:'manuscript.tex.rr.pdf'};
+  const event = async (message, reuseStart=false) => {await cdp.evaluate('(() => {const m='+JSON.stringify(message)+';'+(reuseStart?'m.progress.startedAt=window.__pdfStarted;':'')+'window.dispatchEvent(new MessageEvent("message",{data:m}));})()');await settle();};
+  const set = async (review, extra={}) => {await event({type:'pdfGenerationProgress',progress:null});await cdp.evaluate('window.__setReview({...structuredClone(window.__fixture),...'+JSON.stringify(extra)+',pdfReview:'+JSON.stringify(review)+'})');await settle();};
+  const click = async selector => {await cdp.evaluate('document.querySelector('+JSON.stringify(selector)+')?.click()');await settle();};
+  const sent = () => cdp.evaluate('window.__messages.filter(message=>/^(generateReviewPdf|importPdfReview|regenerateReviewPdf|applyPdfReview)$/.test(message.type))');
+  const labels = () => cdp.evaluate('[...document.querySelectorAll(".pdf-review-generate,.pdf-review-import")].map(node=>node.textContent)');
+  for (const mode of ['unified','sideBySide']) {
+    await resetFixture(width);if((await unifiedSnapshot()).unified!==(mode==='unified'))await toggleLayout();
+    await runTest(width+'px '+mode+': separate PDF buttons generate without applying proposals or offering a missing-file import',async()=>{
+      await set(pdf);await cdp.evaluate('window.__messages=[]');const before=await cdp.evaluate('JSON.stringify(window.__review.files)');
+      assert.deepEqual(await labels(),['Generate PDF from RR','Import review from PDF']);
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled'));
+      await click('.pdf-review-import');assert.deepEqual(await sent(),[]);
+      await click('.pdf-review-generate');await click('.pdf-review-generate');
+      assert.deepEqual(await sent(),[{type:'generateReviewPdf',revision:fixture.revision}]);
+      assert.equal(await cdp.evaluate('JSON.stringify(window.__review.files)'),before);
+      assert.ok(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button,.file-actions button")].every(node=>node.disabled)'));
+    });
+    await runTest(width+'px '+mode+': PDF generation animates immediately and updates phases without rebuilding or scrolling code',async()=>{
+      await set(pdf);await cdp.evaluate('window.__messages=[];window.__pdfCode=document.querySelector(".paired-document")');
+      await click('.pdf-review-generate');
+      const initial=await cdp.evaluate('(() => {const b=document.querySelector(".pdf-review-generate"),s=b.querySelector(".pdf-generation-spinner");return {busy:b.getAttribute("aria-busy"),label:b.textContent,visible:!s.hidden,animation:getComputedStyle(s).animationName,status:document.querySelector(".pdf-generation-status").textContent};})()');
+      const railFits=await cdp.evaluate('(() => {const r=document.querySelector(".change-scrollbar").getBoundingClientRect(),s=document.querySelector("[data-scroll-area]").getBoundingClientRect();return Math.abs(r.top-s.top)<1&&Math.abs(r.bottom-s.bottom)<1;})()');
+      assert.equal(railFits,true,'Progress row keeps the minimap aligned with the code viewport');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status").closest("[aria-busy=true]")'),null,'Live phase announcements are not deferred by a busy ancestor');
+      assert.equal(initial.busy,'true');assert.equal(initial.label,'Generating PDF…');assert.equal(initial.visible,true);assert.equal(initial.animation,'pdf-generation-spin');assert.match(initial.status,/Waiting for build confirmation/);
+      await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop=250;window.__pdfTop=document.querySelector("[data-scroll-area]").scrollTop;window.__pdfStarted=Date.now()-65000');
+      for(const [stage,message] of [['preparing','Preparing project files…'],['diffing','Comparing proposed changes…'],['compiling','Compiling LaTeX (2/3)…'],['annotating','Adding review controls…'],['saving','Saving review PDF…']]){
+        await event({type:'pdfGenerationProgress',progress:{stage,startedAt:1,message}},true);
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status [role=status]").textContent'),message);
+        assert.equal(await cdp.evaluate('document.querySelector(".paired-document")===window.__pdfCode'),true);
+        assert.equal(await cdp.evaluate('document.querySelector("[data-scroll-area]").scrollTop===window.__pdfTop'),true);
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'),true);
+      }
+      assert.match(await cdp.evaluate('document.querySelector(".pdf-generation-elapsed").textContent'),/^1:0[5-9]$/);
+      const elapsed=await cdp.evaluate('document.querySelector(".pdf-generation-elapsed").textContent');
+      await delay(1100);
+      assert.notEqual(await cdp.evaluate('document.querySelector(".pdf-generation-elapsed").textContent'),elapsed,'Elapsed time keeps moving during a long compiler pass');
+      await event({type:'pdfGenerationProgress',progress:{stage:'compiling',startedAt:1,message:'Compiling <img src=x onerror=window.__xss=99>'}},true);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status img")'),null);
+      await event({type:'pdfGenerationProgress',progress:{stage:'compiling',startedAt:1,message:'Compiling LaTeX (2/3)…'}},true);
+      await screenshot('pdf-generation-'+mode+'-'+width);
+      await event({type:'pdfGenerationProgress',progress:null});
+      await event({type:'pdfGenerationResult',outcome:'created'});
+      await set({...pdf,available:true});
+      assert.deepEqual(await labels(),['Generate PDF from RR','Import review from PDF']);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status").textContent'),'PDF created.');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-spinner").hidden'),true);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-generate").getAttribute("aria-busy")'),'false');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-elapsed").textContent'),'');
+      await click('.pdf-review-import');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status").hidden'),true);
+      assert.equal(await cdp.evaluate('(() => {const r=document.querySelector(".change-scrollbar").getBoundingClientRect(),s=document.querySelector("[data-scroll-area]").getBoundingClientRect();return Math.abs(r.top-s.top)<1&&Math.abs(r.bottom-s.bottom)<1;})()'),true,'Hiding the status row realigns the minimap');
+      await set({...pdf,available:true});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'),false);
+      assert.deepEqual(await sent(),[{type:'generateReviewPdf',revision:fixture.revision},{type:'importPdfReview',revision:fixture.revision}]);
+    });
+    await runTest(width+'px '+mode+': cancellation and build failures stop the spinner and allow retry without losing the existing PDF',async()=>{
+      for(const outcome of ['cancelled','failed']){
+        await set({...pdf,available:true});await cdp.evaluate('window.__messages=[]');
+        await click('.pdf-review-generate');
+        await event({type:'busy',busy:true});
+        await event({type:'pdfGenerationProgress',progress:null});
+        await event({type:'pdfGenerationResult',outcome,error:outcome==='failed'?'Compiler failed.':undefined});
+        await set({...pdf,available:true,...(outcome==='failed'?{error:'Compiler failed. <img src=x onerror=window.__xss=99>'}:{})});
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-spinner").hidden'),true);
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status").textContent'),'PDF generation '+outcome+'.');
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'),false);
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled'),false);
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-error img")'),null);
+        await click('.pdf-review-generate');
+        assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-spinner").hidden'),false);
+        assert.deepEqual(await sent(),[{type:'regenerateReviewPdf',revision:fixture.revision},{type:'regenerateReviewPdf',revision:fixture.revision}]);
+        await event({type:'pdfGenerationResult',outcome:'cancelled'});await set({...pdf,available:true});
+      }
+    });
+    await runTest(width+'px '+mode+': restored generation progress survives state refresh and reduced motion keeps textual feedback',async()=>{
+      await set({...pdf,available:true});
+      await event({type:'pdfGenerationProgress',progress:{stage:'compiling',startedAt:Date.now()-2000,message:'Compiling LaTeX (1/3)…'}});
+      await cdp.evaluate('window.__setReview({...window.__review,busy:true})');await settle();
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-generate").textContent'),'Generating PDF…');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-generation-status [role=status]").textContent'),'Compiling LaTeX (1/3)…');
+      assert.equal(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button,.file-actions button")].every(node=>node.disabled)'),true);
+      await cdp.send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+      assert.equal(await cdp.evaluate('getComputedStyle(document.querySelector(".pdf-generation-spinner")).animationName'),'none');
+      assert.match(await cdp.evaluate('document.querySelector(".pdf-generation-status").textContent'),/Compiling LaTeX/);
+      await cdp.send('Emulation.setEmulatedMedia',{features:[]});
+      await event({type:'pdfGenerationResult',outcome:'cancelled'});await set({...pdf,available:true});
+    });
+    await runTest(width+'px '+mode+': companion arrival and removal keep both directions visible without automatic import',async()=>{
+      await set({...pdf,available:true});await cdp.evaluate('window.__messages=[]');
+      assert.deepEqual(await labels(),['Generate PDF from RR','Import review from PDF']);
+      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-generate").disabled && !document.querySelector(".pdf-review-import").disabled'));
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF available. Import its review when ready.');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);assert.deepEqual(await sent(),[]);
+      const before=await cdp.evaluate('JSON.stringify(window.__review.files)');
+      await click('.pdf-review-import');assert.deepEqual(await sent(),[{type:'importPdfReview',revision:fixture.revision}]);
+      assert.equal(await cdp.evaluate('JSON.stringify(window.__review.files)'),before);
+      await set(pdf);assert.deepEqual(await labels(),['Generate PDF from RR','Import review from PDF']);
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled'));assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary")'),null);
+    });
+    await runTest(width+'px '+mode+': only explicitly imported PDF decisions offer a separate application action',async()=>{
+      await set({...pdf,available:true,imported:true,pending:1,accepted:2,ignored:1,canApply:false,pdfHash:'a'.repeat(64)});
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-apply").disabled'));
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent.includes("not applied")'));
+      assert.ok(await cdp.evaluate('window.__review.files[0].hunks.every(h=>h.decision==="pending")'));
+      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,canApply:true,pdfHash:'b'.repeat(64)},{revision:'pdf-latest'});
+      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-apply');
+      assert.deepEqual(await sent(),[{type:'applyPdfReview',pdfHash:'b'.repeat(64),revision:'pdf-latest'}]);
+      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,canApply:false,applied:true});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF review applied.');
+    });
+    await runTest(width+'px '+mode+': invalidating an imported PDF removes stale counts and Apply until another import',async()=>{
+      await set({...pdf,available:true,imported:true,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'e'.repeat(64)});
+      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-apply").disabled'));
+      await set({...pdf,available:true,imported:false,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'e'.repeat(64)});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF available. Import its review when ready.');
+      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-import');
+      assert.deepEqual(await sent(),[{type:'importPdfReview',revision:fixture.revision}]);
+    });
+    await runTest(width+'px '+mode+': Generate uses the current RR even with an existing stale PDF and errors leave source review usable',async()=>{
+      await set({...pdf,available:true,error:'The returned PDF does not match this export. <img src=x onerror=window.__xss=1>'});
+      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-generate").disabled && !document.querySelector(".pdf-review-import").disabled'));
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-regenerate")'),null,'No third regeneration button');
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-error").textContent.includes("<img")'));
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-error img")'),null);
+      assert.ok(await cdp.evaluate('[...document.querySelectorAll(".file-actions button")].filter(node=>!node.dataset.focusKey.endsWith(":undoFile")).every(node=>!node.disabled)'));
+      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-generate');
+      assert.deepEqual(await sent(),[{type:'regenerateReviewPdf',revision:fixture.revision}]);
+    });
+    await runTest(width+'px '+mode+': PDF mutations honor trust and source conflicts; read-only imports remain available',async()=>{
+      await set(pdf,{trusted:false});assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'));
+      await set({...pdf,available:true,imported:true,canApply:true,pending:0,pdfHash:'c'.repeat(64)},{trusted:false});
+      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-import").disabled && document.querySelector(".pdf-review-generate").disabled && document.querySelector(".pdf-review-apply").disabled'));
+      await set(pdf);await cdp.evaluate('(() => {const next=structuredClone(window.__review);next.files[0].hunks[0].conflict="Source changed";window.__setReview(next);})()');await settle();
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'));
+      await set({supported:false,available:false,filename:'other.rr.pdf'});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar")'),null);
+    });
+    await runTest(width+'px '+mode+': PDF operations cannot discard an active draft or run during host work',async()=>{
+      await set({...pdf,available:true,imported:true,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'d'.repeat(64)});
+      await openEdit('grow');await writeDraft('Retain this PDF review draft.');
+      assert.ok(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button")].every(node=>node.disabled)'));
+      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-import');await click('.pdf-review-generate');assert.equal((await sent()).length,0);
+      assert.equal((await editSnapshot()).draft,'Retain this PDF review draft.');
+      await editorKey('Escape');await settle();
+      await set({...pdf,available:true},{busy:true});assert.ok(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button")].every(node=>node.disabled)'));
+    });
+    await runTest(width+'px '+mode+': PDF toolbar wraps within narrow preview without covering code',async()=>{
+      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,canApply:true,pdfHash:'d'.repeat(64)});
+      const fit=await cdp.evaluate('(() => {const bar=document.querySelector(".pdf-review-bar").getBoundingClientRect(),scroll=document.querySelector("[data-scroll-area]").getBoundingClientRect();return {fit:[...document.querySelectorAll(".pdf-review-controls button")].every(node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth;}),above:bar.bottom<=scroll.top+1};})()');
+      assert.deepEqual(fit,{fit:true,above:true});await screenshot('pdf-review-'+mode+'-'+width);
+    });
+  }
+}
+
+
+async function runPendingAllTests(width) {
+  const click = async selector => {await cdp.evaluate('document.querySelector('+JSON.stringify(selector)+')?.click()');await settle();};
+  const sent = () => cdp.evaluate('window.__messages.filter(message=>message.type===\"undoFile\")');
+  const selector = '[data-focus-key$=":undoFile"]';
+  const snapshot = () => cdp.evaluate('(() => {const b=document.querySelector('+JSON.stringify(selector)+');return {disabled:b.disabled,title:b.title,labels:[...document.querySelectorAll(".file-actions button")].map(n=>n.textContent),decisions:window.__review.files[0].hunks.map(h=>h.decision)};})()');
+  for (const unified of [false,true]) {
+    const label=width+'px '+(unified?'unified':'side-by-side')+' Pending all';
+    const set=async (patch={})=>{
+      await resetQuick(width,unified);
+      const next=structuredClone(fixture);Object.assign(next,patch);
+      await cdp.evaluate('window.__messages=[];window.__setReview('+JSON.stringify(next)+')');await settle();return next;
+    };
+    await runTest(label+': ordered compact button stays disabled until an entry is reviewed',async()=>{
+      await set();const view=await snapshot();
+      assert.deepEqual(view.labels,['Pending all','Accept all','Ignore all']);assert.equal(view.disabled,true);
+      assertHeaderRows(await quickSnapshot(),false,!unified);
+      await click(selector);assert.equal((await sent()).length,0);
+      await screenshot('pending-all-'+width+'-'+(unified?'unified':'split'));
+    });
+    await runTest(label+': mixed decisions reset together and reopen a closed request',async()=>{
+      const next=await set();
+      for(const [i,h] of next.files[0].hunks.entries())h.decision=i%2?'ignored':'accepted';
+      next.closed=true;
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+');window.__messages=[]');await settle();
+      assert.equal((await snapshot()).disabled,false);await click(selector);
+      assert.deepEqual(await sent(),[{type:'undoFile',filePath:next.files[0].path,revision:next.revision}]);
+      assert.ok((await snapshot()).decisions.every(d=>d==='pending'));assert.equal((await snapshot()).disabled,true);
+      assert.equal(await cdp.evaluate('window.__review.closed'),false);assert.equal(await completionSnapshot(),null);
+      await assertTextProjection();
+    });
+    await runTest(label+': unsafe undo, untrusted, busy, or editing state blocks bulk reset',async()=>{
+      const next=await set();next.files[0].hunks[0].decision='accepted';
+      for(const change of [
+        state=>{state.trusted=false;},
+        state=>{state.busy=true;},
+        state=>{state.files[0].issue='Source cannot be verified';},
+        state=>{state.files[0].hunks[0].undoBlocked='Accepted source was edited';},
+        state=>{state.files[0].hunks[1].decision='ignored';state.files[0].hunks[1].undoBlocked='Ignored source was edited';}
+      ]){
+        const blocked=structuredClone(next);change(blocked);
+        await cdp.evaluate('window.__setReview('+JSON.stringify(blocked)+');window.__messages=[]');await settle();
+        assert.equal((await snapshot()).disabled,true);await click(selector);assert.equal((await sent()).length,0);
+      }
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+')');await settle();await openEdit('shrink');
+      assert.equal((await snapshot()).disabled,true);await editorKey('Escape');await settle();
+    });
+    await runTest(label+': pending conflicts survive reset and duplicate submission is blocked',async()=>{
+      const next=await set();next.files[0].hunks[0].decision='accepted';next.files[0].hunks[1].conflict='Unrelated pending conflict';
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+');window.__messages=[];window.__deferDecisions=true');await settle();
+      assert.equal((await snapshot()).disabled,false);await click(selector);await click(selector);
+      assert.deepEqual(await sent(),[{type:'undoFile',filePath:next.files[0].path,revision:next.revision}]);
+      assert.equal((await snapshot()).disabled,true);
+      next.files[0].hunks[0].decision='pending';
+      await cdp.evaluate('window.__setReview('+JSON.stringify(next)+');window.__deferDecisions=false');await settle();
+      assert.equal(await cdp.evaluate('window.__review.files[0].hunks[1].conflict'),'Unrelated pending conflict');
+    });
+  }
+}
+
 async function main() {
   const ignore = await fs.readFile(path.join(root, '.gitignore'), 'utf8');
   assert.ok(ignore.split(/\r?\n/).some(line => /^\/?\.codex-\*\/?$/.test(line.trim()) || /^\/?\.codex-test-ui\/?$/.test(line.trim())),
@@ -2663,10 +3263,22 @@ async function main() {
   const url = await startServer();
   console.log('Browser: ' + executable); console.log('Artifacts: ' + runDir);
   await startBrowser(executable, url);
-  if (process.env.RR_UI_TEST_GROUP === 'highlight') {
+  if (process.env.RR_UI_TEST_GROUP === 'pending-all') {
+    for (const width of [1200,620]) {await runPendingAllTests(width);await runQuickReviewTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'header') {
+    for (const width of [1200,845,620]) {await runHeaderStabilityTests(width);await runUnifiedTests(width);}
+  } else if (process.env.RR_UI_TEST_GROUP === 'layout') {
+    await runDefaultLayoutTests();for (const width of [1200,845,620]) await runHeaderStabilityTests(width);await runLayoutTests();
+  } else if (process.env.RR_UI_TEST_GROUP === 'pdf-review') {
+    for (const width of [1200,620]) await runPdfReviewTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'performance') {
+    await runDecisionPerformanceTests();
+  } else if (process.env.RR_UI_TEST_GROUP === 'highlight') {
     for (const width of [1200, 620]) {await runLanguageHighlightTests(width);await runProgrammingHighlightTests(width);await runLiveHighlightTests(width);}
   } else if (process.env.RR_UI_TEST_GROUP === 'live-highlight') {
     for (const width of [1200,620]) await runLiveHighlightTests(width);
+  } else if (process.env.RR_UI_TEST_GROUP === 'accept-through') {
+    for (const width of [1200,620]) {await runAcceptThroughTests(width);await runReviewActionTests(width);await runQuickReviewTests(width);await runEditorExitTests(width);}
   } else if (process.env.RR_UI_TEST_GROUP === 'actions') {
     for (const width of [1200,620]) await runReviewActionTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'navigation') {
@@ -2681,12 +3293,17 @@ async function main() {
     for (const width of [1200,620]) await runQuickReviewTests(width);
   } else if (process.env.RR_UI_TEST_GROUP === 'create') {
     await runCreateRequestTests();
+  } else if (process.env.RR_UI_TEST_GROUP === 'edit-exit') {
+    for (const width of [1200,620]) {await runEditorExitTests(width);await runEditorTests(width);await runEditorDecisionTests(width);await runMulticursorTests(width);}
   } else if (process.env.RR_UI_TEST_GROUP === 'multicursor') {
     for (const width of [1600, 620]) {await runMulticursorTests(width);await runEditorDecisionTests(width);}
   } else {
+    for (const width of [1200,620]) await runPendingAllTests(width);
     await runDefaultLayoutTests();
     await runLayoutTests();
-    for (const width of [1200,620]) {await runQuickReviewTests(width);await runOpenNavigationTests(width);await runOriginalLineTests(width);await runExternalEditTests(width);}
+    for (const width of [1200,620]) {await runQuickReviewTests(width);await runOpenNavigationTests(width);await runOriginalLineTests(width);await runExternalEditTests(width);await runEditorExitTests(width);await runAcceptThroughTests(width);}
+    await runDecisionPerformanceTests();
+    for (const width of [1200,620]) await runPdfReviewTests(width);
     await runCreateRequestTests();
   }
   assert.equal(cdp.exceptions.length, 0, 'Production JavaScript must not throw browser exceptions');

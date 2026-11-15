@@ -12,14 +12,14 @@ Open the repository root as the VS Code workspace, then open a request below. Al
 
 Each entry has one **Accept / Ignore** decision. Use `\n` inside JSON strings for a block of consecutive changed lines; split edits whenever an unchanged line lies between them. Whole insertions and deletions can remain multiline blocks. See the [grouping rules](../docs/FORMAT.md#structure).
 
-Some entries omit `reason`, while others use an empty string. Both are valid: **Why** is disabled inside the **⋯** menu, which remains available for supported language actions. Entries with explanations enable Why.
+Some entries omit `reason`, while others use an empty string. Both are valid: **Show change explanation** is disabled inside the **⋯** menu when no explanation is provided. The menu remains available for its other actions; the explanation popover is titled **Why**.
 
 The preview opens automatically at the first pending change by default. Use **Toggle Comparison Layout** in the editor title to switch from the default unified view to side-by-side. The longer examples exercise wrapping, the 15px change scrollbar, and keeping your position after Accept, Ignore, or Undo.
 
-Try **Quick Review** for arrow-key selection and Tab decisions, or click pending code to edit it directly. The **⋯** menu offers explanations and supported comment/color actions. [Review actions](../docs/REVIEW_ACTIONS.md) covers the controls; [Settings](../docs/SETTINGS.md) covers preview modes and shortcuts.
+Try **Quick Review** for arrow-key selection and Tab decisions, or click pending code to edit it directly. The **⋯** menu offers **Accept all up to here**, **Show change explanation**, and **Keep original as comments** when supported. **Pending all** undoes accepted changes and returns accepted/ignored entries to pending, provided they can still be safely undone. [Review actions](../docs/REVIEW_ACTIONS.md) covers the controls; [Settings](../docs/SETTINGS.md) covers preview modes and shortcuts.
 
 Each `*.proposed.*` file is the exact result of accepting every entry. The blank-notes original is a zero-byte file; accepting the retired-notes request clears its contents but keeps the file. The Python report runs without external packages.
 
 **Accept changes the original example.** Use a disposable copy of this workspace if you want to repeat the review. Keep the pending request and original together when sharing an example.
 
-The previously reviewed `manuscript.tex` and its matching proposed copy are preserved. Use `multiline-demo.tex.rr` for the new TeX example.
+The previously reviewed `manuscript.tex` and its matching proposed copy are preserved. Use `multiline-demo.tex.rr` for the TeX example. It also supports **Generate PDF from RR** when the required LaTeX tools are installed; see [PDF review](../docs/PDF_REVIEW.md).

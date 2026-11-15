@@ -33,11 +33,18 @@ Accepting changes requires workspace trust and a saved original. During a tracke
 - **Quick Review**: Use the button in the preview action row, or the sidebar lightning icon. Either Left or Right arrow switches between Accept and Ignore; Tab applies the choice and moves to the next pending change. Escape exits. See [keyboard review](docs/REVIEW_ACTIONS.md#quick-review).
 - **Accept all / Ignore all**: Decide all remaining pending changes in the request. Accept all is unavailable while a pending conflict remains; Ignore all keeps your current source and discards the proposals.
 - **Undo**: Return an accepted or ignored change to pending. Undoing Accept restores that change's original text while preserving other accepted changes. Undo remains available while the `.rr` exists and that entry has not been changed by a later manual source edit.
-- **Change menu (⋯)**: Open **Show change explanation** or **Keep original as comments**. The latter preserves the original complete lines as comments before the active proposed text. Unsupported contexts and pure insertions disable it. It edits the pending draft only; **Accept** saves it to the original. Escape discards the draft, and the editor undo shortcut reverses the transformation. See [language actions](docs/REVIEW_ACTIONS.md).
+- **Edit proposed code**: Click the code to edit it. Click a line number, row margin, or another row to save the proposal and return to review; **Accept** is still required to change the original.
+- **Change menu (⋯)**: **Accept all up to here** accepts every pending change above and including the selected block. The menu also offers **Show change explanation** and **Keep original as comments**. The latter preserves the original complete lines as comments before the active proposed text. Unsupported contexts and pure insertions disable it. It edits the pending draft only; **Accept** saves it to the original. Escape discards the draft, and the editor undo shortcut reverses the transformation. See [language actions](docs/REVIEW_ACTIONS.md).
 - **File link**: Click the filename beneath **FILE** (unified) or **ORIGINAL** (side-by-side) to open the editable target file.
 - **Toggle Comparison Layout**: Use the preview title-bar button to switch between side-by-side columns and a unified view with removed text followed by added text. Unified is the default; choose another default in Settings. The preview remembers your choice.
 - **Native diff**: Use this Explorer context-menu command on a `.rr` file to open VS Code's built-in comparison.
 - **Open RR as JSON**: Use the preview title-bar button or Explorer context menu to edit the stored request. This keeps the current JSON viewing session open in every preview mode.
+
+## Share a LaTeX review as a PDF
+
+Use **Generate PDF from RR** to create or rebuild `file.tex.rr.pdf` from the current request. Use the separate **Import review from PDF** button to read a returned PDF’s decisions. Neither opening the request nor replacing the PDF imports decisions automatically. After importing a completed review, **Apply reviewed changes** updates the original and request; import alone changes neither.
+
+Generation requires local LaTeX and latexdiff, and asks you to trust the proposed LaTeX before compiling. PDF form and menu support varies by viewer; Overleaf displays the comparison but does not support decisions in its internal viewer. See [PDF review](docs/PDF_REVIEW.md) for the workflow and compatibility limits.
 
 ## Create a request with an AI agent
 
@@ -59,7 +66,9 @@ Use this workflow when you have made your own edits and want someone else to rev
 2. Click **Create Revision Request** in the sidebar's **Create** section, or run **Revision Request: Create Revision Request** from the Command Palette. The **Requests** section below lists existing requests.
 3. Click **Select original**. Choose **Workspace file** for a saved original, or **Git commit** to select a file and one of its latest 100 commits at its current path on the current branch. Renamed paths are not followed. The commit picker shows the message, date, and short hash.
 4. Select the saved **Modified copy**. Git mode initially uses the current saved target file; you can choose a different copy.
-5. Click **Create Revision Request** to save `original.ext.rr` beside the target. Neither input is changed, and an existing request is never overwritten. Send the generated request, with its changes still pending, to the reviewer.
+5. Optionally check **Generate a review PDF** for a saved LaTeX workspace original (`.tex`, `.ltx`, or `.latex`), then click **Create Revision Request** to save `original.ext.rr` beside the target. Neither input is changed, and an existing request is never overwritten. Send the generated request, with its changes still pending, to the reviewer.
+
+The PDF option is unchecked by default and disabled until a supported workspace original is selected. Git originals are not supported for this option. When checked, the normal **Build PDF** confirmation follows request creation; cancelling or failing the PDF build keeps the new `.rr`.
 
 A request made from two saved files opens in the review preview. A Git-based request shows a creation message with **Open RR as JSON** instead: the current file may already contain the proposed changes. This workspace remembers the selected baseline and blocks reviewing it against a different starting file.
 
@@ -81,7 +90,7 @@ Saved-file and CLI comparisons preserve line endings and the UTF-8 BOM. Git comp
 
 - **Navigate changes**: Opening or reopening a preview moves to its first pending change, or the top when none remain. The 15px scrollbar marks pending changes in red/green; click a marker to jump or drag the thumb to scroll. It sits between side-by-side columns or at the right edge in unified view. Accept, Ignore, Undo, and ordinary refreshes preserve your place; Quick Review advances after each decision.
 
-- **Go to original**: Use the button on a pending change's red row to open the actual source file at that line. Earlier accepted changes and tracked manual line additions and deletions are accounted for.
+- **TeX / PDF**: On a pending change's red row, **TeX** opens the current original at that line; **PDF** locates it in the compiled PDF using LaTeX Workshop SyncTeX. Earlier accepted changes and tracked manual line additions and deletions are accounted for. Other file types show **Source**, with PDF navigation disabled.
 
 - **Resize columns**: Drag the narrow line immediately left of the center scrollbar; the preview remembers its position. Both code areas keep the same wrapping width. Double-click to restore equal widths. With the divider focused, use Left/Right arrows, Shift for larger steps, or Home/End for the width limits.
 
@@ -114,7 +123,7 @@ Run `npm run package` to create a VSIX and a matching plugin ZIP; their paths ar
 
 Run `npm run test:plugin` for the plugin connection checks and `npm run package:plugin` to create its ZIP package. The repo marketplace in `.agents/plugins/marketplace.json` also supports local installation directly from `plugin/`.
 
-Tested on **Windows with VS Code 1.145.3**. macOS, Linux, and VS Code 1.96 remain untested.
+Tested on **Windows with VS Code 1.146.0**. macOS, Linux, and VS Code 1.96 remain untested.
 
 ## License
 

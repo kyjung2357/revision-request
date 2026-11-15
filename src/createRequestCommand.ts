@@ -5,7 +5,7 @@ import { createRequestFile } from './createRequestFile';
 import { showCreateRequestView, revealCreateRequestView } from './createRequestView';
 import type { GitOriginal } from './gitOriginal';
 
-export interface CreateRequestResult { uri: vscode.Uri; fromGit: boolean }
+export interface CreateRequestResult { uri: vscode.Uri; fromGit: boolean; generatePdf?: boolean }
 let pendingCreation: Promise<CreateRequestResult | undefined> | undefined;
 
 const samePath = (left: string, right: string) => path.relative(left, right) === '';
@@ -57,13 +57,17 @@ export async function createRequestFromFiles(
   const active = vscode.window.activeTextEditor?.document.uri;
   const defaultUri = active?.scheme === 'file' && vscode.workspace.getWorkspaceFolder(active) && !active.path.endsWith('.rr')
     ? active : folders[0]!.uri;
-  let fromGit = false;
+  let fromGit = false, generatePdf = false;
   const pending = showCreateRequestView({extensionUri, defaultUri,
-    create: async (original, proposed, isCancelled, gitOriginal) => {
+    create: async (original, proposed, isCancelled, gitOriginal, requestedPdf) => {
+      if (requestedPdf && (gitOriginal || !/\.(?:tex|ltx|latex)$/i.test(original.fsPath))) {
+        throw new Error('Review PDF generation requires a saved LaTeX workspace original.');
+      }
       const uri = await createRequestFromSelection(original, proposed, runExclusive, isCancelled, gitOriginal, onGitCreated);
       fromGit = gitOriginal !== undefined;
+      generatePdf = requestedPdf === true;
       return uri;
-    }}).then(uri => uri ? {uri, fromGit} : undefined);
+    }}).then(uri => uri ? {uri, fromGit, ...(generatePdf ? {generatePdf: true} : {})} : undefined);
   pendingCreation = pending;
   try { return await pending; } finally { if (pendingCreation === pending) pendingCreation = undefined; }
 }

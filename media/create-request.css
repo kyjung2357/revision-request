@@ -12,6 +12,10 @@ section { margin-top: 20px; }
 .path-display { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, #7776)); border-radius: 3px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); overflow-wrap: anywhere; white-space: pre-wrap; }
 .result { border-top: 1px solid var(--vscode-panel-border, #7776); padding-top: 18px; }
 .result .path-display { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+.pdf-option { display: flex; align-items: center; gap: 8px; margin-top: 16px; cursor: pointer; }
+.pdf-option.disabled { color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground)); cursor: default; }
+.pdf-option input { margin: 0; accent-color: var(--vscode-button-background); }
+.pdf-option input:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
 .note { margin-top: 18px; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
 button { min-height: 30px; padding: 4px 12px; border: 1px solid var(--vscode-button-border, transparent); border-radius: 3px; font: inherit; cursor: pointer; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }

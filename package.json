@@ -3,7 +3,7 @@
   "displayName": "Revision Request",
   "icon": "media/logo.png",
   "description": "Review revision requests before modifying your files, and choose whether to accept them.",
-  "version": "0.2.2",
+  "version": "0.3.1",
   "publisher": "kyjung2357",
   "private": true,
   "engines": {
@@ -333,7 +333,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node scripts/build.cjs",
-    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/reviewHighlight.test.ts test/reviewRebase.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-rebase.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
+    "test": "tsx --test test/core.test.ts test/codeInlineDiffRules.test.ts test/markdownInlineDiffRules.test.ts test/languageHighlight.test.ts test/reviewHighlight.test.ts test/reviewRebase.test.ts test/request.test.ts test/createRequest.test.ts test/createRequestFile.test.ts test/gitOriginal.test.ts test/reviewActions.test.ts test/mcp-diagnostics.test.ts test/portableReviewPdf.test.ts test/latexReviewPdf.test.ts && node --test test/request-host.test.cjs test/review-editor.test.cjs test/mcp-schema.test.cjs test/mcp-rebase.test.cjs test/mcp-compatibility.test.cjs test/createRequestCommand.test.cjs test/createRequestView.test.cjs test/plugin.test.cjs",
     "request": "tsx scripts/create-request.ts",
     "test:extension": "node scripts/test-extension.cjs",
     "package": "node scripts/package.cjs",
@@ -343,7 +343,8 @@
     "sync:plugin": "node scripts/sync-plugin.cjs",
     "check:plugin": "node scripts/sync-plugin.cjs --check",
     "package:plugin": "node scripts/package-plugin.cjs",
-    "vscode:prepublish": "npm run check && npm run build"
+    "vscode:prepublish": "npm run check && npm run build",
+    "test:pdf": "tsx --test test/portableReviewPdf.test.ts test/latexReviewPdf.test.ts"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
@@ -352,7 +353,8 @@
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.1.0",
     "diff": "^9.0.0",
-    "esbuild": "^0.27.0",
+    "esbuild": "^0.28.1",
+    "pdf-lib": "1.17.1",
     "tsx": "^4.0.0",
     "typescript": "^7.0.2",
     "yazl": "2.5.1"
@@ -360,5 +362,10 @@
   "extensionDependencies": [
     "vscode.json-language-features"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.1"
+    }
+  }
 }

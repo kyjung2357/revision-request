@@ -84,9 +84,12 @@ Module._load = originalLoad;
 const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 function setup(t) {
   current = {workspace: Uri.file(path.join(__dirname, 'virtual-workspace')), attempts: 0, created: [], errors: [], sourceOpens: [], requests: [], documents: [], context: new Map(), picks: 0};
-  const changed = new Emitter(), deleted = new Emitter();
+  const changed = new Emitter(), deleted = new Emitter(), pdfProgress = new Emitter(), pdfFinished = new Emitter();
+  const progressByUri = new Map();
   const service = {
     onDidChange: changed.event, onDidDeleteRequest: deleted.event,
+    onDidChangePdfGeneration: pdfProgress.event, onDidFinishPdfGeneration: pdfFinished.event,
+    getPdfGenerationProgress: uri => progressByUri.get(uri.toString()),
     getState: async uri => {current.requests.push(uri.toString()); return {type: 'state', files: [], revision: 'test'};},
   };
   const context = {extensionUri: Uri.file(path.resolve(__dirname, '..'))};
@@ -94,7 +97,7 @@ function setup(t) {
   t.after(() => editor.dispose());
   const uri = Uri.joinPath(current.workspace, 'inventory_report.py.rr');
   const document = {uri}; current.documents.push(document);
-  return {editor, uri, document, service, changed, deleted};
+  return {editor, uri, document, service, changed, deleted, pdfProgress, pdfFinished, progressByUri};
 }
 test('Python RR automatically previews once per open source document, including after preview close', async t => {
   const {editor, uri, document} = setup(t); current.previewMode = 'once';
@@ -300,6 +303,51 @@ test('external refresh bursts keep one state read in flight and discard its supe
   assert.deepEqual(panel.webview.messages.map(message => message.revision), ['latest']);
 });
 
+test('unchanged external notifications verify source without redelivering identical rows', async t => {
+  const {editor, uri, service, changed} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0]; let reads = 0;
+  const view = {type: 'state', busy: false, revision: 'saved', files: [], unchangedOpacity: 20};
+  service.getState = async () => {reads++; return structuredClone(view);};
+  changed.fire(); await tick(); panel.webview.messages = [];
+  for (let index = 0; index < 5; index++) {changed.fire(); await tick();}
+  assert.equal(reads, 6, 'Every late filesystem notification still verifies current source');
+  assert.deepEqual(panel.webview.messages, [], 'Five identical notifications do not rerender the document');
+  view.unchangedOpacity = 35; changed.fire(); await tick();
+  assert.equal(panel.webview.messages.length, 1, 'Settings changes deliver even with the same source revision');
+  view.files = [{path: 'inventory_report.py', issue: 'Save the original before reviewing.'}];
+  changed.fire(); await tick();
+  assert.equal(panel.webview.messages.length, 2, 'Dirty/conflict changes are never hidden by revision deduplication');
+});
+
+test('an unchanged final state clears busy controls and readiness can redeliver it', async t => {
+  const {editor, uri, service, changed} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.getState = async () => ({type: 'state', busy: false, revision: 'same', files: []});
+  changed.fire(); await tick(); panel.webview.messages = [];
+  service.busy = true; changed.fire();
+  service.busy = false; changed.fire(); await tick();
+  assert.deepEqual(panel.webview.messages.map(message => message.type), ['busy', 'state']);
+  panel.webview.messages = [];
+  await receive({type: 'ready'}); await receive({type: 'ready'});
+  assert.equal(panel.webview.messages.filter(message => message.type === 'state').length, 2);
+});
+
+test('a no-op action receives a final state even without a change event', async t => {
+  const {editor, uri, service, changed} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.getState = async () => ({type: 'state', busy: false, revision: 'same', files: []});
+  service.decide = async () => undefined;
+  changed.fire(); await tick(); panel.webview.messages = [];
+  await receive({type: 'decide', filePath: 'inventory_report.py', hunkId: 'h1', decision: 'ignored', revision: 'same'});
+  assert.deepEqual(panel.webview.messages.map(message => message.type), ['state'], 'A waiting client is always unlocked');
+  panel.webview.messages = [];
+  changed.fire(); await tick();
+  assert.deepEqual(panel.webview.messages, []);
+});
+
 test('an action invalidates a pending state read without publishing transient empty rows', async t => {
   const {editor, uri, service, changed} = setup(t);
   await editor.openPreview(uri); await tick();
@@ -371,6 +419,61 @@ test('edited Accept routes one guarded action and acknowledges only its correlat
   assert.equal(failed.success,false); assert.equal(failed.editId,'attempt-2');
   assert.match(failed.error,/Stale source/);
   assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
+});
+
+for (const changed of [true, false]) test('saving a proposal alone acknowledges ' + (changed ? 'changed' : 'unchanged') + ' content without deciding it', async t => {
+  const {editor, uri, service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], calls = [], acknowledged = deferred();
+  service.editAndAccept = service.decide = service.undo = async () => assert.fail('Saving a proposal must not accept, ignore, or undo it');
+  service.editPending = async (...args) => {calls.push(args); return {changed, revision: 'saved-proposal'};};
+  service.getState = async () => ({type: 'state', revision: 'saved-proposal', files: []});
+  panel.webview.messages = [];
+  panel.webview.postMessage = async message => {
+    panel.webview.messages.push(message);
+    if (message.type === 'editResult') await acknowledged.promise;
+    return true;
+  };
+  const message = {type: 'editPending', filePath: 'inventory_report.py', hunkId: 'selected', draft: 'new\nblock', revision: 'before', editId: 'save-1'};
+  const saving = receive(message); await tick();
+  assert.deepEqual(calls, [[uri, message.filePath, message.hunkId, message.draft, message.revision]]);
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult']);
+  assert.deepEqual(panel.webview.messages[0], {type: 'editResult', editId: 'save-1', filePath: message.filePath,
+    hunkId: 'selected', success: true, error: undefined, changed, revision: 'saved-proposal'});
+  acknowledged.resolve(); await saving;
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult', 'state']);
+});
+
+test('a failed proposal-only save keeps a correlated draft error and refreshes without a completion prompt', async t => {
+  const {editor, uri, service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.editAndAccept = service.decide = service.undo = async () => assert.fail('A failed save cannot submit a decision');
+  service.editPending = async () => {throw Error('The request changed. Review its refreshed contents before editing.');};
+  panel.webview.messages = [];
+  await receive({type: 'editPending', filePath: 'inventory_report.py', hunkId: 'selected', draft: 'kept draft', revision: 'stale', editId: 'save-failed'});
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult', 'state']);
+  const result = panel.webview.messages[0];
+  assert.equal(result.success, false); assert.equal(result.editId, 'save-failed');
+  assert.equal(result.hunkId, 'selected'); assert.equal(result.filePath, 'inventory_report.py');
+  assert.match(result.error, /request changed/i);
+});
+
+test('malformed proposal-only saves cannot reach the file service', async t => {
+  const {editor, uri, service} = setup(t);
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.editPending = service.editAndAccept = service.decide = async () => assert.fail('An invalid save cannot write or decide');
+  const base = {type: 'editPending', filePath: 'inventory_report.py', hunkId: 'selected', draft: 'draft', revision: 'before', editId: 'invalid-save'};
+  for (const message of [
+    {...base, decision: 'accepted'}, {...base, hunkId: ''}, {...base, draft: undefined},
+    {...base, filePath: undefined}, {...base, revision: undefined}, {...base, editId: undefined}
+  ]) {
+    panel.webview.messages = []; await receive(message);
+    assert.deepEqual(panel.webview.messages.map(item => item.type), ['editResult', 'state']);
+    assert.equal(panel.webview.messages[0].success, false);
+    assert.match(panel.webview.messages[0].error, /Invalid proposal edit/);
+  }
 });
 
 test('Ignore while editing records the original decision without saving the draft', async t => {
@@ -760,19 +863,217 @@ test('toggling Quick Review in its active preview preserves position; revealing 
 });
 
 
-test('original-line messages bind navigation to the panel request, hunk and revision', async t => {
+for (const type of ['openTargetLine', 'openTargetPdf']) test(type + ' messages bind navigation to the panel request, hunk and revision', async t => {
   const {editor,uri,service}=setup(t),calls=[];
-  service.openTargetLine=async(...args)=>{calls.push(args);};
+  service[type]=async(...args)=>{calls.push(args);};
   await editor.openPreview(uri);const panel=current.created[0];
-  const message={type:'openTargetLine',filePath:'inventory_report.py',hunkId:'pending-id',revision:'current-revision'};
+  const message={type,filePath:'inventory_report.py',hunkId:'pending-id',revision:'current-revision'};
   panel.received.fire(message);await tick();
   assert.deepEqual(calls,[[uri,message.filePath,message.hunkId,message.revision]]);
-  for(const invalid of [{...message,revision:undefined},{...message,hunkId:1},{...message,filePath:[]},{...message,line:9000}]) {
+  for(const invalid of [{...message,revision:undefined},{...message,hunkId:1},{...message,filePath:[]},{...message,line:9000},{...message,hunkId:''},{...message,revision:''},{...message,filePath:''}]) {
     panel.webview.messages=[];panel.received.fire(invalid);await tick();
     assert.equal(calls.length,1,'The webview cannot supply a raw line or malformed identity');
     assert.match(panel.webview.messages.find(item=>item.error)?.error??'',/Invalid original-line navigation/);
   }
-  service.openTargetLine=async()=>{throw Error('The original has changed since this request was created.');};
+  service[type]=async()=>{throw Error('The original has changed since this request was created.');};
   panel.webview.messages=[];panel.received.fire(message);await tick();
   assert.match(panel.webview.messages.find(item=>item.error)?.error??'',/original has changed/);
+});
+
+
+for (const edited of [false, true]) test('acceptThrough routes one inclusive-prefix action'+(edited?' with its current draft':''), async t => {
+  const {editor,uri,service}=setup(t);await editor.openPreview(uri);await tick();
+  const panel=current.created[0],receive=[...panel.received.listeners][0],calls=[];
+  service.decide=service.editPending=service.editAndAccept=async()=>assert.fail('A prefix must use one dedicated atomic service action');
+  const completionPrompt={completionId:'prefix-done',revision:'accepted-prefix',requestName:'inventory_report.py.rr'};
+  service.acceptThrough=async(...args)=>{calls.push(args);return{changed:true,revision:'accepted-prefix',completionPrompt};};
+  service.getState=async()=>({type:'state',files:[],revision:'accepted-prefix'});
+  panel.webview.messages=[];
+  const message={type:'acceptThrough',filePath:'inventory_report.py',hunkId:'through',revision:'before',...(edited?{draft:'edited\nblock',editId:'through-edit'}:{})};
+  await receive(message);
+  assert.deepEqual(calls,[[uri,'inventory_report.py','through','before',edited?'edited\nblock':undefined]]);
+  assert.deepEqual(panel.webview.messages.map(item=>item.type),edited?['editResult','state','completionPrompt']:['state','completionPrompt']);
+  if(edited){const result=panel.webview.messages[0];assert.equal(result.success,true);assert.equal(result.editId,'through-edit');assert.equal(result.hunkId,'through');assert.equal(result.revision,'accepted-prefix');}
+  assert.equal(panel.webview.messages.at(-1).completionId,'prefix-done');
+});
+
+for (const edited of [false, true]) test('acceptThrough keeps failed'+(edited?' drafts':' ranges')+' pending without a completion prompt', async t => {
+  const {editor,uri,service}=setup(t);await editor.openPreview(uri);await tick();
+  const panel=current.created[0],receive=[...panel.received.listeners][0];
+  service.acceptThrough=async()=>{throw Error('A pending change in this range conflicts.');};
+  panel.webview.messages=[];
+  await receive({type:'acceptThrough',filePath:'inventory_report.py',hunkId:'through',revision:'before',...(edited?{draft:'kept',editId:'failed-edit'}:{})});
+  assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
+  if(edited){const result=panel.webview.messages.find(item=>item.type==='editResult');assert.equal(result.success,false);assert.equal(result.editId,'failed-edit');assert.match(result.error,/conflicts/);}
+  else assert.match(panel.webview.messages.find(item=>item.type==='state').error,/conflicts/);
+});
+
+test('malformed acceptThrough ranges cannot reach file operations', async t => {
+  const {editor,uri,service}=setup(t);await editor.openPreview(uri);await tick();
+  const panel=current.created[0],receive=[...panel.received.listeners][0];
+  service.acceptThrough=service.decide=service.editPending=async()=>assert.fail('Malformed range reached service');
+  const base={type:'acceptThrough',filePath:'inventory_report.py',hunkId:'through',revision:'before'};
+  for(const message of [
+    {...base,hunkId:''},{...base,hunkId:undefined},{...base,filePath:undefined},{...base,revision:undefined},
+    {...base,draft:'unsaved'},{...base,editId:'missing-draft'},{...base,draft:'value',editId:''},
+    {...base,draft:12,editId:'bad-draft'},{...base,decision:'accepted'},{...base,quickDecisionId:'must-not-run'},
+    {...base,draft:'value',editId:'bad-extra',other:true}
+  ]){panel.webview.messages=[];await receive(message);assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);const error=panel.webview.messages.find(item=>item.type==='editResult')?.error||panel.webview.messages.find(item=>item.type==='state')?.error;assert.match(error,/Invalid acceptance range/);}
+});
+
+
+for (const type of ['generateReviewPdf', 'regenerateReviewPdf', 'importPdfReview', 'applyPdfReview']) test(type + ' binds the PDF action to its preview request and refreshes after completion', async t => {
+  const {editor, uri, service} = setup(t); await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], calls = [];
+  const completionPrompt = {completionId: 'pdf-done', revision: 'after-pdf', requestName: 'inventory_report.py.rr'};
+  service.generateReviewPdf = async (...args) => calls.push(['generate', ...args]);
+  service.importPdfReview = async (...args) => calls.push(['import', ...args]);
+  service.applyPdfReview = async (...args) => {calls.push(['apply', ...args]); return {completionPrompt};};
+  service.getState = async () => ({type: 'state', files: [], revision: 'after-pdf'});
+  panel.webview.messages = [];
+  await receive({type, revision: 'before-pdf', ...(type === 'applyPdfReview' ? {pdfHash: 'a'.repeat(64)} : {})});
+  const expected = type === 'applyPdfReview' ? ['apply', uri, 'before-pdf', 'a'.repeat(64)]
+    : type === 'importPdfReview' ? ['import', uri, 'before-pdf'] : ['generate', uri, 'before-pdf', type === 'regenerateReviewPdf'];
+  assert.deepEqual(calls, [expected]);
+  assert.deepEqual(panel.webview.messages.map(item => item.type), type === 'applyPdfReview' ? ['state', 'completionPrompt'] : ['state']);
+});
+
+test('malformed PDF actions cannot choose another request or apply unbound result bytes', async t => {
+  const {editor, uri, service} = setup(t); await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.generateReviewPdf = service.importPdfReview = service.applyPdfReview = async () => assert.fail('Malformed PDF action reached service');
+  for (const type of ['generateReviewPdf', 'regenerateReviewPdf', 'importPdfReview', 'applyPdfReview']) {
+    const base = {type, revision: 'current', ...(type === 'applyPdfReview' ? {pdfHash: 'b'.repeat(64)} : {})};
+    const invalid = [{...base, revision: undefined}, {...base, revision: ''}, {...base, uri: 'file:///other.rr'}, {...base, filePath: 'other.tex'}];
+    if (type === 'applyPdfReview') invalid.push({...base, pdfHash: undefined}, {...base, pdfHash: 'not-a-hash'}, {...base, pdfHash: 42});
+    else invalid.push({...base, pdfHash: 'b'.repeat(64)});
+    for (const message of invalid) {
+      panel.webview.messages = []; await receive(message);
+      assert.match(panel.webview.messages.find(item => item.type === 'state').pdfReview.error, /Invalid PDF review action/);
+      assert.equal(panel.webview.messages.find(item => item.type === 'state').error, undefined, 'PDF errors must not block ordinary review');
+      assert.equal(panel.webview.messages.some(item => item.type === 'completionPrompt'), false);
+    }
+  }
+});
+
+
+test('an updated companion clears an old PDF action error without blocking regular review', async t => {
+  const {editor, uri, service, changed} = setup(t); await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  service.importPdfReview = async () => {throw Error('Older PDF cannot be imported');};
+  await receive({type: 'importPdfReview', revision: 'test'});
+  assert.match(panel.webview.messages.at(-1).pdfReview.error, /Older PDF/); assert.equal(panel.webview.messages.at(-1).error, undefined);
+  service.getState = async () => ({type: 'state', files: [], revision: 'test', pdfReview: {supported: true, available: true,
+    filename: 'example.tex.rr.pdf', imported: false, canApply: false}});
+  changed.fire(); await tick();
+  assert.equal(panel.webview.messages.at(-1).pdfReview.error, undefined); assert.equal(panel.webview.messages.at(-1).pdfReview.canApply, false);
+  assert.equal(panel.webview.messages.at(-1).pdfReview.imported, false);
+});
+
+
+test('disposed VS Code panels with throwing getters are unbound before an explicit reopen', async t => {
+  const {editor, uri} = setup(t); await editor.openPreview(uri); await tick();
+  const panel = current.created[0], live = {active: panel.active, visible: panel.visible, viewColumn: panel.viewColumn};
+  for (const key of Object.keys(live)) Object.defineProperty(panel, key, {configurable: true,
+    get() {if (this.disposed) throw Error('Webview is disposed: ' + key); return live[key];}, set(value) {live[key] = value;}});
+  assert.doesNotThrow(() => panel.dispose(), 'The real API invalidates getters before disposal listeners run');
+  await editor.openPreview(uri); await tick();
+  assert.equal(current.created.length, 2); assert.notEqual(current.created[1], panel); assert.equal(current.created[1].disposed, false);
+});
+
+
+test('Pending all uses the bound request and batches the reset into one refreshed state without completion', async t => {
+  const {editor,uri,service,changed}=setup(t);await editor.openPreview(uri);await tick();
+  const panel=current.created[0],receive=[...panel.received.listeners][0],gate=deferred();let calls=0,reads=0;
+  service.getState=async()=>{reads++;return {type:'state',files:[],revision:'reset'};};
+  service.undoFile=async(...args)=>{
+    calls++;assert.deepEqual(args,[uri,'inventory_report.py','reviewed']);
+    service.busy=true;changed.fire();changed.fire();await gate.promise;service.busy=false;changed.fire();
+  };
+  panel.webview.messages=[];
+  const pending=receive({type:'undoFile',filePath:'inventory_report.py',revision:'reviewed'});await tick();
+  assert.equal(calls,1);assert.equal(reads,0);assert.deepEqual(panel.webview.messages,[{type:'busy',busy:true}]);
+  gate.resolve();await pending;
+  assert.equal(reads,1);assert.deepEqual(panel.webview.messages.map(message=>message.type),['busy','state']);
+});
+
+test('Pending all rejects malformed webview messages before invoking the file service', async t => {
+  const {editor,uri,service}=setup(t);await editor.openPreview(uri);await tick();
+  const panel=current.created[0],receive=[...panel.received.listeners][0];service.undoFile=async()=>assert.fail('Invalid reset must not reach file service');
+  const base={type:'undoFile',filePath:'inventory_report.py',revision:'reviewed'};
+  for(const message of [{...base,filePath:''},{...base,filePath:1},{...base,revision:''},{...base,revision:null},
+      {...base,hunkId:'not-a-single-undo'},{...base,decision:'pending'},{...base,requestUri:'file:///other.rr'}]) {
+    panel.webview.messages=[];await receive(message);
+    assert.match(panel.webview.messages.find(item=>item.type==='state').error,/Invalid pending-all action/);
+  }
+});
+
+test('PDF stage events update only their bound panel without full review reads', async t => {
+  const {editor, uri, service, pdfProgress, pdfFinished} = setup(t);
+  await editor.openPreview(uri);
+  const other = Uri.joinPath(current.workspace, 'another.tex.rr'); await editor.openPreview(other); await tick();
+  const [panel, unrelated] = current.created;
+  panel.webview.messages = []; unrelated.webview.messages = [];
+  let reads = 0; service.getState = async () => {reads++; return {type: 'state', files: []};};
+  for (const pass of [1, 2, 3]) pdfProgress.fire({uri, progress: {stage: 'compiling', startedAt: 42, message: 'Compiling PDF — pass ' + pass + ' of 3…'}});
+  pdfProgress.fire({uri, progress: null}); pdfFinished.fire({uri, outcome: 'created'});
+  await tick();
+  assert.equal(reads, 0);
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['pdfGenerationProgress', 'pdfGenerationProgress', 'pdfGenerationProgress', 'pdfGenerationProgress', 'pdfGenerationResult']);
+  assert.match(panel.webview.messages[1].progress.message, /pass 2/);
+  assert.deepEqual(unrelated.webview.messages, []);
+  panel.dispose(); pdfProgress.fire({uri, progress: {stage: 'saving', startedAt: 42, message: 'Saving…'}});
+  assert.equal(panel.webview.messages.length, 5, 'disposed previews unsubscribe');
+});
+
+test('a preview opened during PDF compilation receives its initial state and current stage on ready', async t => {
+  const {editor, uri, service, progressByUri, pdfProgress, pdfFinished, changed} = setup(t);
+  service.busy = true;
+  const progress = {stage: 'compiling', startedAt: 1000, message: 'Compiling PDF — pass 2 of 3…'};
+  progressByUri.set(uri.toString(), progress);
+  let reads = 0; service.getState = async () => {reads++; return {type: 'state', files: [], revision: 'current', busy: service.busy, pdfReview: {supported: true, filename: 'test.tex.rr.pdf'}};};
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0];
+  panel.webview.messages = [];
+  await receive({type: 'ready'});
+  assert.equal(reads, 1, 'one initial read while the source-preserving compiler runs');
+  assert.equal(panel.webview.messages[0].type, 'state');
+  assert.equal(panel.webview.messages[0].pdfReview.supported, true);
+  assert.deepEqual(panel.webview.messages[1], {type: 'pdfGenerationProgress', progress});
+  pdfProgress.fire({uri, progress: {...progress, message: 'Compiling PDF — pass 3 of 3…'}});
+  assert.equal(reads, 1);
+  progressByUri.delete(uri.toString()); pdfProgress.fire({uri, progress: null}); pdfFinished.fire({uri, outcome: 'created'});
+  service.busy = false; changed.fire(); await tick();
+  assert.equal(reads, 2);
+  assert.equal(panel.webview.messages.at(-1).type, 'state');
+  assert.equal(panel.webview.messages.at(-1).busy, false);
+});
+
+test('malformed Generate clears the local spinner with a failed result before the final state', async t => {
+  const {editor, uri, service} = setup(t); await editor.openPreview(uri); await tick();
+  service.generateReviewPdf = async () => assert.fail('Invalid generation reached service');
+  const panel = current.created[0], receive = [...panel.received.listeners][0]; panel.webview.messages = [];
+  await receive({type: 'generateReviewPdf', revision: ''});
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['pdfGenerationProgress', 'pdfGenerationResult', 'state']);
+  assert.equal(panel.webview.messages[0].progress, null);
+  assert.equal(panel.webview.messages[1].outcome, 'failed');
+  assert.match(panel.webview.messages[1].error, /Invalid PDF review action/);
+});
+
+test('completion during a ready state read never replays an obsolete busy snapshot', async t => {
+  const {editor, uri, service, progressByUri, pdfProgress, pdfFinished, changed} = setup(t);
+  service.busy = true;
+  progressByUri.set(uri.toString(), {stage: 'saving', startedAt: 99, message: 'Saving…'});
+  const initialRead = deferred(); let reads = 0;
+  service.getState = async () => ++reads === 1 ? initialRead.promise : {type: 'state', files: [], revision: 'finished', busy: false};
+  await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0]; panel.webview.messages = [];
+  const ready = receive({type: 'ready'}); await tick();
+  progressByUri.delete(uri.toString()); pdfProgress.fire({uri, progress: null}); pdfFinished.fire({uri, outcome: 'created'});
+  service.busy = false; changed.fire(); await tick();
+  initialRead.resolve({type: 'state', files: [], revision: 'old', busy: true}); await ready;
+  const states = panel.webview.messages.filter(item => item.type === 'state');
+  assert.ok(states.length >= 1); assert.ok(states.every(item => item.busy === false));
+  assert.equal(states.at(-1).revision, 'finished');
+  assert.equal(panel.webview.messages.some(item => item.type === 'pdfGenerationProgress' && item.progress), false);
 });

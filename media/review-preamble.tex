@@ -1,0 +1,23 @@
+% Revision Request review-only additions. The installed latexdiff supplies its
+% own standard text, float, graphics and verbatim markup at build time.
+% These definitions are never inserted into the user's original manuscript.
+\RequirePackage{amsmath}
+\RequirePackage{hyperref}
+\makeatletter
+% latexdiff's amsmath adapter saves the original ulem command under this name.
+% Keep it separate so its text-style wrapper cannot shrink display fractions.
+\@ifundefined{sout@orig}{\let\RRoriginalsout\sout}{\let\RRoriginalsout\sout@orig}
+\newcommand{\RRmathstrike}[2]{\hbox{\RRoriginalsout{$\m@th#1#2$}}}
+\renewcommand{\DIFdel}[1]{{\color{red}\ifmmode\mathpalette\RRmathstrike{#1}\else\RRoriginalsout{#1}\fi}}
+\renewcommand{\DIFadd}[1]{{\color{blue}#1}}
+\AtBeginDocument{\@ifpackageloaded{listings}{\lstset{extendedchars=true}}{}}
+\makeatother
+% Nonvisual stable destinations identify proposals after typesetting/reflow.
+\newcommand{\RRpdfanchor}[1]{\hypertarget{rrreview.#1}{}}
+\newcommand{\RRpdfend}[1]{}
+\pdfstringdefDisableCommands{%
+  \def\RRpdfanchor#1{}\def\RRpdfend#1{}%
+  \def\DIFadd#1{#1}\def\DIFdel#1{}%
+  \def\DIFaddbegin{}\def\DIFaddend{}%
+  \def\DIFdelbegin{}\def\DIFdelend{}%
+}

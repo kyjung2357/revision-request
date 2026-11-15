@@ -12,6 +12,8 @@ async function buildAll() {
       outfile: path.join(root, '.codex-build/extension.js'), external: ['vscode'] }),
     build({ ...common, entryPoints: [path.join(root, 'src/mcpServer.ts')],
       outfile: path.join(root, '.codex-build/mcp-server.cjs'), loader: { '.md': 'text' } }),
+    build({ ...common, entryPoints: [path.join(root, 'src/pdfReviewWorker.ts')],
+      outfile: path.join(root, '.codex-build/pdf-review-worker.cjs') }),
     build({ ...common, platform: 'browser', format: 'iife', globalName: 'RRHighlight',
       entryPoints: [path.join(root, 'src/reviewHighlight.ts')],
       outfile: path.join(root, '.codex-build/review-highlight.js') }),
