@@ -42,7 +42,7 @@ Accepting changes requires workspace trust and a saved original. During a tracke
 
 ## Share a LaTeX review as a PDF
 
-Use **Generate PDF from RR** to create or rebuild `file.tex.rr.pdf` from the current request. Use the separate **Import review from PDF** button to read a returned PDF’s decisions. Neither opening the request nor replacing the PDF imports decisions automatically. After importing a completed review, **Apply reviewed changes** updates the original and request; import alone changes neither.
+Use **Generate PDF from RR** to create or rebuild `file.tex.rr.pdf`. **Open PDF review** opens the built-in viewer, which saves Accept/Ignore choices automatically. **Import review from PDF** waits for those saves and immediately applies the saved choices to the original and `.rr`; undecided entries remain pending. Opening the request or replacing its PDF does not import anything automatically.
 
 Generation requires local LaTeX and latexdiff, and asks you to trust the proposed LaTeX before compiling. PDF form and menu support varies by viewer; Overleaf displays the comparison but does not support decisions in its internal viewer. See [PDF review](docs/PDF_REVIEW.md) for the workflow and compatibility limits.
 

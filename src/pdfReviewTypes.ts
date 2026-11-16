@@ -61,6 +61,10 @@ export interface ImportedPdfReview {
   decisions: Record<string, Decision>;
   pdfHash: string;
 }
+export interface ReviewPdfSnapshot {
+  bytes: Uint8Array;
+  review: ImportedPdfReview;
+}
 export interface PdfReviewState {
   supported: boolean;
   available: boolean;

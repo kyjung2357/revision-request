@@ -7,6 +7,7 @@ import { TextDecoder } from 'node:util';
 import { computeHunks, computeFileInlineChanges, renderAccepted, requestFingerprint, type Decision, type RequestFile, type InlineChangeLine } from './core';
 import { getReviewHtml, getReviewRestoreErrorHtml } from './webview';
 import { captureLatexPdfView, resolveLatexPdfView, focusLatexPdfView } from './latexNavigation';
+import {ReviewPdfEditor, PDF_REVIEW_VIEW} from './reviewPdfEditor';
 import { createTrackedReview, rebaseTrackedReview, reconfigureTrackedReview, transitionTrackedReview, projectTrackedReview, validateTrackedReview, type TrackedReview } from './reviewRebase';
 import { parseRequestDocument, proposalIdentity, resolveRequest, patchRequestStatuses, editPendingRequest, ensureRequestTime, type RevisionRequest } from './request';
 import { McpHost } from './mcpHost';
@@ -35,7 +36,7 @@ async function confirmPdfBuild(requestName: string, targetPath: string, replacin
   return await vscode.window.showWarningMessage('Build this review PDF?', {modal: true, detail}, 'Build PDF') === 'Build PDF';
 }
 interface PdfExportRecord {
-  manifest: PdfReviewManifest; generation: string; warnings: string[];
+  manifest: PdfReviewManifest; generation: string;
   application?: {decisions: Record<string, Decision>; sourceHash: string; requestHash: string};
 }
 
@@ -84,6 +85,12 @@ const inside = (root: string, target: string) => {
   const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
 };
+function resetReviewedChoices(tracking: TrackedReview, decisions: Record<string, Decision>): TrackedReview {
+  const resets: Record<string, Decision> = {};
+  for (const entry of tracking.entries) if (entry.decision !== 'pending' &&
+      decisions[entry.hunk.id] !== undefined && decisions[entry.hunk.id] !== entry.decision) resets[entry.hunk.id] = 'pending';
+  return Object.keys(resets).length ? transitionTrackedReview(tracking, resets) : tracking;
+}
 function decode(bytes: Uint8Array): string {
   try {
     const value = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(bytes);
@@ -145,6 +152,8 @@ export class ReviewService implements vscode.Disposable {
   private readonly resolvedRequests: {request: RevisionRequest; baseline: string; review: ReturnType<typeof resolveRequest>}[] = [];
   private readonly pdfImports = new Map<string, {stamp: string; review: ImportedPdfReview}>();
   busy = false;
+  private flushPdfReview: (uri: vscode.Uri) => Promise<void> = async () => {};
+  setPdfReviewFlush(flush: (uri: vscode.Uri) => Promise<void>) {this.flushPdfReview = flush;}
   private completionRecorder?: (uri: vscode.Uri, cleanup: 'retained' | 'deleted' | 'failed') => Promise<void>;
   setCompletionRecorder(recorder: (uri: vscode.Uri, cleanup: 'retained' | 'deleted' | 'failed') => Promise<void>) {
     this.completionRecorder = recorder;
@@ -393,7 +402,7 @@ export class ReviewService implements vscode.Disposable {
     const text = ensureRequestTime(raw.savedText, new Date(created).toISOString());
     if (text !== raw.savedText) await this.writeRawRequest(uri, raw, text);
   }
-  private commitReview(uri: vscode.Uri, loaded: Awaited<ReturnType<ReviewService['load']>>, text: string, origin: DecisionOrigin, editedHunkId?: string) {
+  private commitReview(uri: vscode.Uri, loaded: Awaited<ReturnType<ReviewService['load']>>, text: string, origin: DecisionOrigin, editedHunkId?: string, replaceReviewed = false) {
     return this.withTracking(uri, async () => {
       const next = this.projection(text, loaded.resolved.review.baseline);
       if (next.request.path !== loaded.resolved.request.path) throw new Error('A review cannot change its target path.');
@@ -409,7 +418,8 @@ export class ReviewService implements vscode.Disposable {
         const prior = oldByIndex.get(removedIndex !== undefined && index >= removedIndex ? index + 1 : index);
         if (prior) mappings[hunk.id] = prior;
       }
-      const newTracking = reconfigureTrackedReview(oldTracking, next.review.file, next.review.decisions, mappings);
+      const decisionBase = replaceReviewed ? resetReviewedChoices(oldTracking, next.review.decisions) : oldTracking;
+      const newTracking = reconfigureTrackedReview(decisionBase, next.review.file, next.review.decisions, mappings);
       const journal: ReviewTransaction = {generation: loaded.generation, baseline: loaded.resolved.review.baseline,
         oldRequest: loaded.savedText, newRequest: text, oldTracking, newTracking};
       await this.context.workspaceState.update(this.journalKey(uri), journal);
@@ -500,7 +510,6 @@ export class ReviewService implements vscode.Disposable {
       if (!record || JSON.stringify(record.manifest) !== JSON.stringify(imported.manifest)) {
         throw new Error('This PDF does not match a review exported from this request. Keep the original .rr and generate a new review PDF.');
       }
-      state.warnings = record.warnings;
       if (!loaded) throw new Error('The request and original must be verified before importing PDF decisions.');
       if (loaded.generation !== record.generation || loaded.resolved.identity !== record.manifest.proposalIdentity) {
         throw new Error('The request changed since this PDF was generated. Generate a new review PDF.');
@@ -510,9 +519,17 @@ export class ReviewService implements vscode.Disposable {
       const application = record.application;
       const sameDecisions = (a: Record<string, Decision>, b: Record<string, Decision>) =>
         Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(id => a[id] === b[id]);
-      if (application && application.requestHash === loaded.fingerprint && application.sourceHash === sourceHash) {
-        if (!sameDecisions(application.decisions, imported.decisions)) throw new Error('This PDF has different decisions from the review already applied. The original was kept unchanged.');
-        state.applied = true; state.canApply = false;
+      const ids = record.manifest.entries.map(entry => entry.id);
+      if (!ids.length || Object.keys(imported.decisions).length !== ids.length || ids.some(id =>
+          !['pending', 'accepted', 'ignored'].includes(imported!.decisions[id]!))) {
+        throw new Error('The PDF review decisions are incomplete or invalid.');
+      }
+      if (application) {
+        if (application.requestHash !== loaded.fingerprint || application.sourceHash !== sourceHash) {
+          throw new Error('The original or local review decisions changed since the PDF review was applied. Keep those edits and generate a new review PDF.');
+        }
+        state.applied = sameDecisions(application.decisions, imported.decisions);
+        state.canApply = !state.applied && vscode.workspace.isTrusted;
         return {state, imported, record, stamp};
       }
       if (sourceHash !== record.manifest.sourceHash || loaded.resolved.request.request.some((entry, index) =>
@@ -522,13 +539,8 @@ export class ReviewService implements vscode.Disposable {
       if (loaded.tracking?.entries.some(entry => entry.decision === 'pending' && entry.conflict)) {
         throw new Error('Resolve pending source conflicts before using PDF review.');
       }
-      const ids = record.manifest.entries.map(entry => entry.id);
-      if (!ids.length || Object.keys(imported.decisions).length !== ids.length || ids.some(id =>
-          !['pending', 'accepted', 'ignored'].includes(imported!.decisions[id]!))) {
-        throw new Error('The PDF review decisions are incomplete or invalid.');
-      }
       state.applied = false;
-      state.canApply = state.pending === 0 && vscode.workspace.isTrusted;
+      state.canApply = vscode.workspace.isTrusted;
     } catch (error) { this.pdfImports.delete(key); state.imported = false; state.error = failure(error); state.canApply = false; }
     return {state, imported, record, stamp};
   }
@@ -610,7 +622,7 @@ export class ReviewService implements vscode.Disposable {
       const latest = await this.companionPdf(uri);
       if (latest.hash !== prior.hash) throw new Error('The companion PDF changed during generation. Its saved review was kept.');
       const key = this.pdfExportKey(uri), previous = this.context.workspaceState.get<PdfExportRecord>(key);
-      const record: PdfExportRecord = {manifest, generation: loaded.generation, warnings: compiled.warnings};
+      const record: PdfExportRecord = {manifest, generation: loaded.generation};
       // Sibling staging keeps displacement and exclusive installation on one
       // filesystem even when extension storage is on another disk. No source
       // or persistent project configuration is changed by this transaction.
@@ -677,8 +689,22 @@ export class ReviewService implements vscode.Disposable {
     }
   }
 
+  async openPdfReview(uri: vscode.Uri) {
+    if (!(await this.companionPdfInfo(uri)).stat) throw new Error('No companion review PDF was found.');
+    await vscode.commands.executeCommand('vscode.openWith', vscode.Uri.file(uri.fsPath + '.pdf'), PDF_REVIEW_VIEW, {preview: false});
+  }
   async importPdfReview(uri: vscode.Uri, revision: string) {
     return this.runExclusive(async () => {
+      if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before importing and applying PDF decisions.');
+      await this.flushPdfReview(vscode.Uri.file(uri.fsPath + '.pdf'));
+      const imported = await this.readPdfReviewNow(uri, revision);
+      return this.applyPdfReviewNow(uri, revision, imported.pdfHash!);
+    });
+  }
+  async readPdfReview(uri: vscode.Uri, revision: string) {
+    return this.runExclusive(() => this.readPdfReviewNow(uri, revision));
+  }
+  private async readPdfReviewNow(uri: vscode.Uri, revision: string) {
       const key = this.pdfFileKey(uri.fsPath + '.pdf');
       this.pdfImports.delete(key);
       const loaded = await this.load(uri);
@@ -689,10 +715,11 @@ export class ReviewService implements vscode.Disposable {
       this.pdfImports.set(key, {stamp: result.stamp, review: result.imported});
       while (this.pdfImports.size > 2) this.pdfImports.delete(this.pdfImports.keys().next().value!);
       return result.state;
-    });
   }
   async applyPdfReview(uri: vscode.Uri, revision: string, pdfHash: string) {
-    return this.runExclusive(async () => {
+    return this.runExclusive(() => this.applyPdfReviewNow(uri, revision, pdfHash));
+  }
+  private async applyPdfReviewNow(uri: vscode.Uri, revision: string, pdfHash: string) {
       if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before applying PDF decisions.');
       await this.prepareReview(uri);
       const loaded = await this.load(uri);
@@ -708,7 +735,7 @@ export class ReviewService implements vscode.Disposable {
         throw new Error('The review PDF changed. Import its latest decisions before applying.');
       }
       if (result.state.applied) return;
-      if (!result.state.canApply) throw new Error('Complete every PDF decision before applying the reviewed changes.');
+      if (!result.state.canApply) throw new Error('This PDF review cannot be applied to the current source.');
       const {imported, record} = result;
       const updates: Record<number, Decision> = {}, changes: Record<string, Decision> = {};
       for (const entry of record.manifest.entries) {
@@ -716,18 +743,30 @@ export class ReviewService implements vscode.Disposable {
         changes[entry.id] = imported.decisions[entry.id]!;
       }
       const text = patchRequestStatuses(loaded.savedText, updates);
+      if (text === loaded.savedText) return; // No decisions changed; do not write or trigger completion cleanup.
       const tracking = loaded.tracking ?? createTrackedReview(loaded.resolved.review.file, loaded.resolved.review.decisions);
-      const next = transitionTrackedReview(tracking, changes);
+      const next = transitionTrackedReview(resetReviewedChoices(tracking, changes), changes);
       // Persist an exact receipt before the transaction: recovery can recognize a
       // committed result after a crash without applying the source a second time.
       await this.context.workspaceState.update(this.pdfExportKey(uri), {...record, application: {
         decisions: imported.decisions, sourceHash: requestFingerprint(next.text), requestHash: requestFingerprint(text)}} satisfies PdfExportRecord);
-      if ((await this.companionPdf(uri)).hash !== pdfHash) throw new Error('The review PDF changed before applying. Import its latest decisions first.');
-      this.completionPrompts.delete(uri.toString());
-      const committed = await this.commitReview(uri, loaded, text, 'user');
+      let committed: Awaited<ReturnType<ReviewService['commitReview']>>;
+      try {
+        if ((await this.companionPdf(uri)).hash !== pdfHash) throw new Error('The review PDF changed before applying. Import its latest decisions first.');
+        this.completionPrompts.delete(uri.toString());
+        committed = await this.commitReview(uri, loaded, text, 'user', undefined, true);
+      } catch (error) {
+        // Keep the new receipt when source/RR recovery committed the new state.
+        // Restore the prior receipt only when neither file changed.
+        try {
+          const raw = decode(await vscode.workspace.fs.readFile(uri));
+          const source = decode(await vscode.workspace.fs.readFile(await this.targetUri(uri, loaded.request.files[0]!)));
+          if (raw === loaded.savedText && source === tracking.text) await this.context.workspaceState.update(this.pdfExportKey(uri), record);
+        } catch { /* An uncertain transaction must stay blocked until recovery verifies it. */ }
+        throw error;
+      }
       const completionPrompt = await this.finishCompletedReview(uri, committed, 'user');
       if (completionPrompt) return {completionPrompt};
-    });
   }
 
   private fileDecisions(file: RequestFile, decisions: Decisions): Decisions {
@@ -1710,7 +1749,7 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
                 throw new Error('Invalid PDF review action.');
               }
               if (message.type === 'applyPdfReview') decisionResult = await this.service.applyPdfReview(uri, message.revision, message.pdfHash);
-              else if (message.type === 'importPdfReview') await this.service.importPdfReview(uri, message.revision);
+              else if (message.type === 'importPdfReview') decisionResult = await this.service.importPdfReview(uri, message.revision);
               else {
                 pdfGenerationStarted = true;
                 await this.service.generateReviewPdf(uri, message.revision, message.type === 'regenerateReviewPdf');
@@ -1773,6 +1812,9 @@ export class ReviewEditor implements vscode.Disposable, vscode.WebviewPanelSeria
               if (message.type === 'openTargetPdf') await this.service.openTargetPdf(uri, message.filePath, message.hunkId, message.revision);
               else await this.service.openTargetLine(uri, message.filePath, message.hunkId, message.revision);
               break;
+            case 'openPdfReview':
+              if (Object.keys(message).some(key => key !== 'type')) throw new Error('Invalid PDF view action.');
+              await this.service.openPdfReview(uri); break;
             case 'openTarget': await this.service.openTarget(uri, message.filePath, {preserveFocus: false}); break;
             case 'openSource': await this.openSource(uri); break;
             case 'openDiff': await this.openDiff(uri, message.filePath, message.revision); break;
@@ -1926,12 +1968,15 @@ export async function activate(context: vscode.ExtensionContext) {
   const requests = vscode.workspace.createFileSystemWatcher('**/*.rr');
   const targets = vscode.workspace.createFileSystemWatcher('**/*');
   const reviewPdfs = vscode.workspace.createFileSystemWatcher('**/*.rr.pdf');
+  const pdfEditor = new ReviewPdfEditor(context.extensionUri, uri => service.pdfChanged(uri));
+  service.setPdfReviewFlush(uri => pdfEditor.flush(uri));
   const changed = (uri: vscode.Uri) => {
     if (uri.path.endsWith('.rr')) { tree.refresh(); service.changed(); }
     else if (service.isTarget(uri)) service.changed();
   };
   context.subscriptions.push(
-    service, tree, requests, targets, reviewPdfs, editor,
+    service, tree, requests, targets, reviewPdfs, editor, pdfEditor,
+    vscode.window.registerCustomEditorProvider(PDF_REVIEW_VIEW, pdfEditor, {webviewOptions: {retainContextWhenHidden: true}, supportsMultipleEditorsPerDocument: false}),
     {dispose: () => {disposed = true; bridge?.dispose(); diagnosticOutput?.dispose();}},
     vscode.window.registerWebviewPanelSerializer(VIEW, editor),
     vscode.window.onDidChangeActiveTextEditor(active => editor.autoPreview(active)),
@@ -1944,7 +1989,9 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.createTreeView('revisionRequest.requests', {treeDataProvider: tree}),
     requests.onDidCreate(changed), requests.onDidDelete(changed), requests.onDidChange(changed),
     targets.onDidChange(changed), targets.onDidDelete(changed),
-    reviewPdfs.onDidCreate(uri => service.pdfChanged(uri)), reviewPdfs.onDidChange(uri => service.pdfChanged(uri)), reviewPdfs.onDidDelete(uri => service.pdfChanged(uri)),
+    reviewPdfs.onDidCreate(uri => {service.pdfChanged(uri);pdfEditor.pdfChanged(uri);}),
+    reviewPdfs.onDidChange(uri => {service.pdfChanged(uri);pdfEditor.pdfChanged(uri);}),
+    reviewPdfs.onDidDelete(uri => {service.pdfChanged(uri);pdfEditor.pdfChanged(uri);}),
     vscode.workspace.onDidChangeTextDocument(event => changed(event.document.uri)),
     vscode.workspace.onDidSaveTextDocument(document => changed(document.uri)),
     vscode.workspace.onDidGrantWorkspaceTrust(() => {service.changed(); publishWorkspaces();}),

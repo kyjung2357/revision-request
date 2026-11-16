@@ -927,7 +927,7 @@ for (const type of ['generateReviewPdf', 'regenerateReviewPdf', 'importPdfReview
   const panel = current.created[0], receive = [...panel.received.listeners][0], calls = [];
   const completionPrompt = {completionId: 'pdf-done', revision: 'after-pdf', requestName: 'inventory_report.py.rr'};
   service.generateReviewPdf = async (...args) => calls.push(['generate', ...args]);
-  service.importPdfReview = async (...args) => calls.push(['import', ...args]);
+  service.importPdfReview = async (...args) => {calls.push(['import', ...args]); return {completionPrompt};};
   service.applyPdfReview = async (...args) => {calls.push(['apply', ...args]); return {completionPrompt};};
   service.getState = async () => ({type: 'state', files: [], revision: 'after-pdf'});
   panel.webview.messages = [];
@@ -935,7 +935,7 @@ for (const type of ['generateReviewPdf', 'regenerateReviewPdf', 'importPdfReview
   const expected = type === 'applyPdfReview' ? ['apply', uri, 'before-pdf', 'a'.repeat(64)]
     : type === 'importPdfReview' ? ['import', uri, 'before-pdf'] : ['generate', uri, 'before-pdf', type === 'regenerateReviewPdf'];
   assert.deepEqual(calls, [expected]);
-  assert.deepEqual(panel.webview.messages.map(item => item.type), type === 'applyPdfReview' ? ['state', 'completionPrompt'] : ['state']);
+  assert.deepEqual(panel.webview.messages.map(item => item.type), ['importPdfReview', 'applyPdfReview'].includes(type) ? ['state', 'completionPrompt'] : ['state']);
 });
 
 test('malformed PDF actions cannot choose another request or apply unbound result bytes', async t => {
@@ -1076,4 +1076,20 @@ test('completion during a ready state read never replays an obsolete busy snapsh
   assert.ok(states.length >= 1); assert.ok(states.every(item => item.busy === false));
   assert.equal(states.at(-1).revision, 'finished');
   assert.equal(panel.webview.messages.some(item => item.type === 'pdfGenerationProgress' && item.progress), false);
+});
+
+
+test('Open PDF review is bound to its preview and cannot open an arbitrary URI', async t => {
+  const {editor, uri, service} = setup(t); await editor.openPreview(uri); await tick();
+  const panel = current.created[0], receive = [...panel.received.listeners][0], calls = [];
+  service.openPdfReview = async (...args) => {calls.push(args);};
+  panel.webview.messages = []; await receive({type: 'openPdfReview'});
+  assert.deepEqual(calls, [[uri]]);
+  for(const extra of [{uri:'file:///outside.pdf'},{filePath:'outside.pdf'},{revision:'obsolete'}]) {
+    panel.webview.messages = []; await receive({type:'openPdfReview',...extra});
+    const state = panel.webview.messages.find(item=>item.type==='state');
+    assert.match(state.pdfReview?.error || state.error, /Invalid PDF/);
+  }
+  assert.equal(calls.length,1);
+  assert.equal(panel.webview.messages.some(item=>item.type==='completionPrompt'),false);
 });

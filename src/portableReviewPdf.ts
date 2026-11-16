@@ -1,11 +1,12 @@
 import path from 'node:path';
 import {existsSync} from 'node:fs';
 import {Worker} from 'node:worker_threads';
-import type {PdfReviewManifest,PdfReviewAnchor,ImportedPdfReview} from './pdfReviewTypes';
+import type {PdfReviewManifest,PdfReviewAnchor,ImportedPdfReview,ReviewPdfSnapshot} from './pdfReviewTypes';
+import type {Decision} from './core';
 export {pdfReviewMenuScript} from './pdfReviewMenu';
 
 const MAX_PDF=50*1024*1024;
-type Job={operation:'read'|'create'|'anchors';bytes:Uint8Array;manifest?:PdfReviewManifest;anchors?:PdfReviewAnchor[];ids?:string[]};
+type Job={operation:'read'|'create'|'anchors'|'decision';bytes:Uint8Array;manifest?:PdfReviewManifest;anchors?:PdfReviewAnchor[];ids?:string[];entryId?:string;decision?:Decision;through?:boolean};
 let active=false;
 const waiting:(()=>void)[]=[];
 function run<T>(job:Job):Promise<T>{
@@ -48,6 +49,10 @@ export async function createPortableReviewPdf(bytes:Uint8Array,manifest:PdfRevie
 }
 /** Reads data only: no PDF actions or scripts are executed. */
 export async function readPortableReviewPdf(bytes:Uint8Array):Promise<ImportedPdfReview>{return run({operation:'read',bytes});}
+/** Save a semantic choice in an isolated worker; arbitrary document scripts remain inert. */
+export async function updatePortableReviewPdfDecision(bytes:Uint8Array,entryId:string,decision:Decision,through=false):Promise<ReviewPdfSnapshot>{
+  return run({operation:'decision',bytes,entryId,decision,through});
+}
 export async function readPortableReviewAnchors(bytes:Uint8Array,ids:string[]):Promise<PdfReviewAnchor[]>{
   if(!Array.isArray(ids)||ids.length>10000||ids.some(id=>typeof id!=='string'||id.length>128))return Promise.reject(new Error('Invalid PDF review anchor identifiers.'));
   return run({operation:'anchors',bytes,ids});

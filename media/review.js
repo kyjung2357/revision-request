@@ -1761,14 +1761,13 @@
     spinner.setAttribute('aria-hidden', 'true');
     generate.append(spinner, element('span', 'pdf-generation-label'));
     controls.append(generate);
+    if (pdf.available) controls.append(button('Open PDF review', 'button button-secondary pdf-review-open',
+      () => post({type: 'openPdfReview'}),
+      {key: 'pdf:open', disabled: busy, title: 'Open ' + pdf.filename + ' with automatic review saving'}));
     controls.append(button('Import review from PDF', 'button button-secondary pdf-review-import',
       () => decide({type: 'importPdfReview'}),
-      {key: 'pdf:import', disabled: busy || !pdf.available,
-        title: 'Read saved decisions from ' + pdf.filename + '; the original stays unchanged'}));
-    if (pdf.imported === true && typeof pdf.pending === 'number' && !pdf.applied) controls.append(button('Apply reviewed changes', 'button button-accept pdf-review-apply',
-      () => decide({type: 'applyPdfReview', pdfHash: pdf.pdfHash}),
-      {key: 'pdf:apply', disabled: busy || !state.trusted || !pdf.canApply || !pdf.pdfHash || Boolean(pdf.error),
-        title: pdf.pending ? 'Finish all PDF decisions before applying them' : 'Apply approved changes to the original and record the PDF decisions'}));
+      {key: 'pdf:import', disabled: busy || !pdf.available || !state.trusted,
+        title: 'Import saved decisions from ' + pdf.filename + ' and apply accepted changes to the original'}));
     bar.append(controls);
     const progress = element('p', 'pdf-generation-status');
     const phase = element('span');
@@ -1777,8 +1776,8 @@
     elapsed.setAttribute('aria-hidden', 'true');
     progress.append(phase, elapsed);
     if (pdf.imported === true && typeof pdf.pending === 'number') {
-      const summary = element('p', 'pdf-review-summary', pdf.applied ? 'PDF review applied.' :
-        'PDF review: ' + (pdf.accepted || 0) + ' approved · ' + (pdf.ignored || 0) + ' ignored · ' + pdf.pending + ' pending — not applied');
+      const summary = element('p', 'pdf-review-summary', pdf.applied && pdf.pending === 0 ? 'PDF review applied.' :
+        'PDF review: ' + (pdf.accepted || 0) + ' accepted · ' + (pdf.ignored || 0) + ' ignored · ' + pdf.pending + ' pending');
       summary.setAttribute('role', 'status');
       bar.append(summary);
     } else if (pdf.available) {
@@ -1787,10 +1786,9 @@
       bar.append(summary);
     }
     bar.append(progress);
-    for (const text of [pdf.error, ...(pdf.warnings || [])].filter(Boolean)) {
-      const message = element('p', 'pdf-review-message' + (text === pdf.error ? ' pdf-review-error' : ''), text);
-      if (text === pdf.error) message.setAttribute('role', 'alert');
-      bar.append(message);
+    if (pdf.error) {
+      const message = element('p', 'pdf-review-message pdf-review-error', pdf.error);
+      message.setAttribute('role', 'alert'); bar.append(message);
     }
     updatePdfGenerationPresentation(bar);
     return bar;

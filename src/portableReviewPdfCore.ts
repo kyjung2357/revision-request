@@ -6,7 +6,7 @@ import {PDFDocument, PDFName, PDFDict, PDFArray, PDFString, PDFHexString, PDFRaw
   type PDFPage, type PDFFont} from 'pdf-lib';
 import {parseRequestDocument, proposalIdentity} from './request';
 import type {Decision} from './core';
-import type {PdfReviewManifest, PdfReviewAnchor, ImportedPdfReview} from './pdfReviewTypes';
+import type {PdfReviewManifest, PdfReviewAnchor, ImportedPdfReview, ReviewPdfSnapshot} from './pdfReviewTypes';
 
 const ATTACHMENT = 'revision-request.json';
 const MAX_PDF = 50 * 1024 * 1024;
@@ -314,6 +314,41 @@ export async function readPortableReviewPdfCore(bytes: Uint8Array): Promise<Impo
     decisions[entry.id]=chosen;
   }
   return{manifest,decisions,pdfHash:sha256(bytes)};
+}
+
+
+/** Update only existing, validated review choices. Never evaluate document actions. */
+export async function updatePortableReviewPdfDecisionCore(
+  bytes: Uint8Array, entryId: string, choice: Decision, through = false,
+): Promise<ReviewPdfSnapshot> {
+  if (typeof entryId !== 'string' || !idPattern.test(entryId) || entryId === '__proto__' ||
+      !decision(choice) || typeof through !== 'boolean' || (through && choice !== 'accepted')) {
+    throw new Error('Invalid PDF review decision.');
+  }
+  const current = await readPortableReviewPdfCore(bytes);
+  const index = current.manifest.entries.findIndex(entry => entry.id === entryId);
+  if (index < 0) throw new Error('The PDF review entry does not exist.');
+  const entries = through ? current.manifest.entries.slice(0, index + 1)
+    .filter(entry => current.decisions[entry.id] === 'pending') : [current.manifest.entries[index]!];
+  if (entries.every(entry => current.decisions[entry.id] === choice)) return {bytes, review: current};
+  const pdf = await PDFDocument.load(bytes, {updateMetadata: false, throwOnInvalidObject: true});
+  const decisions = {...current.decisions};
+  for (const entry of entries) {
+    const field = pdf.getForm().getRadioGroup(fieldName(current.manifest, entry.id));
+    const value = name(choice === 'pending' ? 'Off' : choice);
+    field.acroField.dict.set(name('V'), value);
+    for (const widget of field.acroField.getWidgets()) {
+      const on = widget.getOnValue()!;
+      widget.dict.set(name('AS'), value === on ? on : name('Off'));
+      // Some viewers duplicate /V on the widgets. Keep the parent canonical.
+      widget.dict.delete(name('V'));
+    }
+    pdf.getForm().markFieldAsClean(field.ref);
+    decisions[entry.id] = choice;
+  }
+  const saved = await pdf.save({updateFieldAppearances: false});
+  checkPdf(saved);
+  return {bytes: saved, review: {manifest: current.manifest, decisions, pdfHash: sha256(saved)}};
 }
 
 /** Validate graph topology before pdf-lib recursively traverses page parents/Kids. */

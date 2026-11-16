@@ -45,11 +45,12 @@ async function main() {
   for (const name of ['extension.js', 'mcp-server.cjs', 'pdf-review-worker.cjs', 'review-highlight.js']) {
     await fs.copyFile(path.join(root, '.codex-build', name), path.join(stage, 'dist', name));
   }
+  await fs.cp(path.join(root, '.codex-build', 'pdfjs'), path.join(stage, 'dist', 'pdfjs'), {recursive:true});
   await fs.copyFile(path.join(root, '.codex-build', 'THIRD_PARTY_NOTICES.txt'), path.join(stage, 'THIRD_PARTY_NOTICES.txt'));
   const metadata = JSON.parse(await fs.readFile(path.join(root, '.codex-build', 'bundled-dependencies.json'), 'utf8'));
   for (const dependency of metadata.packages) {
     for (const bundle of dependency.bundles) {
-      bundle.file = 'dist/' + path.posix.basename(bundle.file);
+      bundle.file = bundle.file.replace(/^\.codex-build\//, 'dist/');
     }
   }
   await fs.writeFile(path.join(stage, 'bundled-dependencies.json'), JSON.stringify(metadata, null, 2) + '\n');

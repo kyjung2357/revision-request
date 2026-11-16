@@ -3024,7 +3024,7 @@ async function runPdfReviewTests(width) {
   const event = async (message, reuseStart=false) => {await cdp.evaluate('(() => {const m='+JSON.stringify(message)+';'+(reuseStart?'m.progress.startedAt=window.__pdfStarted;':'')+'window.dispatchEvent(new MessageEvent("message",{data:m}));})()');await settle();};
   const set = async (review, extra={}) => {await event({type:'pdfGenerationProgress',progress:null});await cdp.evaluate('window.__setReview({...structuredClone(window.__fixture),...'+JSON.stringify(extra)+',pdfReview:'+JSON.stringify(review)+'})');await settle();};
   const click = async selector => {await cdp.evaluate('document.querySelector('+JSON.stringify(selector)+')?.click()');await settle();};
-  const sent = () => cdp.evaluate('window.__messages.filter(message=>/^(generateReviewPdf|importPdfReview|regenerateReviewPdf|applyPdfReview)$/.test(message.type))');
+  const sent = () => cdp.evaluate('window.__messages.filter(message=>/^(generateReviewPdf|importPdfReview|regenerateReviewPdf|applyPdfReview|openPdfReview)$/.test(message.type))');
   const labels = () => cdp.evaluate('[...document.querySelectorAll(".pdf-review-generate,.pdf-review-import")].map(node=>node.textContent)');
   for (const mode of ['unified','sideBySide']) {
     await resetFixture(width);if((await unifiedSnapshot()).unified!==(mode==='unified'))await toggleLayout();
@@ -3121,21 +3121,55 @@ async function runPdfReviewTests(width) {
       await set(pdf);assert.deepEqual(await labels(),['Generate PDF from RR','Import review from PDF']);
       assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled'));assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary")'),null);
     });
-    await runTest(width+'px '+mode+': only explicitly imported PDF decisions offer a separate application action',async()=>{
-      await set({...pdf,available:true,imported:true,pending:1,accepted:2,ignored:1,canApply:false,pdfHash:'a'.repeat(64)});
-      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-apply").disabled'));
-      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent.includes("not applied")'));
-      assert.ok(await cdp.evaluate('window.__review.files[0].hunks.every(h=>h.decision==="pending")'));
-      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,canApply:true,pdfHash:'b'.repeat(64)},{revision:'pdf-latest'});
-      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-apply');
-      assert.deepEqual(await sent(),[{type:'applyPdfReview',pdfHash:'b'.repeat(64),revision:'pdf-latest'}]);
-      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,canApply:false,applied:true});
+    await runTest(width+'px '+mode+': Import applies PDF decisions through one host action without a separate Apply button',async()=>{
+      await set({...pdf,available:true});await cdp.evaluate('window.__messages=[]');
       assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
+      await click('.pdf-review-import');await click('.pdf-review-import');
+      assert.deepEqual(await sent(),[{type:'importPdfReview',revision:fixture.revision}]);
+      await set({...pdf,available:true,imported:true,applied:true,pending:1,accepted:2,ignored:1,pdfHash:'a'.repeat(64)});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF review: 2 accepted · 1 ignored · 1 pending');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
+      const resolved=structuredClone(fixture.files);resolved[0].hunks.forEach((h,i)=>h.decision=i===3?'ignored':'accepted');
+      await set({...pdf,available:true,imported:true,pending:0,accepted:3,ignored:1,applied:true},{files:resolved,closed:true});
       assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF review applied.');
+      assert.equal(await cdp.evaluate('document.querySelector(".summary .accepted").textContent'),'3 accepted');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
+      assert.deepEqual(await sent(),[{type:'importPdfReview',revision:fixture.revision}]);
     });
-    await runTest(width+'px '+mode+': invalidating an imported PDF removes stale counts and Apply until another import',async()=>{
+    await runTest(width+'px '+mode+': PDF build logs are absent while real import errors remain visible and safe',async()=>{
+      const warnings=['LaTeX Warning: Reference missing-label undefined.', 'Overfull \\hbox (11.7pt too wide)', 'Package warning: <img src=x onerror=window.__xss=77>'];
+      const review={...pdf,available:true,imported:true,applied:true,pending:0,accepted:3,ignored:1,pdfHash:'f'.repeat(64),warnings};
+      await set(review);await cdp.evaluate('window.__messages=[]');
+      const before=await cdp.evaluate('JSON.stringify(window.__review.files)');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-build-warnings,.pdf-build-warning,.pdf-review-error")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar [role=alert]")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF review applied.');
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar").textContent.includes("LaTeX Warning")'),false);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar").textContent.includes("Overfull")'),false);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar img")'),null);
+      assert.equal(await cdp.evaluate('JSON.stringify(window.__review.files)'),before);
+      assert.deepEqual(await sent(),[]);
+      await screenshot('pdf-import-result-'+mode+'-'+width);
+      await set({...review,imported:false,applied:false,error:'PDF decisions could not be read. <svg onload=window.__xss=88>'});
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-error").getAttribute("role")'),'alert');
+      assert.match(await cdp.evaluate('document.querySelector(".pdf-review-error").textContent'),/PDF decisions could not be read/);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-error svg")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-error").closest("details")'),null);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-bar").textContent.includes("LaTeX Warning")'),false);
+    });
+    await runTest(width+'px '+mode+': Open PDF review launches the companion without changing source decisions',async()=>{
+      await set(pdf);assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-open")'),null);
+      await set({...pdf,available:true});await cdp.evaluate('window.__messages=[]');
+      const before=await cdp.evaluate('JSON.stringify(window.__review.files)');
+      await click('.pdf-review-open');
+      assert.deepEqual(await sent(),[{type:'openPdfReview'}]);
+      assert.equal(await cdp.evaluate('JSON.stringify(window.__review.files)'),before);
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled'),false,'Opening does not lock the review as a decision');
+      await set({...pdf,available:true},{busy:true});await cdp.evaluate('window.__messages=[]');await click('.pdf-review-open');assert.deepEqual(await sent(),[]);
+    });
+    await runTest(width+'px '+mode+': invalidating an imported PDF removes stale counts until another import',async()=>{
       await set({...pdf,available:true,imported:true,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'e'.repeat(64)});
-      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-apply").disabled'));
+      assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
       await set({...pdf,available:true,imported:false,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'e'.repeat(64)});
       assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-apply")'),null);
       assert.equal(await cdp.evaluate('document.querySelector(".pdf-review-summary").textContent'),'PDF available. Import its review when ready.');
@@ -3152,10 +3186,10 @@ async function runPdfReviewTests(width) {
       await cdp.evaluate('window.__messages=[]');await click('.pdf-review-generate');
       assert.deepEqual(await sent(),[{type:'regenerateReviewPdf',revision:fixture.revision}]);
     });
-    await runTest(width+'px '+mode+': PDF mutations honor trust and source conflicts; read-only imports remain available',async()=>{
+    await runTest(width+'px '+mode+': PDF imports require trust while opening a companion remains available',async()=>{
       await set(pdf,{trusted:false});assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'));
       await set({...pdf,available:true,imported:true,canApply:true,pending:0,pdfHash:'c'.repeat(64)},{trusted:false});
-      assert.ok(await cdp.evaluate('!document.querySelector(".pdf-review-import").disabled && document.querySelector(".pdf-review-generate").disabled && document.querySelector(".pdf-review-apply").disabled'));
+      assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-import").disabled && document.querySelector(".pdf-review-generate").disabled && !document.querySelector(".pdf-review-open").disabled'));
       await set(pdf);await cdp.evaluate('(() => {const next=structuredClone(window.__review);next.files[0].hunks[0].conflict="Source changed";window.__setReview(next);})()');await settle();
       assert.ok(await cdp.evaluate('document.querySelector(".pdf-review-generate").disabled'));
       await set({supported:false,available:false,filename:'other.rr.pdf'});
@@ -3165,7 +3199,7 @@ async function runPdfReviewTests(width) {
       await set({...pdf,available:true,imported:true,pending:0,accepted:4,ignored:0,canApply:true,pdfHash:'d'.repeat(64)});
       await openEdit('grow');await writeDraft('Retain this PDF review draft.');
       assert.ok(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button")].every(node=>node.disabled)'));
-      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-import');await click('.pdf-review-generate');assert.equal((await sent()).length,0);
+      await cdp.evaluate('window.__messages=[]');await click('.pdf-review-import');await click('.pdf-review-generate');await click('.pdf-review-open');assert.equal((await sent()).length,0);
       assert.equal((await editSnapshot()).draft,'Retain this PDF review draft.');
       await editorKey('Escape');await settle();
       await set({...pdf,available:true},{busy:true});assert.ok(await cdp.evaluate('[...document.querySelectorAll(".pdf-review-bar button")].every(node=>node.disabled)'));

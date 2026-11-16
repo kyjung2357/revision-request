@@ -1,4 +1,5 @@
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { build } = require('esbuild');
 const { syncPlugin } = require('./sync-plugin.cjs');
 const { writeThirdPartyNotices } = require('./third-party-notices.cjs');
@@ -18,7 +19,26 @@ async function buildAll() {
       entryPoints: [path.join(root, 'src/reviewHighlight.ts')],
       outfile: path.join(root, '.codex-build/review-highlight.js') }),
   ]);
-  await writeThirdPartyNotices({ root, outDir: path.join(root, '.codex-build'), metafiles: results.map(result => result.metafile) });
+  // Ship the maintained PDF.js renderer locally; the webview never downloads code.
+  const pdfRoot = path.dirname(require.resolve('pdfjs-dist/package.json'));
+  const pdfOut = path.join(root, '.codex-build', 'pdfjs');
+  await fs.mkdir(pdfOut, {recursive:true});
+  const assets = [['legacy/build/pdf.min.mjs','pdf.mjs'], ['legacy/build/pdf.worker.min.mjs','pdf.worker.mjs'],
+    ['LICENSE','LICENSE'], ['cmaps','cmaps'], ['standard_fonts','standard_fonts'], ['wasm','wasm']];
+  const staticOutputs = {};
+  async function copyAsset(source, target) {
+    const stat = await fs.stat(source);
+    if (stat.isDirectory()) {
+      await fs.mkdir(target,{recursive:true});
+      for (const name of await fs.readdir(source)) await copyAsset(path.join(source,name),path.join(target,name));
+    } else {
+      await fs.copyFile(source,target);
+      staticOutputs[path.relative(root,target)] = {inputs:{[path.relative(root,source)]:{bytesInOutput:stat.size}}};
+    }
+  }
+  for (const [source,target] of assets) await copyAsset(path.join(pdfRoot,source),path.join(pdfOut,target));
+  await writeThirdPartyNotices({ root, outDir: path.join(root, '.codex-build'),
+    metafiles: [...results.map(result => result.metafile), {outputs:staticOutputs}] });
 }
 module.exports = { buildAll };
 if (require.main === module) buildAll().catch(error => { console.error(error); process.exitCode = 1; });

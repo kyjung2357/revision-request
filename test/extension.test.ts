@@ -12,7 +12,6 @@ import type { McpDiagnosticReport } from '../src/mcpDiagnostics';
 import { PDFDocument } from 'pdf-lib';
 import { readPortableReviewPdf } from '../src/portableReviewPdf';
 import { resolveRequest } from '../src/request';
-import type { PdfReviewState } from '../src/pdfReviewTypes';
 
 interface ExtensionApi {
   getReadyCount(): number;
@@ -29,7 +28,7 @@ interface ExtensionApi {
   deleteRequest(uri: vscode.Uri): Promise<void>;
   generateReviewPdf(uri: vscode.Uri, revision: string, replace?: boolean): Promise<void>;
   testConfirmNextPdfBuild(): void;
-  importPdfReview(uri: vscode.Uri, revision: string): Promise<PdfReviewState>;
+  importPdfReview(uri: vscode.Uri, revision: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
   applyPdfReview(uri: vscode.Uri, revision: string, pdfHash: string): Promise<{completionPrompt: CompletionPrompt} | undefined>;
   undo(uri: vscode.Uri, file: string, hunk: string, revision: string): Promise<void>;
   editPending(uri: vscode.Uri, file: string, hunk: string, draft: string, revision: string): Promise<{changed: boolean; revision: string}>;
@@ -1582,7 +1581,7 @@ export async function run(): Promise<void> {
       });
     } finally { release?.(); await agentConfig.update('mcp.allowAgentDecisions', previous, vscode.ConfigurationTarget.Global); }
   });
-  if (process.env.RR_TEST_LATEX === '1') await check('Bundled PDF compiler, portable form, explicit import and Apply preserve source until approval', async () => {
+  if (process.env.RR_TEST_LATEX === '1') await check('Bundled PDF compiler and portable form import apply reviewed decisions in one action', async () => {
     assert.equal(typeof api.generateReviewPdf, 'function');
     assert.equal(typeof api.importPdfReview, 'function');
     assert.equal(typeof api.applyPdfReview, 'function');
@@ -1617,18 +1616,16 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand('revisionRequest.openPreview', item.request);
     state = await ready(item); assert.equal(state.pdfReview?.imported, false); assert.equal(state.pdfReview.pending, undefined);
     assert.equal(state.pdfReview.canApply, false);
-    await api.importPdfReview(item.request, state.revision);
-    state = await ready(item); assert.equal(state.pdfReview?.imported, true); assert.equal(state.pdfReview.canApply, true, state.pdfReview.error); assert.equal(state.pdfReview.pending, 0);
-    assert.equal(state.pdfReview.accepted, 8); assert.equal(state.pdfReview.ignored, 4); assert.equal(state.pdfReview.applied, false);
-    assert.deepEqual(await bytes(item.target), sourceBytes); assert.deepEqual(await bytes(item.request), requestBytes);
+    const applied = await api.importPdfReview(item.request, state.revision); assert.ok(applied?.completionPrompt);
+    state = await ready(item); assert.equal(state.pdfReview?.imported, true); assert.equal(state.pdfReview.canApply, false, state.pdfReview.error); assert.equal(state.pdfReview.pending, 0);
+    assert.equal(state.pdfReview.accepted, 8); assert.equal(state.pdfReview.ignored, 4); assert.equal(state.pdfReview.applied, true);
     const expected = resolveRequest(reviewed, source, source).expectedTarget;
-    const applied = await api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash!); assert.ok(applied?.completionPrompt);
     assert.deepEqual(await bytes(item.target), Buffer.from(expected, 'utf8')); assert.deepEqual(await bytes(dependency), dependencyBytes);
     const stored = JSON.parse((await bytes(item.request)).toString('utf8'));
     assert.deepEqual(stored.request.map((entry: {status: string}) => entry.status), reviewed.request.map(entry => entry.status));
     state = await ready(item); assert.equal(state.pdfReview?.applied, true); assert.equal(state.pdfReview.canApply, false);
     const after = await bytes(item.target), saved = await bytes(item.request);
-    assert.equal(await api.applyPdfReview(item.request, state.revision, state.pdfReview.pdfHash!), undefined);
+    assert.equal(await api.importPdfReview(item.request, state.revision), undefined);
     assert.deepEqual(await bytes(item.target), after); assert.deepEqual(await bytes(item.request), saved);
     await fs.writeFile(path.join(workspace.fsPath, 'pdf-smoke.json'), JSON.stringify({pdf: companion.fsPath,
       source: item.target.fsPath, request: item.request.fsPath, dependency: dependency.fsPath, entries: 12, accepted: 8, ignored: 4,

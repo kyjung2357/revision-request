@@ -92,4 +92,4 @@ Mouse review remains available. Quick Review pauses on a conflicting item; use i
 
 ## Portable PDF review
 
-For LaTeX requests, **Generate PDF from RR** creates or rebuilds the separate `.rr.pdf`, while **Import review from PDF** explicitly reads its saved decisions. These buttons stay separate; opening the request or replacing the PDF never imports decisions automatically. PDF choices remain separate until **Apply reviewed changes** is clicked. See [PDF review](PDF_REVIEW.md) for returning the document, viewer support, and generation requirements.
+For LaTeX requests, **Generate PDF from RR** creates or rebuilds the separate `.rr.pdf`. **Open PDF review** opens the built-in viewer with automatic saving. **Import review from PDF** waits for pending saves, then applies saved decisions to the original and `.rr`; undecided entries remain pending. Opening the request or replacing the PDF never imports decisions automatically. See [PDF review](PDF_REVIEW.md) for returning the document, viewer support, and generation requirements.
